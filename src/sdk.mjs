@@ -12,6 +12,12 @@ import {
   syncCursorRules,
   ZSTACK_ROLES
 } from './connector.mjs';
+import {
+  checkUpstream,
+  handleUpdateCommand,
+  getSyncState,
+  saveSyncState
+} from './upstream.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -298,6 +304,20 @@ export class ZStack {
     const state = await fetchModelHitchState(this.baseUrl);
     const mapping = resolveRoleMapping(state);
     return syncCursorRules({ mapping, project: options.project });
+  }
+
+  /**
+   * Check upstream pstack repository on GitHub for changes on demand.
+   */
+  async checkUpstream(options = {}) {
+    return await checkUpstream(options);
+  }
+
+  /**
+   * Check and optionally update upstream pstack sync state.
+   */
+  async update(options = {}) {
+    return await handleUpdateCommand(options);
   }
 }
 

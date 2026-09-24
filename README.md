@@ -3,7 +3,7 @@
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](package.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
-[![Tests](https://img.shields.io/badge/tests-8%20passed-brightgreen.svg)](tests/connector.test.mjs)
+[![Tests](https://img.shields.io/badge/tests-9%20passed-brightgreen.svg)](tests/connector.test.mjs)
 [![Gateway](https://img.shields.io/badge/gateway-ModelHitch%203939-orange.svg)](https://github.com/bobbybacklogs/ModelHitch)
 
 An opinionated Agent Operating System, TypeScript SDK, and CLI for rigorous software engineering.
@@ -144,7 +144,22 @@ zstack sync
 zstack sync --project
 ```
 
-### 5. Introspection & Health
+### 5. Upstream Synchronization
+
+Check the canonical `pstack` repository (`cursor/plugins/tree/main/pstack`) on demand for new commits, playbooks, or principle updates:
+
+```bash
+# Check upstream for changes (interactive prompt to record checkpoint)
+zstack update
+
+# Automatically record and sync the latest upstream checkpoint
+zstack update --apply
+
+# Check upstream status without prompting
+zstack update --check
+```
+
+### 6. Introspection & Health
 
 ```bash
 # Display system overview, tenets, and package metadata

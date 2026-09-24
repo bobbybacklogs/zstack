@@ -1,0 +1,9 @@
+{
+  "repo": "cursor/plugins",
+  "path": "pstack",
+  "url": "https://github.com/cursor/plugins/tree/main/pstack",
+  "lastSyncedCommit": "12d587dfb20741cafc376c42c696c5f6e2a64487",
+  "lastSyncedDate": "2026-09-23T20:03:21Z",
+  "lastSyncedMessage": "fix(pstack): resolve rule conflicts and read the model rule the same way (#422)",
+  "lastCheckTimestamp": "2026-09-24T19:08:55.850Z"
+}

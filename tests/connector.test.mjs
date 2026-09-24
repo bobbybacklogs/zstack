@@ -84,4 +84,10 @@ describe('zstack SDK class', () => {
     assert.ok(res.usage.total_tokens > 0);
     assert.equal(res.playbook, 'feature');
   });
+
+  it('checks upstream pstack status on demand', async () => {
+    const upstream = await z.checkUpstream();
+    assert.ok(typeof upstream.hasUpdates === 'boolean');
+    assert.ok(upstream.state);
+  });
 });

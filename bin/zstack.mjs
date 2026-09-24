@@ -5,14 +5,18 @@ import { ZStack, DEFAULT_BRIDGE_URL } from '../src/index.mjs';
 const [,, cmd, ...rawArgs] = process.argv;
 const z = new ZStack();
 
-// Parse basic flags (--files, --role, --model, --project)
+// Parse basic flags (--files, --role, --model, --project, --apply, -y, --check)
 function parseArgs(args) {
-  const flags = { files: [], project: false };
+  const flags = { files: [], project: false, apply: false, check: false };
   const positional = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--project') {
       flags.project = true;
+    } else if (arg === '--apply' || arg === '-y') {
+      flags.apply = true;
+    } else if (arg === '--check') {
+      flags.check = true;
     } else if (arg === '--files' && i + 1 < args.length) {
       flags.files = args[++i].split(',').map(s => s.trim());
     } else if (arg === '--role' && i + 1 < args.length) {
@@ -40,6 +44,7 @@ Usage:
   zstack panel "<prompt>"                          Run multi-family adversarial critique in parallel
   zstack status                                    Show ModelHitch health and active role mappings
   zstack sync [--project]                          Sync Cursor rules (~/.cursor/rules/zstack-models.mdc)
+  zstack update [--apply]                          Check upstream pstack repository for updates
   zstack playbooks                                 List all 15 execution playbooks
   zstack principles                                List the 20 engineering principles
   zstack --about                                   Show system architecture, tenets, and metadata
@@ -50,6 +55,8 @@ Options:
   --role <role>            Override role assignment (e.g., 'feature, refactoring', 'judgment and prose')
   --model <provider/model> Override model directly (e.g., 'deepseek/deepseek-v4-flash')
   --project                Target current project directory instead of user home
+  --apply, -y              Automatically record upstream sync checkpoint
+  --check                  Check upstream without prompting for update
   --about, -a              Show architecture and design overview
   --version, -v            Show package version
 `);
@@ -244,6 +251,12 @@ async function main() {
     case 'sync':
       await handleSync(rawArgs);
       break;
+    case 'update':
+    case '--update': {
+      const { flags } = parseArgs(rawArgs);
+      await z.update({ apply: flags.apply, check: flags.check });
+      break;
+    }
     case 'task':
       await handleTask(rawArgs[0], rawArgs.slice(1));
       break;

@@ -137,6 +137,10 @@ export declare class ZStack {
   panel(prompt: string, options?: any): Promise<PanelCritique[]>;
 
   syncRules(options?: { project?: boolean }): Promise<string>;
+
+  checkUpstream(options?: { token?: string; statePath?: string }): Promise<any>;
+
+  update(options?: { apply?: boolean; yes?: boolean; token?: string; statePath?: string }): Promise<any>;
 }
 
 export declare function createZStack(options?: ZStackOptions): ZStack;
