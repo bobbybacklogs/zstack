@@ -3,7 +3,7 @@
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](package.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
-[![Tests](https://img.shields.io/badge/tests-7%20passed-brightgreen.svg)](tests/connector.test.mjs)
+[![Tests](https://img.shields.io/badge/tests-8%20passed-brightgreen.svg)](tests/connector.test.mjs)
 [![Gateway](https://img.shields.io/badge/gateway-ModelHitch%203939-orange.svg)](https://github.com/bobbybacklogs/ModelHitch)
 
 An opinionated Agent Operating System, TypeScript SDK, and CLI for rigorous software engineering.
@@ -147,6 +147,9 @@ zstack sync --project
 ### 5. Introspection & Health
 
 ```bash
+# Display system overview, tenets, and package metadata
+zstack --about
+
 # Check ModelHitch bridge connectivity and active role mappings
 zstack status
 

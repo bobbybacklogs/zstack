@@ -89,6 +89,18 @@ export interface RoleMapping {
   panelList: string[];
 }
 
+export interface AboutInfo {
+  name: string;
+  version: string;
+  description: string;
+  repository: string;
+  license: string;
+  gateway: string;
+  playbookCount: number;
+  principleCount: number;
+  subsystems: string[];
+}
+
 export declare class ZStack {
   baseUrl: string;
   rootDir: string;
@@ -96,6 +108,8 @@ export declare class ZStack {
   defaultSystemPrompt: string;
 
   constructor(options?: ZStackOptions);
+
+  about(): AboutInfo;
 
   status(): Promise<{
     ok: boolean;

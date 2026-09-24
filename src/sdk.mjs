@@ -74,6 +74,28 @@ export class ZStack {
   }
 
   /**
+   * Return metadata and architecture overview for zstack.
+   */
+  about() {
+    return {
+      name: 'zstack',
+      version: '0.1.0',
+      description: 'Agent Operating System for Rigorous Engineering powered by ModelHitch',
+      repository: 'https://github.com/bobbybacklogs/zstack',
+      license: 'MIT',
+      gateway: this.baseUrl,
+      playbookCount: this.listPlaybooks().length,
+      principleCount: this.listPrinciples().length,
+      subsystems: [
+        'Task Playbooks (15 SOPs for features, bug-fixes, refactors, forensics, PRs)',
+        'Durable Principles (20 non-negotiable engineering rules cited against changes)',
+        'Workload-Specific Model Routing (decouples engineering roles to optimal models)',
+        'ModelHitch Integration (local multi-wire resilience gateway on port 3939)'
+      ]
+    };
+  }
+
+  /**
    * List all available task playbooks.
    */
   listPlaybooks() {

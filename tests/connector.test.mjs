@@ -66,6 +66,15 @@ describe('zstack SDK class', () => {
     assert.equal(ref.type, 'refactoring');
   });
 
+  it('provides about metadata', () => {
+    const meta = z.about();
+    assert.equal(meta.name, 'zstack');
+    assert.equal(meta.version, '0.1.0');
+    assert.equal(meta.playbookCount, 15);
+    assert.equal(meta.principleCount, 20);
+    assert.ok(meta.subsystems.length >= 4);
+  });
+
   it('executes a task with playbook grounding via ModelHitch', async () => {
     const res = await z.task({
       prompt: 'Respond with ONLY: "task verified"',

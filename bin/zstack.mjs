@@ -40,8 +40,9 @@ Usage:
   zstack panel "<prompt>"                          Run multi-family adversarial critique in parallel
   zstack status                                    Show ModelHitch health and active role mappings
   zstack sync [--project]                          Sync Cursor rules (~/.cursor/rules/zstack-models.mdc)
-  zstack playbooks                                 List all 16 execution playbooks
+  zstack playbooks                                 List all 15 execution playbooks
   zstack principles                                List the 20 engineering principles
+  zstack --about                                   Show system architecture, tenets, and metadata
   zstack help                                      Show this help message
 
 Options:
@@ -49,6 +50,8 @@ Options:
   --role <role>            Override role assignment (e.g., 'feature, refactoring', 'judgment and prose')
   --model <provider/model> Override model directly (e.g., 'deepseek/deepseek-v4-flash')
   --project                Target current project directory instead of user home
+  --about, -a              Show architecture and design overview
+  --version, -v            Show package version
 `);
 }
 
@@ -176,10 +179,61 @@ async function handlePanel(args) {
   }
 }
 
+function handleAbout() {
+  const meta = z.about();
+  console.log(`
+zstack — Agent Operating System for Rigorous Engineering
+Version:     ${meta.version} (ESM, TypeScript types included)
+License:     ${meta.license}
+Repository:  ${meta.repository}
+Gateway:     ${meta.gateway}
+
+Overview:
+  zstack is an opinionated, verification-first operating system, SDK, and CLI
+  for AI coding agents. Inspired by Lauren Tan's pstack/poteto-mode methodology,
+  zstack replaces unverified code generation with structured execution, durable
+  engineering principles, and workload-specific model routing.
+
+Subsystems:
+  - Task Playbooks (${meta.playbookCount} SOPs)
+    Structured execution procedures for features, bug-fixes, refactoring,
+    performance diagnostics, runtime forensics, and PR packaging.
+  - Durable Principles (${meta.principleCount} Rules)
+    Non-negotiable engineering constraints (laziness protocol, root cause
+    remediation, boundary discipline, context preservation) cited against
+    concrete code decisions.
+  - Workload-Specific Model Routing
+    Decouples agent engineering roles from individual models. Routes fast code
+    generation to high-throughput models, architectural synthesis to frontier
+    reasoning models, and adversarial critiques to multi-family panels.
+  - ModelHitch Integration (http://127.0.0.1:3939/v1)
+    Normalizes multi-wire endpoints (OpenAI, Anthropic Messages, Gemini
+    GenerateContent, Codex Responses) through a local BYOK proxy with automatic
+    circuit breaking, failover, and token/cost telemetry.
+
+Core Tenets:
+  - Verify against real artifacts (live processes, HTTP responses, test output),
+    never self-reports or unit mocks.
+  - Delete before writing: the best diff is negative lines of code.
+  - Make illegal states unrepresentable with strict boundary schemas and tagged unions.
+  - Write unslopped declarative prose with short, active sentences and no em-dashes.
+`);
+}
+
 async function main() {
   switch (cmd) {
     case 'status':
       await handleStatus();
+      break;
+    case 'about':
+    case '--about':
+    case '-a':
+      handleAbout();
+      break;
+    case 'version':
+    case '--version':
+    case '-v':
+      console.log('zstack v0.1.0');
       break;
     case 'playbooks':
       await handlePlaybooks();
@@ -222,3 +276,4 @@ main().catch(err => {
   console.error(`Fatal: ${err.message}`);
   process.exit(1);
 });
+
