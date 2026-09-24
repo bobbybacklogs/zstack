@@ -1,14 +1,24 @@
 # zstack
 
-> **An Agent Operating System for Rigorous Engineering.**  
-> Powered by OpenCode Zen & Go models via the [ModelHitch](https://github.com/bobbybacklogs/ModelHitch) BYOK local gateway (`127.0.0.1:3939`).
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](package.json)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
+[![Tests](https://img.shields.io/badge/tests-7%20passed-brightgreen.svg)](tests/connector.test.mjs)
+[![Gateway](https://img.shields.io/badge/gateway-ModelHitch%203939-orange.svg)](https://github.com/bobbybacklogs/ModelHitch)
 
-`zstack` is an opinionated, verification-first operating system for AI coding agents. Inspired by Lauren Tan's `pstack` / `poteto-mode`, `zstack` strips away chatty, unverified code generation in favor of:
+An opinionated Agent Operating System, TypeScript SDK, and CLI for rigorous software engineering.
 
-1. **Task-Specific Playbooks**: Standard Operating Procedures (SOPs) for features, bug-fixes, refactors, prototypes, and forensics.
-2. **Durable Principles**: 20 core engineering principles (laziness protocol, prove-it-works, subtract-before-you-add, boundary discipline, etc.) cited against actual decisions.
-3. **Workload-Specific Model Routing**: Matching tasks to the best OpenCode Zen and Go models (fast coding vs. deep architectural judgment vs. multi-family adversarial panels).
-4. **ModelHitch Integration**: Solving OpenCode Zen's multi-wire endpoint fragmentation by routing all agent traffic through a unified, resilient local proxy on `http://127.0.0.1:3939/v1`.
+`zstack` decouples high-level engineering tasks from individual models. It structures development through task-specific playbooks, enforces twenty non-negotiable engineering principles, and routes operations to specialized language models via [ModelHitch](https://github.com/bobbybacklogs/ModelHitch) (`127.0.0.1:3939`).
+
+---
+
+## Key Capabilities
+
+- **15 Standard Operating Playbooks**: Structured execution recipes for features, bug fixes, refactoring, performance forensics, and pull requests.
+- **20 Durable Principles**: Non-negotiable engineering rules (laziness protocol, root cause remediation, boundary discipline, context preservation) cited against concrete code changes.
+- **Dynamic Workload Routing**: Routes tasks to the optimal model based on available providers (OpenCode Zen/Go, OpenAI, Anthropic, Gemini, DeepSeek).
+- **Adversarial Multi-Family Panels**: Concurrently queries models across distinct provider families (`/arena`, `/panel`) to surface architectural blind spots.
+- **Unified SDK & CLI**: Programmatic TypeScript API and terminal binary for direct task execution, prompt classification, and rule synchronization.
 
 ---
 
@@ -23,7 +33,7 @@
 +---------------------------------------------------------------------------------+
 | zstack Core (Cognitive & Workflow Layer)                                        |
 |                                                                                 |
-|   Router: /z-mode                                                               |
+|   Classifier & Router                                                           |
 |   ├── Task Classification (Feature, Bug-fix, Refactor, Investigation, etc.)     |
 |   ├── Principles Index (Laziness Protocol, Prove-It-Works, Guard Context, etc.) |
 |   └── Task Playbooks (playbooks/*.md)                                           |
@@ -32,147 +42,276 @@
              Role Assignment: Fast Coder | Architect / Judgment | Review Panels
                                           v
 +---------------------------------------------------------------------------------+
-| ModelHitch Bridge (http://127.0.0.1:3939/v1)                                   |
+| ModelHitch Gateway (http://127.0.0.1:3939/v1)                                   |
 |                                                                                 |
 |   - Multi-wire normalization (/responses, /messages, /chat/completions, /models)|
-|   - Automatic failover & circuit-breaking (429 / 5xx)                           |
-|   - Local token, cost, and latency analytics (modelhitch-usage.db)              |
+|   - Automatic circuit-breaking and fallback routing                             |
+|   - Usage and cost telemetry                                                    |
 +---------------------------------------------------------------------------------+
                          /                |               \
                         /                 |                \
                        v                  v                 v
             +--------------------+ +---------------+ +-----------------------+
-            | OpenCode Go        | | OpenCode Zen  | | Fallbacks / Free      |
-            | (Flat Rate Sub)    | | (Pay-per-use) | | (Local Ollama, etc.)  |
+            | OpenCode Go / Zen  | | OpenAI / Anth | | Gemini / DeepSeek     |
             |                    | |               | |                       |
-            | - deepseek-v4-pro  | | - claude-son- | | - deepseek-v4-flash   |
-            | - kimi-k2.7-code   | |   net-4-6     | | - big-pickle          |
-            | - glm-5.1          | | - gpt-5.5     | | - mimo-v2.6-flash     |
-            |                    | | - qwen3.7-max | |                       |
+            | - deepseek-v4-pro  | | - gpt-5.6     | | - gemini-3.6-flash    |
+            | - claude-sonnet-4-6| | - o3 / o4     | | - deepseek-v4-flash   |
+            | - gpt-5.5          | |               | | - deepseek-reasoner   |
             +--------------------+ +---------------+ +-----------------------+
 ```
 
 ---
 
-## Model Roles & Routing Matrix
+## Model Role Allocation Matrix
 
-`zstack` separates the engineering role from the model. Using the OpenCode catalog routed via ModelHitch:
+When connected to ModelHitch, `zstack` inspects available providers and assigns models to roles:
 
-| Role | Default Model | Upstream Service | Rationale |
+| Role | Preferred Model (OpenCode) | Fallback Hitch Model | Workload Profile |
 | :--- | :--- | :--- | :--- |
-| **Fast Coder / Implementation** | `deepseek-v4-pro` | OpenCode Go | High-throughput, precise code generation under flat-rate subscription. |
-| **Alternative Coder** | `kimi-k2.7-code` | OpenCode Go | Specialized coding agent for long-context refactors. |
-| **Rapid Exploration / Forensics** | `deepseek-v4-flash` | OpenCode Zen | Extreme speed & cost efficiency ($0.14 / 1M input) for throwaway probes. |
-| **Architect / Judgment / Prose** | `claude-sonnet-4-6` | OpenCode Zen | Frontier reasoning for architecture decisions, diff reviews, and Diátaxis docs. |
-| **Deep Reasoning Alternative** | `gpt-5.5` | OpenCode Zen | High-rigor frontier model for complex mathematical or algorithm design. |
-| **Adversarial Review Panel** (`/arena`, `/interrogate`, `critics`) | Multi-family ensemble:<br>1. `claude-sonnet-4-6`<br>2. `gpt-5.5`<br>3. `deepseek-v4-pro`<br>4. `qwen3.7-max` | OpenCode Zen & Go | Cross-family ensemble prevents shared blind spots during adversarial reviews. |
+| **feature, refactoring** | `opencode/deepseek-v4-pro` | `deepseek/deepseek-v4-flash` | High-throughput, precise code generation and transformations. |
+| **bug-fix, perf-issue** | `opencode/deepseek-v4-pro` | `deepseek/deepseek-v4-flash` | Root-cause analysis, reproduction, and minimal diff footprints. |
+| **fast exploration** | `opencode/deepseek-v4-flash` | `deepseek/deepseek-v4-flash` | Rapid exploratory scripts and throwaway spikes. |
+| **judgment and prose** | `opencode/claude-sonnet-4-6` | `openai/gpt-5.6-luna` | Architecture evaluations, API contracts, and PR descriptions. |
+| **deep reasoning** | `opencode/gpt-5.5` | `openai/gpt-5.6-luna` | Algorithm design, invariants, and mathematical correctness. |
+| **how explorer / why** | `opencode/deepseek-v4-pro` | `deepseek/deepseek-v4-flash` | Subsystem exploration and runtime behavior analysis. |
+| **adversarial panel** | `claude-sonnet-4-6`, `gpt-5.5`, `deepseek-v4-pro` | `openai/gpt-5.6-luna`, `gemini-3.6-flash`, `deepseek-v4-flash` | Parallel review across divergent model families. |
 
 ---
 
-## Directory Structure
+## Installation
 
+### Global CLI Installation
+
+Install or link globally using Node.js (>= 18.0.0):
+
+```bash
+git clone https://github.com/bobbybacklogs/zstack.git
+cd zstack
+npm link
 ```
-zstack/
-├── skills/
-│   ├── z-mode/                   # Primary task router and orchestrator
-│   └── setup-zstack/             # Interactive role-to-model configuration
-├── principles/                   # 20 core engineering principles
-│   ├── laziness-protocol.md
-│   ├── foundational-thinking.md
-│   ├── subtract-before-you-add.md
-│   ├── prove-it-works.md
-│   ├── fix-root-causes.md
-│   ├── guard-the-context-window.md
-│   ├── never-block-on-the-human.md
-│   ├── build-the-lever.md
-│   ├── boundary-discipline.md
-│   ├── type-system-discipline.md
-│   ├── make-operations-idempotent.md
-│   ├── migrate-callers-then-delete-legacy-apis.md
-│   ├── separate-before-serializing-shared-state.md
-│   ├── sequence-verifiable-units.md
-│   ├── redesign-from-first-principles.md
-│   ├── minimize-reader-load.md
-│   ├── outcome-oriented-execution.md
-│   ├── experience-first.md
-│   ├── exhaust-the-design-space.md
-│   └── encode-lessons-in-structure.md
-├── playbooks/                    # 16 task-specific execution playbooks
-│   ├── feature.md
-│   ├── bug-fix.md
-│   ├── prototype.md
-│   ├── refactoring.md
-│   ├── investigation.md
-│   ├── perf-issue.md
-│   ├── runtime-forensics.md
-│   ├── trace-forensics.md
-│   ├── opening-a-pr.md
-│   ├── pause-safely.md
-│   ├── session-pickup.md
-│   ├── autonomous-run.md
-│   ├── eval.md
-│   ├── visual-parity.md
-│   └── authoring-a-skill.md
-├── verification/                 # Verification infrastructure templates
-│   ├── feature-map.template.md
-│   ├── evidence-schema.json
-│   └── README.md
-└── docs/
-    └── refs/                     # Reference documents & OpenCode Zen cheatsheet
+
+Verify installation:
+
+```bash
+zstack --help
+```
+
+### SDK Dependency
+
+Install locally in a project:
+
+```bash
+npm install git+https://github.com/bobbybacklogs/zstack.git
 ```
 
 ---
 
-## ModelHitch Connector Harness
+## CLI Usage
 
-`zstack` includes a built-in connector and CLI harness that connects directly to ModelHitch (`http://127.0.0.1:3939/v1`). It dynamically queries ModelHitch's live catalog, detects your active providers (OpenCode, OpenAI, Gemini, DeepSeek, OpenRouter, etc.), and automatically resolves the best model for each engineering role.
+### 1. One-Shot Task Execution (Auto-Classified)
 
-### Commands
+Pass any task description. `zstack` analyzes the prompt, identifies the matching playbook, grounds the context in the relevant principles, and routes to the assigned model:
 
 ```bash
-# Check ModelHitch bridge health, active providers, and current role mappings
-node bin/zstack.mjs status
+zstack "Fix unhandled promise rejection in auth retry loop"
+```
 
-# Automatically sync Cursor rules with currently active ModelHitch models
-node bin/zstack.mjs sync
+### 2. Task with Explicit Playbook and File Attachments
 
-# Run a prompt directly against any role's assigned model
-node bin/zstack.mjs run "feature" "Build token rotation handler"
+Specify a playbook explicitly and attach local source files for bounded context:
 
-# Run an adversarial critique across the multi-family panel in parallel
-node bin/zstack.mjs panel "Should we use optimistic concurrency or distributed locks?"
+```bash
+zstack task feature "Add token bucket rate limiting to refresh route" --files src/auth.ts,src/server.ts
+```
 
-# List available models in ModelHitch grouped by provider
-node bin/zstack.mjs models
+### 3. Adversarial Multi-Family Panel Review
+
+Dispatch an architecture question or proposed diff to a multi-model panel:
+
+```bash
+zstack panel "Should we use optimistic concurrency or distributed locks for ledger balances?"
+```
+
+### 4. Rule Synchronization
+
+Inspect active ModelHitch providers and generate or update Cursor rules:
+
+```bash
+# Update global rule (~/.cursor/rules/zstack-models.mdc)
+zstack sync
+
+# Update project-level rule (.cursor/rules/zstack-models.mdc)
+zstack sync --project
+```
+
+### 5. Introspection & Health
+
+```bash
+# Check ModelHitch bridge connectivity and active role mappings
+zstack status
+
+# List all available playbooks and their triggers
+zstack playbooks
+
+# List all 20 principles and when to apply them
+zstack principles
 ```
 
 ---
 
-## Quickstart
+## TypeScript SDK Reference
 
-### 1. Ensure ModelHitch is Running
-ModelHitch runs locally on port 3939 as your multi-wire bridge:
+### Basic Usage
+
+```typescript
+import { ZStack } from 'zstack';
+
+const z = new ZStack({
+  baseUrl: 'http://127.0.0.1:3939' // Optional: defaults to MODELHITCH_BASE_URL
+});
+
+// Run a task with automatic classification and playbook grounding
+const result = await z.task({
+  prompt: 'Fix memory leak in websocket event listeners',
+  files: ['src/socket.ts'],
+  playbook: 'perf-issue' // Optional: auto-classified if omitted
+});
+
+console.log(result.content);
+console.log(`Executed by ${result.model} (${result.durationMs}ms)`);
+console.log(`Tokens used: ${result.usage.total_tokens}`);
+```
+
+### Parallel Adversarial Panel Review
+
+```typescript
+const critiques = await z.panel(
+  'Evaluate proposed transaction serialization boundary'
+);
+
+for (const c of critiques) {
+  if (c.ok) {
+    console.log(`Model: ${c.model} (${c.durationMs}ms)`);
+    console.log(c.content);
+  }
+}
+```
+
+### Direct Role Dispatch
+
+```typescript
+const response = await z.runRole(
+  'judgment and prose',
+  'Write architecture note explaining the token lifecycle'
+);
+
+console.log(response.content);
+```
+
+### Prompt Classification
+
+```typescript
+const info = z.classifyPrompt('Why is memory growing during batch imports?');
+console.log(info.type); // "perf-issue"
+console.log(info.playbookFile); // "playbooks/perf-issue.md"
+console.log(info.principles); // ["fix-root-causes", "build-the-lever", "prove-it-works"]
+```
+
+---
+
+## Execution Playbooks
+
+Standard Operating Procedures located in `playbooks/`:
+
+| Playbook | Trigger |
+| :--- | :--- |
+| `feature.md` | Implementing new user-facing functionality, API routes, or subsystems. |
+| `bug-fix.md` | Resolving bugs, failing tests, crashes, or reported regressions. |
+| `refactoring.md` | Restructuring or simplifying code without altering external behavior. |
+| `perf-issue.md` | Diagnosing latency bottlenecks, memory growth, or throughput limits. |
+| `prototype.md` | Exploring unproven approaches or settling design feasibility questions. |
+| `investigation.md` | Answering architectural questions or tracing unknown execution paths. |
+| `runtime-forensics.md` | Investigating process crashes, hangs, deadlocks, or socket leaks. |
+| `trace-forensics.md` | Diagnosing distributed tracing spans, timeouts, or network delays. |
+| `opening-a-pr.md` | Structuring commits, writing diff summaries, and preparing PRs. |
+| `eval.md` | Measuring model accuracy, benchmark deltas, or regression thresholds. |
+| `visual-parity.md` | Aligning user interfaces with visual mockups or design specifications. |
+| `pause-safely.md` | Creating auditable checkpoints before pausing an active session. |
+| `session-pickup.md` | Resuming work from prior checkpoints or interrupted branches. |
+| `autonomous-run.md` | Running long-running unattended agent loops with progress gates. |
+| `authoring-a-skill.md` | Packaging verified workflows into reusable agent skills. |
+
+---
+
+## Core Engineering Principles
+
+Twenty principles located in `principles/`:
+
+- **Laziness Protocol** (`laziness-protocol.md`): Delete before writing. Reject premature abstractions.
+- **Foundational Thinking** (`foundational-thinking.md`): Define core data types and invariants before business logic.
+- **Redesign from First Principles** (`redesign-from-first-principles.md`): Redesign foundational boundaries when adding major requirements.
+- **Subtract Before You Add** (`subtract-before-you-add.md`): Remove dead code before adding features on top of debt.
+- **Minimize Reader Load** (`minimize-reader-load.md`): Collapse unnecessary indirection and shrink mutable scope.
+- **Outcome-Oriented Execution** (`outcome-oriented-execution.md`): Converge to target state without leaving orphaned shims.
+- **Experience First** (`experience-first.md`): Prioritize caller ergonomics over internal implementation ease.
+- **Exhaust the Design Space** (`exhaust-the-design-space.md`): Explore multiple candidate solutions before committing.
+- **Build the Lever** (`build-the-lever.md`): Automate repetitive tasks into reusable scripts and harnesses.
+- **Boundary Discipline** (`boundary-discipline.md`): Validate strictly at inputs; trust verified internal types.
+- **Type System Discipline** (`type-system-discipline.md`): Make illegal states unrepresentable with tagged unions.
+- **Make Operations Idempotent** (`make-operations-idempotent.md`): Ensure handlers converge safely on repeated execution.
+- **Migrate Callers Then Delete Legacy APIs** (`migrate-callers-then-delete-legacy-apis.md`): Remove deprecated paths in one clean migration.
+- **Separate Before Serializing Shared State** (`separate-before-serializing-shared-state.md`): Partition ownership before introducing locks.
+- **Prove It Works** (`prove-it-works.md`): Verify against live processes and real artifacts, not mocks.
+- **Fix Root Causes** (`fix-root-causes.md`): Reproduce failures and trace to source rather than masking symptoms.
+- **Sequence Verifiable Units** (`sequence-verifiable-units.md`): Decompose work into independently testable commits.
+- **Guard the Context Window** (`guard-the-context-window.md`): Offload bulk file reads and searches to targeted subagents.
+- **Never Block on the Human** (`never-block-on-the-human.md`): Formulate prototypes on reversible decisions autonomously.
+- **Encode Lessons in Structure** (`encode-lessons-in-structure.md`): Institutionalize fixes via linters, types, or tests.
+
+---
+
+## Editor & Agent Integration
+
+Install the `zstack` skill across your local agent environments via ModelHitch:
+
 ```bash
-modelhitch status
-# or to start in background:
-modelhitch bridge --background
+modelhitch setup zstack
 ```
 
-### 2. Sync Model Roles via Harness
-Run the sync command to write `~/.cursor/rules/zstack-models.mdc`:
+Supported environments:
+- **Cursor**: `~/.cursor/skills/zstack` and `~/.cursor/rules/zstack-models.mdc`
+- **Claude Code**: `~/.claude/skills/zstack`
+- **OpenAI Codex**: `~/.codex/skills/zstack`
+- **GitHub Copilot / VS Code**: `~/.copilot/skills/zstack`
+- **Google Antigravity**: `~/.gemini/config/skills/zstack`
+
+In chat or editor prompts, prefix multi-step tasks with `/z-mode`:
+
+```text
+/z-mode Build idempotent webhook receiver with replay verification
+```
+
+---
+
+## Verification & Testing
+
+Run the automated test suite:
+
 ```bash
-node bin/zstack.mjs sync
-```
-Or use the agent setup command:
-```
-/setup-zstack
+npm test
 ```
 
-### 3. Enter zstack Mode
-In your AI editor / agent prompt, prefix multi-step tasks with:
-```
-/z-mode Build the authentication token refresh loop with rotation evidence
-```
+Tests validate:
+1. ModelHitch bridge health check on `127.0.0.1:3939`.
+2. Catalog and active provider discovery.
+3. Role mapping resolution across all 15 engineering roles.
+4. Live prompt execution via the local bridge.
+5. SDK playbook and principle index resolution.
+6. Prompt classification accuracy.
+7. Task execution with contextual playbook grounding.
 
-The router classifies your task, reads the applicable principles, selects the matching playbook, writes a verifiable todolist, delegates sub-tasks through ModelHitch, and verifies the final result before reporting done.
+---
 
+## License
+
+MIT License. Copyright (c) 2026 genoventures-labs.
