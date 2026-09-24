@@ -3,6 +3,7 @@ export interface ZStackOptions {
   rootDir?: string;
   workspaceDir?: string;
   defaultSystemPrompt?: string;
+  timeoutMs?: number;
 }
 
 export interface PlaybookInfo {
@@ -11,6 +12,9 @@ export interface PlaybookInfo {
   path: string;
   title: string;
   trigger: string;
+  keywords?: string[];
+  requires?: string[];
+  version?: string | null;
 }
 
 export interface PrincipleInfo {
@@ -19,6 +23,9 @@ export interface PrincipleInfo {
   path: string;
   title: string;
   applyWhen: string;
+  keywords?: string[];
+  requires?: string[];
+  version?: string | null;
 }
 
 export interface PromptClassification {
@@ -26,6 +33,21 @@ export interface PromptClassification {
   role: string;
   principles: string[];
   playbookFile: string;
+}
+
+export interface PlaybookCandidate {
+  type: string;
+  role: string;
+  principles: string[];
+  playbookFile: string;
+  score: number;
+  reason: string;
+}
+
+export interface DetailedClassification extends PromptClassification {
+  candidates: PlaybookCandidate[];
+  confidence: number;
+  ambiguous: boolean;
 }
 
 export interface TaskOptions {
@@ -39,6 +61,11 @@ export interface TaskOptions {
   model?: string;
   temperature?: number;
   maxTokens?: number;
+  semantic?: boolean;
+  contextBudget?: number;
+  contextTokens?: number;
+  noPrune?: boolean;
+  timeoutMs?: number;
 }
 
 export interface TaskResult {
@@ -47,7 +74,19 @@ export interface TaskResult {
   role: string;
   playbook: string;
   principles: string[];
-  usage: {
+  classification?: {
+    type: string;
+    candidates: PlaybookCandidate[];
+    confidence: number | null;
+    ambiguous: boolean;
+  };
+  context?: {
+    estimatedTokens: number;
+    budgetTokens: number;
+    trimmed: string[];
+    omittedPrinciples: string[];
+  };
+  contextNotes?: string[] | null;  usage: {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
@@ -106,6 +145,7 @@ export declare class ZStack {
   rootDir: string;
   workspaceDir: string;
   defaultSystemPrompt: string;
+  timeoutMs?: number;
 
   constructor(options?: ZStackOptions);
 
@@ -130,6 +170,8 @@ export declare class ZStack {
 
   classifyPrompt(prompt: string): PromptClassification;
 
+  classifyPromptDetailed(prompt: string): DetailedClassification;
+
   task(options: string | TaskOptions): Promise<TaskResult>;
 
   runRole(role: string, prompt: string, options?: any): Promise<TaskResult>;
@@ -137,6 +179,10 @@ export declare class ZStack {
   panel(prompt: string, options?: any): Promise<PanelCritique[]>;
 
   syncRules(options?: { project?: boolean }): Promise<string>;
+
+  getBudget(): StoredBudget;
+  setBudget(tier: string, source?: string): Promise<BudgetInfo>;
+  getBudgetMapping(): Promise<BudgetInfo>;
 
   checkUpstream(options?: { token?: string; statePath?: string }): Promise<any>;
 
@@ -146,10 +192,175 @@ export declare class ZStack {
 export declare function createZStack(options?: ZStackOptions): ZStack;
 export declare function runTask(promptOrOptions: string | TaskOptions): Promise<TaskResult>;
 export declare function runPanel(prompt: string, options?: any): Promise<PanelCritique[]>;
-export declare function checkBridgeHealth(baseUrl?: string): Promise<BridgeHealth>;
-export declare function fetchModelHitchState(baseUrl?: string): Promise<ModelHitchState>;
+export declare function checkBridgeHealth(baseUrl?: string, options?: any): Promise<BridgeHealth>;
+export declare function fetchModelHitchState(baseUrl?: string, options?: any): Promise<ModelHitchState>;
 export declare function resolveRoleMapping(state: ModelHitchState): RoleMapping;
-export declare function syncCursorRules(options?: { mapping: RoleMapping; project?: boolean }): string;
+export declare function scorePlaybookTriggers(text: string): PlaybookCandidate[];
+export declare function syncCursorRules(options?: { mapping: RoleMapping; project?: boolean; budget?: BudgetInfo }): string;
 export declare const DEFAULT_BRIDGE_URL: string;
 export declare const ZSTACK_ROLES: readonly string[];
 export declare const ZSTACK_SYSTEM_PROMPT: string;
+
+export type BudgetTierId = 'low-med' | 'med-high' | 'high' | 'max';
+export type BudgetSourceId = 'config' | 'catalog';
+
+export interface BudgetTierInfo {
+  name: string;
+  description: string;
+  profile: string;
+}
+
+export interface BudgetInfo {
+  tier: string;
+  tierInfo: BudgetTierInfo;
+  source: BudgetSourceId;
+  sourceDescription: string;
+  models: Record<string, string>;
+  panelList: string[];
+}
+
+export interface StoredBudget {
+  tier: string;
+  source: BudgetSourceId;
+  lastUpdated: string;
+}
+
+export declare const BUDGET_TIERS: Record<string, BudgetTierInfo>;
+export declare const BUDGET_SOURCES: Record<string, string>;
+export declare function getStoredBudget(filePath?: string): StoredBudget;
+export declare function saveStoredBudget(data: Partial<StoredBudget>, filePath?: string): StoredBudget;
+export declare function resolveBudgetMapping(options: { tier?: string; source?: string; state: ModelHitchState }): BudgetInfo;
+export declare function promptAndSetBudget(options?: any): Promise<{ applied: boolean; budget: BudgetInfo; rulePath?: string }>;
+
+export declare const CLASSIFY_CONFIDENCE_THRESHOLD: number;
+export declare const CLASSIFY_AMBIGUITY_MARGIN: number;
+export declare const CLASSIFY_MAX_CANDIDATES: number;
+
+export interface SemanticCandidate {
+  type: string;
+  score: number;
+  reason: string;
+}
+
+export declare const ROUTER_EMBEDDING_MODEL: string;
+export declare const ROUTER_MIN_SCORE: number;
+export declare const ROUTER_CACHE_FILE: string;
+export declare function hashContent(text: string): string;
+export declare function cosineSimilarity(a: number[], b: number[]): number;
+export declare function fetchEmbeddings(texts: string[], options?: any): Promise<number[][]>;
+export declare function getPlaybookEmbeddings(options?: any): Promise<Record<string, { trigger: string; hash: string; vector: number[] }> | null>;
+export declare function classifyPromptSemantic(prompt: string, options?: any): Promise<{ type: string; score: number; candidates: SemanticCandidate[] } | null>;
+
+export declare const DEFAULT_CONTEXT_BUDGET_TOKENS: number;
+export declare function estimateTokens(text: string): number;
+export declare function extractHeader(content: string, maxLines?: number): string;
+export declare function planContext(options?: any): {
+  withinBudget: boolean;
+  estimatedTokens: number;
+  budgetTokens: number;
+  filesContext: string;
+  playbookText: string;
+  principlesText: string;
+  trimmed: string[];
+  omittedPrinciples: string[];
+  aborted: boolean;
+  abortReason: string | null;
+};
+
+export interface GradeVerdict {
+  principle: string;
+  applies: boolean;
+  verdict: 'pass' | 'warn' | 'fail';
+  rationale: string;
+  evidence: string[];
+}
+
+export declare const GRADER_MAX_CHUNK_CHARS: number;
+export declare const GRADER_MAX_PRINCIPLES: number;
+export declare function splitDiffIntoChunks(diffText: string, maxChars?: number): Array<{ index: number; total: number; header: string; body: string; truncated?: boolean }>;
+export declare function rankPrinciples(diffText: string, options?: any): Array<{ id: string; score: number; snippet: string }>;
+export declare function validateVerdicts(value: any): { ok: boolean; error?: string; verdicts?: GradeVerdict[] };
+export declare function gradeDiff(diffText: string, options?: any): Promise<{
+  verdicts: GradeVerdict[];
+  chunked: boolean;
+  principles: string[];
+  model: string;
+  raw: string;
+  retried?: boolean;
+  parseError?: string;
+}>;
+export declare function formatVerdictTable(verdicts: GradeVerdict[]): string;
+
+export declare const DEFAULT_GATEWAY_TIMEOUT_MS: number;
+export declare const GATEWAY_MAX_ATTEMPTS: number;
+export declare const GATEWAY_BACKOFF_BASE_MS: number;
+export declare const GATEWAY_BACKOFF_CAP_MS: number;
+export declare const GATEWAY_RETRYABLE_STATUS: Set<number>;
+export declare function resolveGatewayTimeoutMs(options?: any): number;
+export declare class GatewayError extends Error {
+  kind: 'unreachable' | 'timeout' | 'http' | 'parse';
+  status: number | null;
+  baseUrl?: string;
+  attempts: number;
+}
+export declare function parseRetryAfterMs(value: any, nowMs?: number): number | null;
+export declare function gatewayFetch(url: string, options?: any): Promise<{ data: any; status: number; attempts: number }>;
+
+export interface ManifestDoc {
+  id?: string;
+  title?: string;
+  applyWhen?: string;
+  keywords?: string[];
+  requires?: string[];
+  version?: string;
+  [key: string]: any;
+}
+
+export declare function parseDoc(text: string, source?: string): { data: ManifestDoc | null; body: string; fallback: boolean };
+export declare function validateDocs(docs: Array<{ source?: string; id?: string; data?: ManifestDoc | null }>): { ok: boolean; errors: string[] };
+
+export interface TriageCandidate {
+  playbook: string;
+  trigger: string;
+  confidence: number;
+  reason: string;
+  nextCommands: string[];
+}
+
+export declare const TRIAGE_DEFAULT_BUDGET_TOKENS: number;
+export declare const TRIAGE_MAX_CANDIDATES: number;
+export declare function capTriageInput(input: any, options?: any): { text: string; trimmed: boolean; estimatedTokens: number; budgetTokens: number; note: string | null };
+export declare function splitFailures(text: any): string[];
+export declare function heuristicTriage(text: any, options?: any): TriageCandidate[];
+export declare function triageFailure(options?: any): Promise<{ candidates: TriageCandidate[]; heuristicOnly: boolean; notice: string | null; notes: string[]; retried?: boolean }>;
+
+export declare const OFFLOAD_DEFAULT_ROLE: string;
+export declare const OFFLOAD_DEFAULT_BUDGET_TOKENS: number;
+export declare const OFFLOAD_DEFAULT_MAX_FILES: number;
+export declare const OFFLOAD_DEFAULT_MAX_FILE_BYTES: number;
+export declare function walkPaths(paths: string[], options?: any): Promise<string[]>;
+export declare function rankOffloadFiles(query: string, filesWithText: Array<{ file: string; content: string }>): Array<{ file: string; score: number; fileHits: number; contentHits: number }>;
+export declare function runContextOffload(options?: any, deps?: any): Promise<{
+  ok: boolean;
+  answer: string;
+  findings: Array<{ file: string; line?: number; claim: string; confidence: number | null }>;
+  uncovered?: string[];
+  filesScanned: number;
+  filesAttached: number;
+  estimatedTokens: number;
+  omitted: string[];
+  model: string | null;
+  role: string;
+  durationMs: number;
+  error?: string;
+}>;
+export declare function formatOffloadReport(result: any): string;
+
+export declare const HISTORY_PREVIEW_CHARS: number;
+export declare const HISTORY_DEFAULT_LIMIT: number;
+export declare function historyPath(pathOverride?: string): string;
+export declare function appendHistory(entry: any, pathOverride?: string): boolean;
+export declare function readHistory(options?: any): { entries: any[]; skipped: number; total: number };
+export declare function lastEntry(pathOverride?: string): any;
+export declare function needsRerunConfirm(entry: any): boolean;
+export declare function resetHistoryWarnings(): void;

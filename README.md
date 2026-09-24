@@ -116,6 +116,18 @@ Pass any task description. `zstack` analyzes the prompt, identifies the matching
 zstack "Fix unhandled promise rejection in auth retry loop"
 ```
 
+Confident matches run directly. Ambiguous matches offer guided playbook selection:
+the classifier scores every trigger (keyword hits plus a specificity bonus) and a
+match is confident only when the top candidate scores >= 1.0 and leads the
+runner-up by >= 0.5. Otherwise the CLI prints the top three candidates with
+their trigger lines and prompts for a number, a playbook id, or Enter for the
+top candidate (`--playbook <id>` always bypasses; non-interactive shells fall
+back to the top candidate with a warning). When the keyword match is ambiguous
+and the ModelHitch gateway is reachable, an embedding-based semantic router
+(`classifyPromptSemantic` in `src/router.mjs`, cached in
+`verification/playbook-embeddings.json`) refines the choice; otherwise the
+keyword result stands unchanged.
+
 ### 2. Task with Explicit Playbook and File Attachments
 
 Specify a playbook explicitly and attach local source files for bounded context:
@@ -123,6 +135,12 @@ Specify a playbook explicitly and attach local source files for bounded context:
 ```bash
 zstack task feature "Add token bucket rate limiting to refresh route" --files src/auth.ts,src/server.ts
 ```
+
+Attached files pass through the context budgeter (default 12000 tokens, `~4
+chars/token` estimate). Over budget, file bodies truncate with explicit
+`[... omitted lines X-Y ...]` markers and trailing principles drop with a note;
+`--no-prune` aborts instead of trimming, and `--context-budget <tokens>` sets a
+custom budget.
 
 ### 3. Adversarial Multi-Family Panel Review
 
@@ -132,7 +150,19 @@ Dispatch an architecture question or proposed diff to a multi-model panel:
 zstack panel "Should we use optimistic concurrency or distributed locks for ledger balances?"
 ```
 
-### 4. Rule Synchronization
+### 4. Principle Grading
+
+Grade a proposed diff against the 20 principles with structured verdicts
+(`pass` / `warn` / `fail` plus rationale and evidence lines):
+
+```bash
+zstack grade --file diff.patch
+```
+
+Oversized diffs chunk by file hunk (merged verdicts marked chunked); unparseable
+model output retries once and is reported as a parse error, never fabricated.
+
+### 5. Rule Synchronization
 
 Inspect active ModelHitch providers and generate or update Cursor rules:
 
@@ -144,7 +174,7 @@ zstack sync
 zstack sync --project
 ```
 
-### 5. Upstream Synchronization
+### 6. Upstream Synchronization
 
 Check the canonical `pstack` repository (`cursor/plugins/tree/main/pstack`) on demand for new commits, playbooks, or principle updates:
 
@@ -159,7 +189,7 @@ zstack update --apply
 zstack update --check
 ```
 
-### 6. Introspection & Health
+### 7. Introspection & Health
 
 ```bash
 # Display system overview, tenets, and package metadata
@@ -174,6 +204,80 @@ zstack playbooks
 # List all 20 principles and when to apply them
 zstack principles
 ```
+
+### 8. Scripting Output
+
+`status`, `playbooks`, `principles`, `budget`, `task`, `prompt`, and `panel`
+accept a global `--json` flag emitting a single JSON document on stdout
+(diagnostics go to stderr). Exit codes: 0 success, 1 failure, 2 usage error,
+3 gateway unreachable, 4 partial panel failure. `--json` disables interactive
+prompts and uses defaults.
+
+```bash
+zstack status --json
+zstack budget max --source catalog --json  # preview only; add --confirm to apply
+```
+
+### 9. Interactive Shell
+
+A persistent session with sticky playbook, files, role, model, and JSON mode:
+
+```bash
+zstack shell  # alias: zstack repl
+```
+
+Each line runs the one-shot path (classification, guided selection, task).
+Session commands: `/playbook <id>`, `/files <a,b>`, `/role <role>`,
+`/model <m>`, `/json on|off`, `/context <tokens>`, `/status`, `/help`, `/exit`.
+
+### 10. Failure Triage
+
+Turn test output, stack traces, or logs into a ranked playbook decision:
+
+```bash
+zstack triage --file failure.log [--json] [--no-live]
+```
+
+Heuristic keyword scoring ranks up to 3 candidates with literal `zstack`
+follow-ups; when the gateway is reachable a strict-JSON model pass refines the
+choice, otherwise output is marked `[!] heuristic only`. Stdin is accepted when
+piped.
+
+### 11. Context Offload Search
+
+Delegate bulk file reads to a throwaway subagent that returns only a distilled
+report (raw bodies never enter the parent context):
+
+```bash
+zstack explore "where is context budget trimming implemented" --paths src,tests --json
+```
+
+### 12. Run History
+
+One JSON line per task/prompt/panel run in `~/.zstack/history.jsonl`
+(`ZSTACK_HISTORY_PATH` overrides; previews cap at 200 chars):
+
+```bash
+zstack history --limit 10 [--json]
+zstack history --last --rerun [--yes]  # --yes required when the preview was truncated
+```
+
+## Gateway Reliability
+
+Per-request timeout defaults to 30000ms (`--timeout <ms>` or
+`MODELHITCH_TIMEOUT`). Idempotent GETs (health, config, models) retry up to 3
+times with exponential backoff (250ms base, 2000ms cap), honoring `Retry-After`
+on 429 and retrying 502/503/504 — never 400/401/403/404/422, and never POSTs.
+Failures are structured `{ kind, status, message, baseUrl, attempts }` with
+kinds `unreachable`/`timeout` (exit 3), `http`/`parse` (exit 1).
+
+## Document Contract
+
+Playbooks and principles support an optional leading `---` frontmatter block
+(`id`, `title`, `applyWhen`, `keywords`/`requires` arrays, `version`), parsed
+without dependencies by `src/manifest.mjs`. Documents without frontmatter keep
+today's extraction with a one-time stderr warning. Mismatched ids, duplicate
+ids, and non-array `keywords` are validation errors.
 
 ---
 
