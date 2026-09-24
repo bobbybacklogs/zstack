@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ZStackVerificationEvidence",
+  "type": "object",
+  "required": ["timestamp", "task", "status", "checks"],
+  "properties": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "task": {
+      "type": "string",
+      "description": "Short description of the task or feature verified"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["passed", "failed", "partially_verified"]
+    },
+    "principlesCited": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of principles that guided the verification decisions"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "command", "passed", "exitCode"],
+        "properties": {
+          "name": { "type": "string" },
+          "command": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "exitCode": { "type": "integer" },
+          "durationMs": { "type": "number" },
+          "outputSnippet": { "type": "string" }
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "modelUsed": { "type": "string" },
+        "tokenUsage": { "type": "integer" },
+        "latencyMs": { "type": "number" }
+      }
+    }
+  }
+}
