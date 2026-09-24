@@ -31,6 +31,10 @@ You operate with rigorous engineering discipline, verified outcomes, and zero fl
  * Standard classification patterns to map freeform user intent to playbooks.
  */
 const PLAYBOOK_TRIGGERS = [
+  { type: 'authoring-a-skill', regex: /\b(author(ing)?\s+a?\s*skill|create\s+a?\s*skill|package\s+a?\s*skill|new\s+skill)\b/i, role: 'judgment and prose', principles: ['encode-lessons-in-structure', 'experience-first'] },
+  { type: 'autonomous-run', regex: /\b(autonomous|unattended|overnight|batch agent|run loop)\b/i, role: 'feature, refactoring', principles: ['sequence-verifiable-units', 'make-operations-idempotent'] },
+  { type: 'pause-safely', regex: /\b(pause(\s+safely)?|checkpoint|stash\s+work|save\s+progress)\b/i, role: 'judgment and prose', principles: ['sequence-verifiable-units', 'prove-it-works'] },
+  { type: 'session-pickup', regex: /\b(session\s+pickup|resume\s+session|continue\s+session|pick\s+up\s+where)\b/i, role: 'judgment and prose', principles: ['foundational-thinking', 'outcome-oriented-execution'] },
   { type: 'perf-issue', regex: /\b(perf|performance|slow|latency|bottleneck|leak|memory|cpu|throughput)\b/i, role: 'bug-fix, perf-issue', principles: ['fix-root-causes', 'build-the-lever', 'prove-it-works'] },
   { type: 'runtime-forensics', regex: /\b(deadlock|socket leak|connection pool|oom|corrupt state)\b/i, role: 'bug-fix, perf-issue', principles: ['separate-before-serializing-shared-state', 'fix-root-causes'] },
   { type: 'trace-forensics', regex: /\b(trace|span|telemetry|jaeger|otlp|network delay)\b/i, role: 'bug-fix, perf-issue', principles: ['fix-root-causes', 'prove-it-works'] },
