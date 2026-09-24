@@ -5,8 +5,9 @@ import {
   fetchModelHitchState,
   resolveRoleMapping,
   sendChat,
-  ZSTACK_ROLES
-} from '../src/connector.mjs';
+  ZSTACK_ROLES,
+  ZStack
+} from '../src/index.mjs';
 
 describe('zstack ModelHitch connector', () => {
   it('connects to local ModelHitch bridge and checks health', async () => {
@@ -40,5 +41,38 @@ describe('zstack ModelHitch connector', () => {
     });
     assert.ok(res.content.length > 0, 'Response content should not be empty');
     assert.ok(res.usage.total_tokens > 0, 'Usage should track tokens');
+  });
+});
+
+describe('zstack SDK class', () => {
+  const z = new ZStack();
+
+  it('lists playbooks and principles', () => {
+    const playbooks = z.listPlaybooks();
+    assert.equal(playbooks.length, 15, 'Should find 15 playbooks');
+
+    const principles = z.listPrinciples();
+    assert.equal(principles.length, 20, 'Should find 20 principles');
+  });
+
+  it('classifies prompts into appropriate playbooks', () => {
+    const bug = z.classifyPrompt('Fix memory leak in web socket handler');
+    assert.equal(bug.type, 'perf-issue');
+
+    const feat = z.classifyPrompt('Implement OAuth2 token rotation');
+    assert.equal(feat.type, 'feature');
+
+    const ref = z.classifyPrompt('Clean up legacy unused helper functions');
+    assert.equal(ref.type, 'refactoring');
+  });
+
+  it('executes a task with playbook grounding via ModelHitch', async () => {
+    const res = await z.task({
+      prompt: 'Respond with ONLY: "task verified"',
+      playbook: 'feature'
+    });
+    assert.ok(res.content.includes('task verified') || res.content.length > 0);
+    assert.ok(res.usage.total_tokens > 0);
+    assert.equal(res.playbook, 'feature');
   });
 });

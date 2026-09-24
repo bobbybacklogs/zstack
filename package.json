@@ -3,7 +3,15 @@
   "version": "0.1.0",
   "description": "Agent Operating System for Rigorous Engineering powered by ModelHitch",
   "type": "module",
-  "main": "src/index.mjs",
+  "main": "./src/index.mjs",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.mjs",
+      "default": "./src/index.mjs"
+    }
+  },
   "bin": {
     "zstack": "bin/zstack.mjs"
   },
