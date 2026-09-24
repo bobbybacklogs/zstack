@@ -123,6 +123,31 @@ zstack/
 
 ---
 
+## ModelHitch Connector Harness
+
+`zstack` includes a built-in connector and CLI harness that connects directly to ModelHitch (`http://127.0.0.1:3939/v1`). It dynamically queries ModelHitch's live catalog, detects your active providers (OpenCode, OpenAI, Gemini, DeepSeek, OpenRouter, etc.), and automatically resolves the best model for each engineering role.
+
+### Commands
+
+```bash
+# Check ModelHitch bridge health, active providers, and current role mappings
+node bin/zstack.mjs status
+
+# Automatically sync Cursor rules with currently active ModelHitch models
+node bin/zstack.mjs sync
+
+# Run a prompt directly against any role's assigned model
+node bin/zstack.mjs run "feature" "Build token rotation handler"
+
+# Run an adversarial critique across the multi-family panel in parallel
+node bin/zstack.mjs panel "Should we use optimistic concurrency or distributed locks?"
+
+# List available models in ModelHitch grouped by provider
+node bin/zstack.mjs models
+```
+
+---
+
 ## Quickstart
 
 ### 1. Ensure ModelHitch is Running
@@ -133,12 +158,15 @@ modelhitch status
 modelhitch bridge --background
 ```
 
-### 2. Configure Model Roles
-Run the setup command or inspect `setup-zstack`:
+### 2. Sync Model Roles via Harness
+Run the sync command to write `~/.cursor/rules/zstack-models.mdc`:
+```bash
+node bin/zstack.mjs sync
+```
+Or use the agent setup command:
 ```
 /setup-zstack
 ```
-This generates your local rule file configuring role-to-model mappings directed at your ModelHitch bridge.
 
 ### 3. Enter zstack Mode
 In your AI editor / agent prompt, prefix multi-step tasks with:
@@ -147,3 +175,4 @@ In your AI editor / agent prompt, prefix multi-step tasks with:
 ```
 
 The router classifies your task, reads the applicable principles, selects the matching playbook, writes a verifiable todolist, delegates sub-tasks through ModelHitch, and verifies the final result before reporting done.
+

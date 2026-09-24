@@ -36,12 +36,21 @@ interrogate reviewers    claude-sonnet-4-6, gpt-5.5, deepseek-v4-pro, qwen3.7-ma
 ### 1. Verify ModelHitch Status
 Check that ModelHitch is running locally on port 3939:
 ```bash
+node bin/zstack.mjs status
+```
+Or curl the bridge:
+```bash
 curl http://127.0.0.1:3939/v1/models
 ```
-Confirm the OpenCode Zen and OpenCode Go upstream routes are hitched in your `~/.modelhitch/config.json`.
 
 ### 2. Configure Editor Model Rule
-When using Cursor, generate `~/.cursor/rules/zstack-models.mdc`:
+Run the automated sync command to query ModelHitch and write `~/.cursor/rules/zstack-models.mdc`:
+```bash
+node bin/zstack.mjs sync
+```
+This automatically inspects your active providers (OpenCode if present, or Hitch's other active providers like OpenAI, Gemini, DeepSeek) and writes the optimal mapping.
+
+Alternatively, manual rule shape:
 
 ```markdown
 ---

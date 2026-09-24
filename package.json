@@ -1,0 +1,25 @@
+{
+  "name": "zstack",
+  "version": "0.1.0",
+  "description": "Agent Operating System for Rigorous Engineering powered by ModelHitch",
+  "type": "module",
+  "main": "src/index.mjs",
+  "bin": {
+    "zstack": "bin/zstack.mjs"
+  },
+  "scripts": {
+    "status": "node bin/zstack.mjs status",
+    "sync": "node bin/zstack.mjs sync",
+    "test": "node tests/connector.test.mjs"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "modelhitch",
+    "opencode",
+    "verification",
+    "playbooks"
+  ],
+  "author": "genoventures-labs",
+  "license": "MIT"
+}
