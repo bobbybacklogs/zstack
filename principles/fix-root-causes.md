@@ -1,3 +1,10 @@
+---
+id: fix-root-causes
+title: Fix Root Causes
+applyWhen: Debugging, resolving test failures, or triaging production errors.
+keywords: [fix, root, causes, debugging, resolving, failures, triaging, production]
+version: 1
+---
 # Fix Root Causes
 
 > **Apply when:** Debugging, resolving test failures, or triaging production errors.

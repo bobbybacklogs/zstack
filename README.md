@@ -271,13 +271,64 @@ on 429 and retrying 502/503/504 — never 400/401/403/404/422, and never POSTs.
 Failures are structured `{ kind, status, message, baseUrl, attempts }` with
 kinds `unreachable`/`timeout` (exit 3), `http`/`parse` (exit 1).
 
+### Tool Calls
+
+The gateway normalizes provider tool-call behavior so clients never handle
+vendor wire quirks.
+
+- **DSML recovery.** DeepSeek V4 models sometimes write their internal
+  tool-call syntax into the text channel instead of populating `tool_calls`,
+  which ships raw `<｜DSML｜function_calls>` markup to the caller. The gateway
+  parses that markup, returns real `tool_calls`, and strips the markup from
+  `content`. Recovery runs on streaming and non-streaming paths, and only when
+  the provider returned no genuine tool calls, so quoted markup in ordinary
+  prose is left alone. Named parameters map directly; positional parameters map
+  onto the declared tool schema's properties in order.
+- **Session headers.** Requests carry a per-conversation session id, taken from
+  the client's session header when present and derived from the conversation
+  otherwise. OpenCode Go requires `x-opencode-session` and rejects requests
+  without it (`MissingSessionID`, HTTP 400), so the OpenCode provider always
+  sends it on every wire; Zen uses the same id for routing and cache affinity.
+
+
 ## Document Contract
 
-Playbooks and principles support an optional leading `---` frontmatter block
-(`id`, `title`, `applyWhen`, `keywords`/`requires` arrays, `version`), parsed
-without dependencies by `src/manifest.mjs`. Documents without frontmatter keep
-today's extraction with a one-time stderr warning. Mismatched ids, duplicate
-ids, and non-array `keywords` are validation errors.
+Every playbook and principle ships with a leading `---` frontmatter block (`id`,
+`title`, `applyWhen`, `keywords`/`requires` arrays, `version`), parsed without
+dependencies by `src/manifest.mjs`. Frontmatter is the contract, not a nicety:
+it is what supplies the `applyWhen` trigger text and the keyword set that
+classification scores against, so a document without it silently degrades
+routing. Missing frontmatter falls back to legacy extraction and reports the
+affected files in a single aggregated warning rather than one line per document.
+The SDK strips frontmatter before dispatch, so a playbook or principle fetched
+through `getPlaybook`/`getPrinciple` is model-ready body text. Mismatched ids,
+duplicate ids, and non-array `keywords` are validation errors.
+
+## Provider Lanes
+
+A lane pins which provider family role models resolve from, so you can choose
+between OpenCode's pay-per-use catalog, its flat-rate Go subscription, or plain
+ModelHitch routing without editing role mappings by hand.
+
+| Lane | Prefix | Description |
+| --- | --- | --- |
+| `auto` | — | Zen when an OpenCode key is active, otherwise hitch |
+| `zen` | `opencode/` | OpenCode Zen pay-per-use models |
+| `go` | `opencode-go/` | OpenCode Go and Go Plus flat-rate models |
+| `hitch` | — | No OpenCode preference; active ModelHitch providers and config default |
+
+```bash
+zstack budget med-high --source catalog --lane go --confirm
+zstack --go "Fix the flaky retry test"        # one-shot override
+zstack --zen "Refactor the parser"            # aliases: --zen, --go, --hitch
+zstack --lane hitch "Investigate the timeout"
+```
+
+Lane resolution applies whenever the source is `catalog`. With
+`--source config` your ModelHitch policy pins the models, so the lane is recorded
+but not applied and the mapping reports `laneApplied: false`. The stored lane
+survives a tier-only update. Every lane is validated against the live catalog, so
+a resolved model the gateway does not serve is never selected.
 
 ---
 
@@ -302,6 +353,23 @@ const result = await z.task({
 console.log(result.content);
 console.log(`Executed by ${result.model} (${result.durationMs}ms)`);
 console.log(`Tokens used: ${result.usage.total_tokens}`);
+```
+
+### Provider Lanes
+
+```typescript
+// Pin the lane for one call without touching stored settings
+const result = await z.task({
+  prompt: 'Fix the flaky retry test',
+  lane: 'go' // auto | zen | go | hitch
+});
+
+// Persist a lane, then read back the resolved mapping
+const budget = await z.setBudget('med-high', 'catalog', 'go');
+console.log(budget.laneApplied); // false when source=config pins models
+for (const [role, model] of Object.entries(budget.models)) {
+  console.log(`${role} -> ${model}`);
+}
 ```
 
 ### Parallel Adversarial Panel Review

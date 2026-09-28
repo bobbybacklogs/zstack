@@ -21,8 +21,10 @@ import {
 import {
   BUDGET_TIERS,
   BUDGET_SOURCES,
+  LANES,
   getStoredBudget,
   saveStoredBudget,
+  normalizeLane,
   resolveBudgetMapping
 } from './budget.mjs';
 import { classifyPromptSemantic, ROUTER_MIN_SCORE } from './router.mjs';
@@ -33,12 +35,38 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const DEFAULT_ROOT_DIR = join(__dirname, '..');
 
-// Tracks frontmatter-fallback warnings so each file warns at most once per process.
-const warnedFallback = new Set();
-function warnFallback(source) {
-  if (warnedFallback.has(source)) return;
-  warnedFallback.add(source);
-  console.error(`[manifest] ${source}: no frontmatter, using legacy extraction`);
+// Documents indexed without frontmatter (legacy extraction). Shipped playbooks
+// and principles all carry frontmatter, so this only fills for user-authored
+// documents; they are reported once per process as a single aggregated line
+// rather than one line per file, which used to bury CLI output (e.g. --about).
+const legacyExtractionSources = new Set();
+
+/** Sources indexed so far via legacy extraction, in first-seen order. */
+export function getLegacyExtractionSources() {
+  return [...legacyExtractionSources];
+}
+
+/** Clear the legacy-extraction report (tests only). */
+export function resetLegacyExtractionSources() {
+  legacyExtractionSources.clear();
+}
+
+function reportLegacyExtraction(sources) {
+  if (sources.length === 0) return;
+  console.error(
+    `[manifest] ${sources.length} document(s) without frontmatter, using legacy extraction: ${sources.join(', ')}`
+  );
+}
+
+/** Record newly seen legacy sources and return only those not reported before. */
+function trackLegacyExtraction(sources) {
+  const fresh = [];
+  for (const source of sources) {
+    if (legacyExtractionSources.has(source)) continue;
+    legacyExtractionSources.add(source);
+    fresh.push(source);
+  }
+  return fresh;
 }
 
 /**
@@ -99,8 +127,10 @@ export function scorePlaybookTriggers(text) {
 
 /**
  * Standard classification patterns to map freeform user intent to playbooks.
+ * Exported as the single source of truth for per-playbook principles, which the
+ * frontmatter backfill script and the manifest drift test both consume.
  */
-const PLAYBOOK_TRIGGERS = [
+export const PLAYBOOK_TRIGGERS = [
   { type: 'authoring-a-skill', regex: /\b(author(ing)?\s+a?\s*skill|create\s+a?\s*skill|package\s+a?\s*skill|new\s+skill)\b/i, role: 'judgment and prose', principles: ['encode-lessons-in-structure', 'experience-first'] },
   { type: 'autonomous-run', regex: /\b(autonomous|unattended|overnight|batch agent|run loop)\b/i, role: 'feature, refactoring', principles: ['sequence-verifiable-units', 'make-operations-idempotent'] },
   { type: 'pause-safely', regex: /\b(pause(\s+safely)?|checkpoint|stash\s+work|save\s+progress)\b/i, role: 'judgment and prose', principles: ['sequence-verifiable-units', 'prove-it-works'] },
@@ -139,21 +169,16 @@ export class ZStack {
     }
     const state = await fetchModelHitchState(this.baseUrl, { timeoutMs: this.timeoutMs });
     const stored = this.getBudget();
-    let mapping;
-    let budget = null;
-    try {
-      budget = await this.getBudgetMapping(state);
-      mapping = { mode: state.activeProviders.includes('opencode') || state.activeProviders.includes('opencode-go') ? 'opencode-zen-go' : 'modelhitch-multi-provider', models: budget.models, panelList: budget.panelList };
-    } catch {
-      const legacy = resolveRoleMapping(state);
-      mapping = legacy;
-    }
+    const mapping = await this.resolveRoleMapping(state);
+    const budget = mapping.tierInfo ? mapping : null;
     return {
       ok: true,
       baseUrl: this.baseUrl,
       message: health.message,
       activeProviders: state.activeProviders,
       mode: mapping.mode,
+      lane: budget?.lane ?? null,
+      laneInfo: budget?.laneInfo ?? null,
       mapping: mapping.models,
       panelModels: mapping.panelList,
       budget: stored,
@@ -169,21 +194,41 @@ export class ZStack {
   }
 
   /**
-   * Resolve the active budget mapping against live ModelHitch state.
-   * Pass a pre-fetched state to avoid an extra network round-trip.
+   * Resolve the active role mapping from live gateway state, honoring a lane
+   * override. Budget mapping is preferred; the connector's legacy resolver is
+   * the documented fallback when budget resolution cannot run at all.
    */
-  async getBudgetMapping(cachedState = null) {
-    const state = cachedState || await fetchModelHitchState(this.baseUrl, { timeoutMs: this.timeoutMs });
-    const stored = getStoredBudget();
-    return resolveBudgetMapping({ tier: stored.tier, source: stored.source, state });
+  async resolveRoleMapping(state, lane = null) {
+    try {
+      return await this.getBudgetMapping(state, lane);
+    } catch {
+      const stored = getStoredBudget();
+      return resolveRoleMapping(state, { lane: normalizeLane(lane || stored.lane) });
+    }
   }
 
   /**
-   * Persist a new budget tier/source. Does not sync Cursor rules by itself;
-   * call syncRules() afterwards or use the CLI `budget` command which
-   * previews the mapping and requires explicit confirmation beforehand.
+   * Resolve the active budget mapping against live ModelHitch state.
+   * Pass a pre-fetched state to avoid an extra network round-trip, and a lane to
+   * override the stored provider lane for this call only (used by --zen/--go/--hitch).
    */
-  async setBudget(tier, source = null) {
+  async getBudgetMapping(cachedState = null, lane = null) {
+    const state = cachedState || await fetchModelHitchState(this.baseUrl, { timeoutMs: this.timeoutMs });
+    const stored = getStoredBudget();
+    return resolveBudgetMapping({
+      tier: stored.tier,
+      source: stored.source,
+      lane: lane || stored.lane,
+      state
+    });
+  }
+
+  /**
+   * Persist a new budget tier, model source, and/or provider lane. Does not sync
+   * Cursor rules by itself; call syncRules() afterwards or use the CLI `budget`
+   * command which previews the mapping and requires explicit confirmation.
+   */
+  async setBudget(tier, source = null, lane = null) {
     if (!BUDGET_TIERS[tier]) {
       throw new Error(`Unknown budget tier: ${tier}. Valid tiers: ${Object.keys(BUDGET_TIERS).join(', ')}`);
     }
@@ -192,7 +237,8 @@ export class ZStack {
     if (nextSource !== 'config' && nextSource !== 'catalog') {
       throw new Error(`Unknown budget source: ${nextSource}. Valid sources: config, catalog`);
     }
-    const saved = saveStoredBudget({ tier, source: nextSource });
+    const nextLane = normalizeLane(lane || stored.lane);
+    const saved = saveStoredBudget({ tier, source: nextSource, lane: nextLane });
     void saved;
     return await this.getBudgetMapping();
   }
@@ -226,7 +272,8 @@ export class ZStack {
   listPlaybooks() {
     const playbooksDir = join(this.rootDir, 'playbooks');
     if (!existsSync(playbooksDir)) return [];
-    return readdirSync(playbooksDir)
+    const legacy = [];
+    const list = readdirSync(playbooksDir)
       .filter(f => f.endsWith('.md'))
       .map(file => {
         const id = file.replace(/\.md$/, '');
@@ -250,7 +297,7 @@ export class ZStack {
             version: parsed.data.version || null
           };
         }
-        warnFallback(`playbooks/${file}`);
+        legacy.push(`playbooks/${file}`);
         const triggerMatch = content.match(/> \*\*Trigger:\*\*\s*(.+)/i);
         const titleMatch = content.match(/^#\s+(.+)$/m);
         return {
@@ -264,10 +311,14 @@ export class ZStack {
           version: null
         };
       });
+    reportLegacyExtraction(trackLegacyExtraction(legacy));
+    return list;
   }
 
   /**
-   * Get contents of a specific playbook.
+   * Get the dispatchable contents of a specific playbook: the document body with
+   * any frontmatter stripped. Frontmatter is index metadata (id, applyWhen,
+   * keywords) and would otherwise be billed as prompt tokens on every task.
    */
   getPlaybook(name) {
     const clean = name.replace(/\.md$/, '');
@@ -275,7 +326,7 @@ export class ZStack {
     if (!existsSync(playbookPath)) {
       throw new Error(`Playbook not found: ${clean} (searched ${playbookPath})`);
     }
-    return readFileSync(playbookPath, 'utf8');
+    return parseDoc(readFileSync(playbookPath, 'utf8'), `playbooks/${clean}.md`).body;
   }
 
   /**
@@ -285,7 +336,8 @@ export class ZStack {
   listPrinciples() {
     const principlesDir = join(this.rootDir, 'principles');
     if (!existsSync(principlesDir)) return [];
-    return readdirSync(principlesDir)
+    const legacy = [];
+    const list = readdirSync(principlesDir)
       .filter(f => f.endsWith('.md'))
       .map(file => {
         const id = file.replace(/\.md$/, '');
@@ -309,7 +361,7 @@ export class ZStack {
             version: parsed.data.version || null
           };
         }
-        warnFallback(`principles/${file}`);
+        legacy.push(`principles/${file}`);
         const applyMatch = content.match(/> \*\*Apply when:\*\*\s*(.+)/i);
         const titleMatch = content.match(/^#\s+(.+)$/m);
         return {
@@ -323,10 +375,13 @@ export class ZStack {
           version: null
         };
       });
+    reportLegacyExtraction(trackLegacyExtraction(legacy));
+    return list;
   }
 
   /**
-   * Get contents of a specific principle.
+   * Get the dispatchable contents of a specific principle: the document body
+   * with any frontmatter stripped (see getPlaybook).
    */
   getPrinciple(name) {
     const clean = name.replace(/\.md$/, '');
@@ -334,7 +389,7 @@ export class ZStack {
     if (!existsSync(principlePath)) {
       throw new Error(`Principle not found: ${clean} (searched ${principlePath})`);
     }
-    return readFileSync(principlePath, 'utf8');
+    return parseDoc(readFileSync(principlePath, 'utf8'), `principles/${clean}.md`).body;
   }
 
   /**
@@ -469,17 +524,12 @@ export class ZStack {
       '\n## Applicable Principles:\n' + principlesText
     ].filter(Boolean).join('\n\n');
 
-    // Resolve assigned model from ModelHitch (budget-aware, legacy fallback)
+    // Resolve assigned model from ModelHitch (budget- and lane-aware, legacy fallback)
     const state = await fetchModelHitchState(this.baseUrl, { timeoutMs: this.timeoutMs });
     let targetModel = options.model;
     if (!targetModel) {
-      try {
-        const budgetMapping = resolveBudgetMapping({ tier: getStoredBudget().tier, source: getStoredBudget().source, state });
-        targetModel = budgetMapping.models[roleName] || budgetMapping.models['feature, refactoring'];
-      } catch {
-        const mapping = resolveRoleMapping(state);
-        targetModel = mapping.models[roleName] || mapping.models['feature, refactoring'];
-      }
+      const mapping = await this.resolveRoleMapping(state, options.lane);
+      targetModel = mapping.models[roleName] || mapping.models['feature, refactoring'];
     }
 
     const messages = [
@@ -532,25 +582,19 @@ export class ZStack {
       });
     }
     const state = await fetchModelHitchState(this.baseUrl, { timeoutMs: this.timeoutMs });
-    try {
-      const budgetMapping = resolveBudgetMapping({ tier: getStoredBudget().tier, source: getStoredBudget().source, state });
-      const assignedModel = budgetMapping.models[role] || budgetMapping.models['feature, refactoring'];
-      const messages = [
-        ...(options.system ? [{ role: 'system', content: options.system }] : []),
-        { role: 'user', content: prompt }
-      ];
-      const chatRes = await sendChat({ model: assignedModel, messages, baseUrl: this.baseUrl, temperature: options.temperature ?? 0.2, maxTokens: options.maxTokens, timeoutMs: options.timeoutMs ?? this.timeoutMs });
-      return { content: chatRes.content, model: chatRes.model, usage: chatRes.usage, durationMs: chatRes.durationMs, raw: chatRes.raw };
-    } catch {
-      return await connectorRunRole(role, prompt, {
-        ...options,
-        baseUrl: this.baseUrl
-      });
-    }
+    const budgetMapping = await this.resolveRoleMapping(state, options.lane);
+    const assignedModel = budgetMapping.models[role] || budgetMapping.models['feature, refactoring'];
+    const messages = [
+      ...(options.system ? [{ role: 'system', content: options.system }] : []),
+      { role: 'user', content: prompt }
+    ];
+    const chatRes = await sendChat({ model: assignedModel, messages, baseUrl: this.baseUrl, temperature: options.temperature ?? 0.2, maxTokens: options.maxTokens, timeoutMs: options.timeoutMs ?? this.timeoutMs });
+    return { content: chatRes.content, model: chatRes.model, usage: chatRes.usage, durationMs: chatRes.durationMs, raw: chatRes.raw };
   }
 
   /**
-   * Run an adversarial panel critique across multiple distinct model families (budget-aware).
+   * Run an adversarial panel critique across multiple distinct model families
+   * (budget- and lane-aware).
    */
   async panel(prompt, options = {}) {
     if (options.models) {
@@ -560,34 +604,22 @@ export class ZStack {
       });
     }
     const state = await fetchModelHitchState(this.baseUrl, { timeoutMs: this.timeoutMs });
-    try {
-      const budgetMapping = resolveBudgetMapping({ tier: getStoredBudget().tier, source: getStoredBudget().source, state });
-      return await connectorRunPanel(prompt, {
-        ...options,
-        models: budgetMapping.panelList,
-        baseUrl: this.baseUrl
-      });
-    } catch {
-      return await connectorRunPanel(prompt, {
-        ...options,
-        baseUrl: this.baseUrl
-      });
-    }
+    const budgetMapping = await this.resolveRoleMapping(state, options.lane);
+    return await connectorRunPanel(prompt, {
+      ...options,
+      models: budgetMapping.panelList,
+      baseUrl: this.baseUrl
+    });
   }
 
   /**
-   * Synchronize Cursor rule files with active ModelHitch models (budget-aware).
+   * Synchronize Cursor rule files with active ModelHitch models (budget- and
+   * lane-aware).
    */
   async syncRules(options = {}) {
     const state = await fetchModelHitchState(this.baseUrl, { timeoutMs: this.timeoutMs });
-    const stored = getStoredBudget();
-    try {
-      const budget = resolveBudgetMapping({ tier: stored.tier, source: stored.source, state });
-      return syncCursorRules({ mapping: { models: budget.models }, project: options.project, budget });
-    } catch {
-      const mapping = resolveRoleMapping(state);
-      return syncCursorRules({ mapping, project: options.project });
-    }
+    const budget = await this.resolveRoleMapping(state, options.lane);
+    return syncCursorRules({ mapping: { models: budget.models }, project: options.project, budget });
   }
 
   /**

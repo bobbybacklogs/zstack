@@ -1,3 +1,10 @@
+---
+id: sequence-verifiable-units
+title: Sequence Work into Verifiable Units
+applyWhen: Planning multi-file features, broad migrations, or complex system overhauls.
+keywords: [sequence, verifiable, units, planning, multi-file, features, broad, migrations]
+version: 1
+---
 # Sequence Work into Verifiable Units
 
 > **Apply when:** Planning multi-file features, broad migrations, or complex system overhauls.

@@ -1,3 +1,10 @@
+---
+id: outcome-oriented-execution
+title: Outcome-Oriented Execution
+applyWhen: Executing multi-phase migrations, refactors, or capability replacements.
+keywords: [outcome, oriented, execution, executing, multi-phase, migrations, refactors, capability]
+version: 1
+---
 # Outcome-Oriented Execution
 
 > **Apply when:** Executing multi-phase migrations, refactors, or capability replacements.

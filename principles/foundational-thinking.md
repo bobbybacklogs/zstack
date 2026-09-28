@@ -1,3 +1,10 @@
+---
+id: foundational-thinking
+title: Foundational Thinking
+applyWhen: Before writing business logic, designing data models, or sequencing multi-component changes.
+keywords: [foundational, thinking, writing, business, logic, designing, models, sequencing]
+version: 1
+---
 # Foundational Thinking
 
 > **Apply when:** Before writing business logic, designing data models, or sequencing multi-component changes.

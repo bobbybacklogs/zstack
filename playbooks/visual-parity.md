@@ -1,3 +1,11 @@
+---
+id: visual-parity
+title: Visual Parity
+applyWhen: Implementing or refining web, mobile, or desktop UI to match reference designs or mockups.
+keywords: [css, styling, pixel, visual, regression, responsive, layout]
+requires: [experience-first, prove-it-works]
+version: 1
+---
 # Playbook: Visual Parity
 
 > **Trigger:** Implementing or refining web, mobile, or desktop UI to match reference designs or mockups.

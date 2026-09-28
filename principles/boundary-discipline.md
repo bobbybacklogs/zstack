@@ -1,3 +1,10 @@
+---
+id: boundary-discipline
+title: Boundary Discipline
+applyWhen: Wiring external API inputs, HTTP request handlers, CLI arguments, or database integrations.
+keywords: [boundary, discipline, wiring, external, inputs, request, handlers, arguments]
+version: 1
+---
 # Boundary Discipline
 
 > **Apply when:** Wiring external API inputs, HTTP request handlers, CLI arguments, or database integrations.

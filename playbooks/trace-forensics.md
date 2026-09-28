@@ -1,3 +1,11 @@
+---
+id: trace-forensics
+title: Trace Forensics
+applyWhen: Investigating distributed request traces, latency spikes across network boundaries, or downstream timeouts.
+keywords: [trace, span, telemetry, jaeger, otlp, network, delay]
+requires: [fix-root-causes, prove-it-works]
+version: 1
+---
 # Playbook: Trace Forensics
 
 > **Trigger:** Investigating distributed request traces, latency spikes across network boundaries, or downstream timeouts.

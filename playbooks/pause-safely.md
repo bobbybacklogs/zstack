@@ -1,3 +1,11 @@
+---
+id: pause-safely
+title: Pause Safely
+applyWhen: Ending an agent turn, pausing work for human review, or stepping away mid-task.
+keywords: [pause, safely, checkpoint, stash, work, save, progress]
+requires: [sequence-verifiable-units, prove-it-works]
+version: 1
+---
 # Playbook: Pause Safely
 
 > **Trigger:** Ending an agent turn, pausing work for human review, or stepping away mid-task.

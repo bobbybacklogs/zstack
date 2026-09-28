@@ -1,3 +1,10 @@
+---
+id: migrate-callers-then-delete-legacy-apis
+title: Migrate Callers Then Delete Legacy APIs
+applyWhen: Replacing an internal API, function signature, or data contract.
+keywords: [migrate, callers, delete, legacy, apis, replacing, internal, function]
+version: 1
+---
 # Migrate Callers Then Delete Legacy APIs
 
 > **Apply when:** Replacing an internal API, function signature, or data contract.

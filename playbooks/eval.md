@@ -1,3 +1,11 @@
+---
+id: eval
+title: Evaluation & Benchmarking
+applyWhen: Evaluating model quality, prompt changes, classification accuracy, or agent regression suites.
+keywords: [eval, benchmark, accuracy, score, quality, delta]
+requires: [prove-it-works, encode-lessons-in-structure]
+version: 1
+---
 # Playbook: Evaluation & Benchmarking
 
 > **Trigger:** Evaluating model quality, prompt changes, classification accuracy, or agent regression suites.

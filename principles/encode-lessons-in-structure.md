@@ -1,3 +1,10 @@
+---
+id: encode-lessons-in-structure
+title: Encode Lessons in Structure
+applyWhen: Catching yourself writing the same guideline, warning, or manual instruction a second time.
+keywords: [encode, lessons, structure, catching, yourself, writing, guideline, warning]
+version: 1
+---
 # Encode Lessons in Structure
 
 > **Apply when:** Catching yourself writing the same guideline, warning, or manual instruction a second time.

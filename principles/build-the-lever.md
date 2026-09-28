@@ -1,3 +1,10 @@
+---
+id: build-the-lever
+title: Build the Lever
+applyWhen: Performing non-trivial, multi-file, or recurring tasks.
+keywords: [build, lever, performing, non-trivial, multi-file, recurring, tasks]
+version: 1
+---
 # Build the Lever
 
 > **Apply when:** Performing non-trivial, multi-file, or recurring tasks.

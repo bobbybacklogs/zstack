@@ -1,3 +1,10 @@
+---
+id: guard-the-context-window
+title: Guard the Context Window
+applyWhen: Handling large files, reading logs, searching codebases, or planning parallel agent sweeps.
+keywords: [guard, context, window, handling, large, files, reading, searching]
+version: 1
+---
 # Guard the Context Window
 
 > **Apply when:** Handling large files, reading logs, searching codebases, or planning parallel agent sweeps.

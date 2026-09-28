@@ -1,3 +1,11 @@
+---
+id: runtime-forensics
+title: Runtime Forensics
+applyWhen: Debugging active daemon crashes, hung processes, socket exhaustion, or live server state.
+keywords: [deadlock, socket, leak, connection, pool, oom, corrupt, state]
+requires: [separate-before-serializing-shared-state, fix-root-causes, make-operations-idempotent]
+version: 1
+---
 # Playbook: Runtime Forensics
 
 > **Trigger:** Debugging active daemon crashes, hung processes, socket exhaustion, or live server state.

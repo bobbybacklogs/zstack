@@ -1,3 +1,11 @@
+---
+id: session-pickup
+title: Session Pickup
+applyWhen: Resuming development from a previously paused session, handoff note, or existing branch.
+keywords: [session, pickup, resume, continue, pick]
+requires: [foundational-thinking, outcome-oriented-execution]
+version: 1
+---
 # Playbook: Session Pickup
 
 > **Trigger:** Resuming development from a previously paused session, handoff note, or existing branch.

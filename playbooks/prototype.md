@@ -1,3 +1,11 @@
+---
+id: prototype
+title: Prototype / Spike
+applyWhen: Exploring an unproven library, settling a design dispute, or testing performance feasibility.
+keywords: [prototype, spike, explore, experiment, poc, proof, concept]
+requires: [exhaust-the-design-space, never-block-on-the-human, laziness-protocol]
+version: 1
+---
 # Playbook: Prototype / Spike
 
 > **Trigger:** Exploring an unproven library, settling a design dispute, or testing performance feasibility.

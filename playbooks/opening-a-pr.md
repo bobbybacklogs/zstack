@@ -1,3 +1,11 @@
+---
+id: opening-a-pr
+title: Opening a PR
+applyWhen: Packaging completed, verified work into a clean commit series and pull request.
+keywords: [pr, pull, request, commit, summary, diff]
+requires: [minimize-reader-load, sequence-verifiable-units, laziness-protocol, prove-it-works]
+version: 1
+---
 # Playbook: Opening a PR
 
 > **Trigger:** Packaging completed, verified work into a clean commit series and pull request.

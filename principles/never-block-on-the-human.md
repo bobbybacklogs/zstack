@@ -1,3 +1,10 @@
+---
+id: never-block-on-the-human
+title: Never Block on the Human
+applyWhen: Tempted to ask the developer "should I do X?" or "which approach do you prefer?" on reversible work.
+keywords: [never, block, human, tempted, developer, approach, prefer, reversible]
+version: 1
+---
 # Never Block on the Human
 
 > **Apply when:** Tempted to ask the developer "should I do X?" or "which approach do you prefer?" on reversible work.

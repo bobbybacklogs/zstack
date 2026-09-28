@@ -1,3 +1,10 @@
+---
+id: laziness-protocol
+title: Laziness Protocol
+applyWhen: Refactoring, sizing a diff, or tempted to add abstractions, layers, helper utilities, or indirection.
+keywords: [laziness, protocol, refactoring, sizing, tempted, abstractions, layers, helper]
+version: 1
+---
 # Laziness Protocol
 
 > **Apply when:** Refactoring, sizing a diff, or tempted to add abstractions, layers, helper utilities, or indirection.

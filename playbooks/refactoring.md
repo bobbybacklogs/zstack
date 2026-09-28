@@ -1,3 +1,11 @@
+---
+id: refactoring
+title: Refactoring
+applyWhen: Restructuring, cleaning, or optimizing code without changing observable external behavior.
+keywords: [refactor, restructure, clean, cleanup, simplify, deprecate, remove, dead, dedup]
+requires: [laziness-protocol, subtract-before-you-add, minimize-reader-load, prove-it-works]
+version: 1
+---
 # Playbook: Refactoring
 
 > **Trigger:** Restructuring, cleaning, or optimizing code without changing observable external behavior.

@@ -92,6 +92,50 @@ describe('principle frontmatter schema', () => {
     assert.equal(ok, true, errors.join('; '));
   });
 
+  it('ships frontmatter on every document so no read path uses legacy extraction', () => {
+    const missing = [];
+    for (const [dir, marker] of [['playbooks', /#\s*Playbook/i], ['principles', /#\s/]]) {
+      for (const file of readdirSync(join(ROOT, dir)).filter(f => f.endsWith('.md'))) {
+        const parsed = parseDoc(readFileSync(join(ROOT, dir, file), 'utf8'), `${dir}/${file}`);
+        if (parsed.fallback) missing.push(`${dir}/${file}`);
+        void marker;
+      }
+    }
+    assert.deepEqual(missing, [], `documents without frontmatter: ${missing.join(', ')}`);
+  });
+
+  it('keeps frontmatter applyWhen identical to the in-body trigger line', () => {
+    // The frontmatter drives the index; the body line drives the semantic router
+    // and human readers. Identical text keeps the two extraction paths in sync.
+    const drift = [];
+    for (const [dir, marker] of [['playbooks', 'Trigger'], ['principles', 'Apply when']]) {
+      for (const file of readdirSync(join(ROOT, dir)).filter(f => f.endsWith('.md'))) {
+        const parsed = parseDoc(readFileSync(join(ROOT, dir, file), 'utf8'), `${dir}/${file}`);
+        const body = parsed.body.match(new RegExp(`> \\*\\*${marker}:\\*\\*\\s*(.+)`, 'i'));
+        if (!body) {
+          drift.push(`${dir}/${file}: missing '> **${marker}:**' line`);
+          continue;
+        }
+        if (parsed.data.applyWhen !== body[1].trim()) {
+          drift.push(`${dir}/${file}: frontmatter "${parsed.data.applyWhen}" != body "${body[1].trim()}"`);
+        }
+      }
+    }
+    assert.deepEqual(drift, [], drift.join('; '));
+  });
+
+  it('indexes every shipped document through frontmatter, never the legacy path', () => {
+    const z = new ZStack({ rootDir: ROOT });
+    for (const entry of z.listPlaybooks()) {
+      assert.ok(entry.version, `playbook ${entry.id} must carry a frontmatter version`);
+      assert.notEqual(entry.trigger, 'General task', `playbook ${entry.id} must have a real trigger`);
+    }
+    for (const entry of z.listPrinciples()) {
+      assert.ok(entry.version, `principle ${entry.id} must carry a frontmatter version`);
+      assert.notEqual(entry.applyWhen, 'General engineering decisions', `principle ${entry.id} must have a real applyWhen`);
+    }
+  });
+
   it('keeps existing --json keys unchanged for list indexes', () => {
     const z = new ZStack({ rootDir: ROOT });
     const pb = z.listPlaybooks();

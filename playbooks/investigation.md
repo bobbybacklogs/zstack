@@ -1,3 +1,11 @@
+---
+id: investigation
+title: Investigation
+applyWhen: Researching code architecture, diagnosing an unknown issue, or answering "how/why does X work?"
+keywords: [investigate, how, why, explain, understand]
+requires: [guard-the-context-window, foundational-thinking, prove-it-works]
+version: 1
+---
 # Playbook: Investigation
 
 > **Trigger:** Researching code architecture, diagnosing an unknown issue, or answering "how/why does X work?"

@@ -66,6 +66,8 @@ export interface TaskOptions {
   contextTokens?: number;
   noPrune?: boolean;
   timeoutMs?: number;
+  /** Provider lane override for this task: auto | zen | go | hitch. */
+  lane?: string;
 }
 
 export interface TaskResult {
@@ -123,9 +125,11 @@ export interface ModelHitchState {
 }
 
 export interface RoleMapping {
-  mode: 'opencode-zen-go' | 'modelhitch-multi-provider';
+  mode: 'opencode-zen' | 'opencode-go' | 'opencode-zen-go' | 'modelhitch-multi-provider' | 'modelhitch-config-pinned';
   models: Record<string, string>;
   panelList: string[];
+  /** Lane actually used to resolve models. */
+  lane?: 'zen' | 'go' | 'hitch';
 }
 
 export interface AboutInfo {
@@ -178,11 +182,12 @@ export declare class ZStack {
 
   panel(prompt: string, options?: any): Promise<PanelCritique[]>;
 
-  syncRules(options?: { project?: boolean }): Promise<string>;
+  syncRules(options?: { project?: boolean; lane?: string }): Promise<string>;
 
   getBudget(): StoredBudget;
-  setBudget(tier: string, source?: string): Promise<BudgetInfo>;
-  getBudgetMapping(): Promise<BudgetInfo>;
+  setBudget(tier: string, source?: string, lane?: string | null): Promise<BudgetInfo>;
+  getBudgetMapping(cachedState?: ModelHitchState | null, lane?: string | null): Promise<BudgetInfo>;
+  resolveRoleMapping(state: ModelHitchState, lane?: string | null): Promise<BudgetInfo & RoleMapping>;
 
   checkUpstream(options?: { token?: string; statePath?: string }): Promise<any>;
 
@@ -194,7 +199,7 @@ export declare function runTask(promptOrOptions: string | TaskOptions): Promise<
 export declare function runPanel(prompt: string, options?: any): Promise<PanelCritique[]>;
 export declare function checkBridgeHealth(baseUrl?: string, options?: any): Promise<BridgeHealth>;
 export declare function fetchModelHitchState(baseUrl?: string, options?: any): Promise<ModelHitchState>;
-export declare function resolveRoleMapping(state: ModelHitchState): RoleMapping;
+export declare function resolveRoleMapping(state: ModelHitchState, options?: { lane?: string }): RoleMapping;
 export declare function scorePlaybookTriggers(text: string): PlaybookCandidate[];
 export declare function syncCursorRules(options?: { mapping: RoleMapping; project?: boolean; budget?: BudgetInfo }): string;
 export declare const DEFAULT_BRIDGE_URL: string;
@@ -203,6 +208,7 @@ export declare const ZSTACK_SYSTEM_PROMPT: string;
 
 export type BudgetTierId = 'low-med' | 'med-high' | 'high' | 'max';
 export type BudgetSourceId = 'config' | 'catalog';
+export type LaneId = 'auto' | 'zen' | 'go' | 'hitch';
 
 export interface BudgetTierInfo {
   name: string;
@@ -210,11 +216,27 @@ export interface BudgetTierInfo {
   profile: string;
 }
 
+export interface LaneInfo {
+  id: LaneId;
+  name: string;
+  prefix: string | null;
+  description: string;
+}
+
 export interface BudgetInfo {
   tier: string;
   tierInfo: BudgetTierInfo;
   source: BudgetSourceId;
   sourceDescription: string;
+  /** Lane actually used to resolve models (auto is resolved to zen or hitch). */
+  lane: Exclude<LaneId, 'auto'>;
+  /** Lane as requested before auto-resolution. */
+  requestedLane: LaneId;
+  laneInfo: LaneInfo;
+  /** Gateway mode label, e.g. 'opencode-zen' | 'opencode-go' | 'modelhitch-multi-provider'. */
+  mode: string;
+  /** False when source=config pins models from ModelHitch policy, bypassing the lane. */
+  laneApplied: boolean;
   models: Record<string, string>;
   panelList: string[];
 }
@@ -222,14 +244,19 @@ export interface BudgetInfo {
 export interface StoredBudget {
   tier: string;
   source: BudgetSourceId;
+  lane: LaneId;
   lastUpdated: string;
 }
 
 export declare const BUDGET_TIERS: Record<string, BudgetTierInfo>;
 export declare const BUDGET_SOURCES: Record<string, string>;
+export declare const LANES: Record<LaneId, LaneInfo>;
+export declare function normalizeLane(lane?: string | null): LaneId;
+export declare function isKnownLane(lane?: string | null): boolean;
+export declare function hasOpenCodeKey(keys?: Record<string, unknown>): boolean;
 export declare function getStoredBudget(filePath?: string): StoredBudget;
 export declare function saveStoredBudget(data: Partial<StoredBudget>, filePath?: string): StoredBudget;
-export declare function resolveBudgetMapping(options: { tier?: string; source?: string; state: ModelHitchState }): BudgetInfo;
+export declare function resolveBudgetMapping(options: { tier?: string; source?: string; lane?: string; state: ModelHitchState }): BudgetInfo;
 export declare function promptAndSetBudget(options?: any): Promise<{ applied: boolean; budget: BudgetInfo; rulePath?: string }>;
 
 export declare const CLASSIFY_CONFIDENCE_THRESHOLD: number;

@@ -1,3 +1,10 @@
+---
+id: separate-before-serializing-shared-state
+title: Separate Before Serializing Shared State
+applyWhen: Multiple concurrent agents, background jobs, or threads access shared files, databases, or memory structures.
+keywords: [separate, serializing, shared, state, multiple, concurrent, agents, background]
+version: 1
+---
 # Separate Before Serializing Shared State
 
 > **Apply when:** Multiple concurrent agents, background jobs, or threads access shared files, databases, or memory structures.

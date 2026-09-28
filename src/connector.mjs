@@ -277,14 +277,25 @@ export async function fetchModelHitchState(baseUrl = DEFAULT_BRIDGE_URL, options
 /**
  * Intelligently resolve the best model for each zstack role based on ModelHitch's active providers.
  * Prefers OpenCode if available, else falls back cleanly to Hitch's other active providers (DeepSeek, OpenAI, Gemini, etc.).
+ *
+ * Pass `lane` ('zen' | 'go' | 'hitch' | 'auto') to force a provider family:
+ * 'zen' uses opencode/<model>, 'go' uses opencode-go/<model>, 'hitch' skips
+ * OpenCode entirely. 'auto' (the default) keeps the detection above.
  */
-export function resolveRoleMapping(state) {
+export function resolveRoleMapping(state, options = {}) {
   const { keys, models, config } = state;
-  const hasOpenCode = !!(keys['opencode'] || keys['opencode-go'] || process.env.OPENCODE_API_KEY);
+  const hasOpenCodeKey = !!(keys['opencode'] || keys['opencode-go'] || process.env.OPENCODE_API_KEY);
   const hasDeepSeek = !!(keys['deepseek'] || process.env.DEEPSEEK_API_KEY);
   const hasOpenAI = !!(keys['openai'] || process.env.OPENAI_API_KEY);
   const hasGemini = !!(keys['gemini'] || process.env.GEMINI_API_KEY);
   const hasVercel = !!(keys['vercel-ai-gateway'] || process.env.VERCEL_AI_GATEWAY_API_KEY);
+
+  const requested = String(options.lane || 'auto').toLowerCase();
+  const lane = requested === 'auto'
+    ? (hasOpenCodeKey ? 'zen' : 'hitch')
+    : (requested === 'zen' || requested === 'go' || requested === 'hitch' ? requested : 'zen');
+  const hasOpenCode = lane !== 'hitch';
+  const prefix = lane === 'go' ? 'opencode-go/' : 'opencode/';
 
   const modelIds = new Set(models.map(m => m.id));
   const defaultModel = config?.defaultProviderId && config?.defaultModel
@@ -304,11 +315,16 @@ export function resolveRoleMapping(state) {
   let architectModel = defaultModel;
   let reasonerModel = defaultModel;
 
-  if (hasOpenCode) {
-    coderModel = 'opencode/deepseek-v4-pro';
-    fastModel = 'opencode/deepseek-v4-flash';
-    architectModel = 'opencode/claude-sonnet-4-6';
-    reasonerModel = 'opencode/gpt-5.5';
+  if (lane === 'go') {
+    coderModel = `${prefix}deepseek-v4-pro`;
+    fastModel = `${prefix}deepseek-v4-flash`;
+    architectModel = `${prefix}gpt-5.6-luna`;
+    reasonerModel = `${prefix}kimi-k3`;
+  } else if (lane === 'zen') {
+    coderModel = `${prefix}deepseek-v4-pro`;
+    fastModel = `${prefix}deepseek-v4-flash`;
+    architectModel = `${prefix}claude-sonnet-4-6`;
+    reasonerModel = `${prefix}gpt-5.5`;
   } else {
     // Pick Fast Coder
     if (hasDeepSeek) {
@@ -334,8 +350,10 @@ export function resolveRoleMapping(state) {
 
   // Construct Multi-Family Ensemble Panel (picks 1 model from each distinct provider family)
   const panelModels = [];
-  if (hasOpenCode) {
-    panelModels.push('opencode/claude-sonnet-4-6', 'opencode/gpt-5.5', 'opencode/deepseek-v4-pro');
+  if (lane === 'go') {
+    panelModels.push(`${prefix}deepseek-v4-pro`, `${prefix}gpt-5.6-luna`, `${prefix}qwen3.8-max`);
+  } else if (lane === 'zen') {
+    panelModels.push(`${prefix}claude-sonnet-4-6`, `${prefix}gpt-5.5`, `${prefix}deepseek-v4-pro`);
   } else {
     if (hasOpenAI) panelModels.push('openai/gpt-5.6-luna');
     if (hasGemini) panelModels.push('gemini/models/gemini-3.6-flash');
@@ -345,9 +363,11 @@ export function resolveRoleMapping(state) {
   if (panelModels.length === 0) panelModels.push(defaultModel);
 
   const panelStr = panelModels.join(', ');
+  const MODES = { zen: 'opencode-zen', go: 'opencode-go', hitch: 'modelhitch-multi-provider' };
 
   return {
-    mode: hasOpenCode ? 'opencode-zen-go' : 'modelhitch-multi-provider',
+    mode: hasOpenCode ? (MODES[lane] || 'opencode-zen-go') : 'modelhitch-multi-provider',
+    lane,
     models: {
       'feature, refactoring': coderModel,
       'bug-fix, perf-issue': coderModel,

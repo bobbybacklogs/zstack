@@ -1,3 +1,11 @@
+---
+id: bug-fix
+title: Bug Fix
+applyWhen: Resolving a bug, test failure, crash, regression, or reported defect.
+keywords: [bug, fix, broken, error, failing, crash, exception, regression, issue]
+requires: [fix-root-causes, prove-it-works, boundary-discipline, laziness-protocol, encode-lessons-in-structure, type-system-discipline]
+version: 1
+---
 # Playbook: Bug Fix
 
 > **Trigger:** Resolving a bug, test failure, crash, regression, or reported defect.

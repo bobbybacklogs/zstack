@@ -1,3 +1,10 @@
+---
+id: minimize-reader-load
+title: Minimize Reader Load
+applyWhen: Reviewing, authoring, or refactoring code that feels dense, convoluted, or hard to trace.
+keywords: [minimize, reader, load, reviewing, authoring, refactoring, feels, dense]
+version: 1
+---
 # Minimize Reader Load
 
 > **Apply when:** Reviewing, authoring, or refactoring code that feels dense, convoluted, or hard to trace.

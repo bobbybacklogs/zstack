@@ -1,3 +1,10 @@
+---
+id: type-system-discipline
+title: Type System Discipline
+applyWhen: Designing types, interfaces, data contracts, or function signatures.
+keywords: [type, system, discipline, designing, types, interfaces, contracts, function]
+version: 1
+---
 # Type System Discipline
 
 > **Apply when:** Designing types, interfaces, data contracts, or function signatures.

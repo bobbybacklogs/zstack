@@ -1,3 +1,11 @@
+---
+id: autonomous-run
+title: Autonomous Run
+applyWhen: Multi-hour, overnight, or unattended batch agent loops ("run until done", "/loop").
+keywords: [autonomous, unattended, overnight, batch, agent, run, loop]
+requires: [sequence-verifiable-units, make-operations-idempotent]
+version: 1
+---
 # Playbook: Autonomous Run
 
 > **Trigger:** Multi-hour, overnight, or unattended batch agent loops ("run until done", "/loop").

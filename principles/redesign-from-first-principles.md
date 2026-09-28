@@ -1,3 +1,10 @@
+---
+id: redesign-from-first-principles
+title: Redesign from First Principles
+applyWhen: Integrating a new requirement or edge case into an existing design that resists it.
+keywords: [redesign, first, principles, integrating, requirement, existing, design, resists]
+version: 1
+---
 # Redesign from First Principles
 
 > **Apply when:** Integrating a new requirement or edge case into an existing design that resists it.

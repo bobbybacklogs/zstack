@@ -1,3 +1,11 @@
+---
+id: perf-issue
+title: Performance Issue
+applyWhen: Diagnosing slow queries, high latency, memory bloat, or throughput degradation.
+keywords: [perf, performance, slow, latency, bottleneck, leak, memory, cpu, throughput]
+requires: [fix-root-causes, build-the-lever, prove-it-works, laziness-protocol]
+version: 1
+---
 # Playbook: Performance Issue
 
 > **Trigger:** Diagnosing slow queries, high latency, memory bloat, or throughput degradation.

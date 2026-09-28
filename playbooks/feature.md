@@ -1,3 +1,11 @@
+---
+id: feature
+title: New Feature
+applyWhen: Implementing new user-facing functionality, API routes, or a new subsystem.
+keywords: [feature, add, implement, create, build, support, new]
+requires: [foundational-thinking, boundary-discipline, sequence-verifiable-units, type-system-discipline, prove-it-works, build-the-lever, laziness-protocol]
+version: 1
+---
 # Playbook: New Feature
 
 > **Trigger:** Implementing new user-facing functionality, API routes, or a new subsystem.

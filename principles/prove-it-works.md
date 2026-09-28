@@ -1,3 +1,10 @@
+---
+id: prove-it-works
+title: Prove It Works
+applyWhen: After completing a task, before declaring done or opening a pull request.
+keywords: [prove, works, completing, declaring, opening, request]
+version: 1
+---
 # Prove It Works
 
 > **Apply when:** After completing a task, before declaring done or opening a pull request.

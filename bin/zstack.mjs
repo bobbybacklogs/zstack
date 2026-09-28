@@ -3,7 +3,7 @@
 import { createInterface } from 'node:readline/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { ZStack, DEFAULT_BRIDGE_URL, fetchModelHitchState } from '../src/index.mjs';
-import { BUDGET_TIERS, BUDGET_SOURCES, getStoredBudget, promptAndSetBudget } from '../src/budget.mjs';
+import { BUDGET_TIERS, BUDGET_SOURCES, LANES, getStoredBudget, isKnownLane, normalizeLane, promptAndSetBudget } from '../src/budget.mjs';
 import { gradeDiff, formatVerdictTable } from '../src/grader.mjs';
 import { appendHistory, readHistory, lastEntry, needsRerunConfirm, HISTORY_PREVIEW_CHARS } from '../src/history.mjs';
 import { triageFailure } from '../src/triage.mjs';
@@ -66,6 +66,10 @@ function parseArgs(args) {
       flags.tier = args[++i].toLowerCase();
     } else if (arg === '--source' && i + 1 < args.length) {
       flags.source = args[++i].toLowerCase();
+    } else if (arg === '--lane' && i + 1 < args.length) {
+      flags.lane = args[++i].toLowerCase();
+    } else if (arg === '--zen' || arg === '--go' || arg === '--hitch') {
+      flags.lane = arg.slice(2);
     } else if (arg === '--file' && i + 1 < args.length) {
       flags.file = args[++i];
     } else if (arg === '--paths' && i + 1 < args.length) {
@@ -183,7 +187,8 @@ Usage:
   zstack task <playbook> "<prompt>" [options]      Run a task with an explicit playbook
   zstack prompt "<prompt>" [--role <role>]         Send a prompt directly to a model role
   zstack panel "<prompt>"                          Run multi-family adversarial critique in parallel
-  zstack budget [tier] [--source config|catalog] [--confirm]  Preview + confirm model budget mapping
+  zstack budget [tier] [--source config|catalog] [--lane auto|zen|go|hitch] [--confirm]
+                                                   Preview + confirm model budget mapping
   zstack grade [--file <diff>] [--json]            Grade a diff against the 20 principles
   zstack triage [--file <log>] [--json]            Rank playbooks for failure output
   zstack explore "<query>" [--paths src,tests]     Distill bulk file reads via a subagent
@@ -202,6 +207,14 @@ Usage:
     config   Option A: strictly use models pinned in ModelHitch config policies
     catalog  Option B: use active providers but pick best tier models from catalog
 
+  Provider lanes (which provider family role models resolve from):
+    auto     Default: OpenCode Zen when an OpenCode key is active, else hitch
+    zen      OpenCode Zen pay-per-use  (opencode/<model>)
+    go       OpenCode Go flat-rate    (opencode-go/<model>)
+    hitch    No OpenCode preference: ModelHitch active providers / config default
+  Shortcuts: --zen, --go, --hitch. A single request can override the stored lane,
+  for example: zstack --go "Fix the flaky retry test"
+
   Prompt classification: confident matches run directly; ambiguous matches offer
   guided playbook selection (threshold: top score >= 1.0 with >= 0.5 margin).
   The semantic router refines ambiguous matches when the gateway is reachable.
@@ -209,6 +222,8 @@ Usage:
 Options:
   --tier <tier>              Budget tier (low-med, med-high, high, max)
   --source <config|catalog>  Model selection source (Option A vs Option B)
+  --lane <auto|zen|go|hitch> Provider lane for this invocation (overrides stored lane)
+  --zen, --go, --hitch       Shortcuts for --lane zen | go | hitch
   --confirm, --yes, -y       Confirm and apply budget mapping without interactive prompt
   --json                     Emit a single JSON document on stdout (diagnostics to stderr)
   --timeout <ms>             Per-request gateway timeout (default 30000, env MODELHITCH_TIMEOUT)
@@ -243,6 +258,7 @@ async function handleStatus(args) {
     emitJson({
       ok: true, baseUrl: res.baseUrl, message: res.message,
       activeProviders: res.activeProviders, mode: res.mode,
+      lane: res.lane ?? null,
       mapping: res.mapping, panelModels: res.panelModels, budget: res.budget ?? null
     });
     return;
@@ -251,7 +267,7 @@ async function handleStatus(args) {
   console.log('\n=== zstack ModelHitch Harness ===');
   console.log(`[✓] ModelHitch Bridge: Online (${res.message})`);
   console.log(`[✓] Active Hitch Providers: ${res.activeProviders?.join(', ') || 'none'}`);
-  console.log(`[✓] Operating Mode: ${res.mode === 'opencode-zen-go' ? 'OpenCode Zen & Go' : 'ModelHitch Multi-Provider'}`);
+  console.log(`[✓] Provider Lane: ${res.laneInfo?.name || res.lane || 'auto'} (${res.mode})`);
   if (res.budget) {
     console.log(`[✓] Budget: ${res.budget.tier} (source: ${res.budget.source}) — change with: zstack budget --tier <low-med|med-high|high|max>`);
   }
@@ -294,7 +310,7 @@ async function handlePrinciples(args) {
 async function handleSync(args) {
   const { flags } = parseArgs(args);
   try {
-    const filePath = await z.syncRules({ project: flags.project });
+    const filePath = await z.syncRules({ project: flags.project, lane: flags.lane });
     if (flags.json) {
       emitJson({ ok: true, rulePath: filePath });
       return;
@@ -312,6 +328,7 @@ function taskOptions(prompt, playbook, flags) {
     files: flags.files,
     role: flags.role,
     model: flags.model,
+    lane: flags.lane,
     ...contextFlags(flags)
   };
 }
@@ -596,7 +613,7 @@ async function handleBudget(args) {
   const { flags, positional } = parseArgs(args);
   if (positional[0] === 'help' || positional[0] === '--help' || positional[0] === '-h') {
     if (flags.json) {
-      emitJson({ ok: true, command: 'budget', tiers: BUDGET_TIERS, sources: BUDGET_SOURCES, stored: getStoredBudget() });
+      emitJson({ ok: true, command: 'budget', tiers: BUDGET_TIERS, sources: BUDGET_SOURCES, lanes: LANES, stored: getStoredBudget() });
       return;
     }
     console.log(`
@@ -604,18 +621,25 @@ zstack budget — preview and confirm model budget mapping (confirmation require
 
 Usage:
   zstack budget                          Show current budget + preview mapping
-  zstack budget low-med                  Preview Low-Med tier (current source)
+  zstack budget low-med                  Preview Low-Med tier (current source and lane)
   zstack budget high --source config     Preview High tier, Option A (ModelHitch config only)
   zstack budget max --source catalog --confirm   Apply Max tier, Option B without prompt
+  zstack budget med-high --go            Preview the Med-High tier on the OpenCode Go lane
 
 Tiers: low-med | med-high | high | max
 Sources: config (A: config-pinned models) | catalog (B: provider-aligned presets)
+Lanes:   auto (default) | zen (OpenCode Zen) | go (OpenCode Go) | hitch (ModelHitch routing)
+  Shortcuts: --zen, --go, --hitch set the lane without --lane.
 `);
     return;
   }
   const stored = getStoredBudget();
   const tierArg = (positional[0] || flags.tier || stored.tier || 'med-high').toLowerCase();
   const sourceArg = (flags.source || stored.source || 'catalog').toLowerCase();
+  const laneArg = normalizeLane(flags.lane || stored.lane);
+  if (!isKnownLane(flags.lane)) {
+    fail(`Error: unknown lane "${flags.lane}". Valid lanes: auto, zen, go, hitch`, EXIT.USAGE, flags);
+  }
 
   if (!BUDGET_TIERS[tierArg]) {
     fail(`Error: unknown budget tier "${tierArg}". Valid tiers: ${Object.keys(BUDGET_TIERS).join(', ')}`, EXIT.USAGE, flags);
@@ -637,7 +661,7 @@ Sources: config (A: config-pinned models) | catalog (B: provider-aligned presets
   if (flags.json && !(flags.confirm || flags.yes || flags.apply)) {
     // --json without --confirm previews only: no interactive prompt, nothing applied.
     const { resolveBudgetMapping } = await import('../src/budget.mjs');
-    const preview = resolveBudgetMapping({ tier: tierArg, source: sourceArg, state });
+    const preview = resolveBudgetMapping({ tier: tierArg, source: sourceArg, lane: laneArg, state });
     emitJson({ ok: true, applied: false, preview });
     return;
   }
@@ -654,13 +678,19 @@ Sources: config (A: config-pinned models) | catalog (B: provider-aligned presets
       const marker = id === sourceArg ? '>' : ' ';
       console.log(` ${marker} ${id.padEnd(10)} ${desc}`);
     }
+    console.log('\nProvider lanes:');
+    for (const [id, info] of Object.entries(LANES)) {
+      const marker = id === laneArg ? '>' : ' ';
+      console.log(` ${marker} ${id.padEnd(10)} ${info.name.padEnd(18)} ${info.description}`);
+    }
   } else {
-    console.error(`Previewing budget tier ${tierArg} (source ${sourceArg})...`);
+    console.error(`Previewing budget tier ${tierArg} (source ${sourceArg}, lane ${laneArg})...`);
   }
 
   const result = await promptAndSetBudget({
     tier: tierArg,
     source: sourceArg,
+    lane: laneArg,
     state,
     project: flags.project,
     confirm: flags.confirm || flags.yes || flags.apply
@@ -900,6 +930,7 @@ Session commands:
   /files <a,b>       Attach files (/files clear to unset)
   /role <role>       Pin a role override (/role clear to unset)
   /model <m>         Pin a model override (/model clear to unset)
+  /lane <auto|zen|go|hitch>  Pin a provider lane (/lane clear for stored default)
   /json on|off       Toggle JSON output mode
   /context <tokens>  Set the context budget (/context clear for default)
   /status            Show session state
@@ -929,8 +960,20 @@ async function handleShellSlash(line, state, flags) {
       console.log(`  json: ${state.json ? 'on' : 'off'}`);
       console.log(`  context budget: ${state.contextBudget || '(default 12000)'}`);
       console.log(`  model budget: ${stored.tier} (source: ${stored.source})`);
+      console.log(`  lane: ${state.lane || `${normalizeLane(stored.lane)} (stored)`}`);
       return null;
     }
+    case 'lane':
+      if (!arg || arg.toLowerCase() === 'clear') {
+        state.lane = null;
+        console.log(`lane: unset (stored default: ${normalizeLane(getStoredBudget().lane)})`);
+      } else if (!isKnownLane(arg)) {
+        console.log(`[!] Unknown lane "${arg}". Valid lanes: auto, zen, go, hitch.`);
+      } else {
+        state.lane = normalizeLane(arg);
+        console.log(`lane: ${state.lane}`);
+      }
+      return null;
     case 'playbook':
       if (!arg) {
         console.log(`playbook: ${state.playbook || '(auto)'}`);
@@ -1019,6 +1062,7 @@ async function handleShell(args) {
     files: flags.files || [],
     role: flags.role || null,
     model: flags.model || null,
+    lane: flags.lane ? normalizeLane(flags.lane) : null,
     json: !!flags.json,
     contextBudget: flags.contextBudget || null
   };
@@ -1072,6 +1116,7 @@ async function handleShell(args) {
         files: (state.files && state.files.length > 0) ? state.files : [],
         role: state.role || undefined,
         model: state.model || undefined,
+        lane: state.lane || flags.lane,
         json: state.json,
         contextBudget: state.contextBudget ?? flags.contextBudget,
         noPrune: flags.noPrune

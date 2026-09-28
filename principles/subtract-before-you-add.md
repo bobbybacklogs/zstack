@@ -1,3 +1,10 @@
+---
+id: subtract-before-you-add
+title: Subtract Before You Add
+applyWhen: Sequencing a feature addition, refactor, or subsystem rewrite.
+keywords: [subtract, add, sequencing, feature, addition, refactor, subsystem, rewrite]
+version: 1
+---
 # Subtract Before You Add
 
 > **Apply when:** Sequencing a feature addition, refactor, or subsystem rewrite.

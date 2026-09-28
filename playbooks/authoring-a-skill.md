@@ -1,3 +1,11 @@
+---
+id: authoring-a-skill
+title: Authoring a Skill
+applyWhen: Distilling a successful multi-step workflow into a reusable agent skill or slash command.
+keywords: [authoring, skill, create, package, new]
+requires: [encode-lessons-in-structure, experience-first]
+version: 1
+---
 # Playbook: Authoring a Skill
 
 > **Trigger:** Distilling a successful multi-step workflow into a reusable agent skill or slash command.

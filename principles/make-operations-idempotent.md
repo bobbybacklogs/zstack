@@ -1,3 +1,10 @@
+---
+id: make-operations-idempotent
+title: Make Operations Idempotent
+applyWhen: Designing CLI commands, deployment scripts, migration loops, API endpoints, or retry logic.
+keywords: [make, operations, idempotent, designing, commands, deployment, scripts, migration]
+version: 1
+---
 # Make Operations Idempotent
 
 > **Apply when:** Designing CLI commands, deployment scripts, migration loops, API endpoints, or retry logic.

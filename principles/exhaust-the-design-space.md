@@ -1,3 +1,10 @@
+---
+id: exhaust-the-design-space
+title: Exhaust the Design Space
+applyWhen: Faced with an unfamiliar interaction, complex algorithm, or major architectural decision with no clear precedent.
+keywords: [exhaust, design, space, faced, unfamiliar, interaction, complex, algorithm]
+version: 1
+---
 # Exhaust the Design Space
 
 > **Apply when:** Faced with an unfamiliar interaction, complex algorithm, or major architectural decision with no clear precedent.
