@@ -18,7 +18,9 @@
   "scripts": {
     "status": "node bin/zstack.mjs status",
     "sync": "node bin/zstack.mjs sync",
-    "test": "node tests/connector.test.mjs"
+    "test": "node tests/connector.test.mjs",
+    "verify": "node scripts/verify.mjs",
+    "verify:live": "node scripts/verify.mjs --live"
   },
   "keywords": [
     "ai",
