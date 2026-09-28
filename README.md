@@ -142,7 +142,63 @@ chars/token` estimate). Over budget, file bodies truncate with explicit
 `--no-prune` aborts instead of trimming, and `--context-budget <tokens>` sets a
 custom budget.
 
-### 3. Adversarial Multi-Family Panel Review
+### 3. Agentic Execution (The Tool Loop)
+
+A plain prompt makes **one** model call and prints the reply. That call cannot
+read a file, run a command, or change anything, so asking it to "look over this
+project and fix it" produces a plausible plan and no work.
+
+Adding `--agent`, `--apply`, or `--project` instead runs the ModelHitch harness:
+the model receives tools, its calls execute, and the results feed back until the
+task is done or `--max-turns` is reached. zstack still owns classification,
+playbook and principle injection, and lane routing; ModelHitch owns the loop,
+the approval gate, and snapshots.
+
+```bash
+zstack "Add an events API and rename Chronos to OddEvents" --project --apply --go
+```
+
+Every turn and tool call streams as it happens:
+
+```
+[>] Task classified as [feature] (playbook: playbooks/feature.md)
+[>] Agentic run (apply, max 8 turns) in /repo
+[>] Agent run: opencode-go/deepseek-v4-pro in /repo
+    │ I'll inspect the file before changing it.
+[1] turn 1 (4650 tokens)
+    ! approval bash: approved
+    ! bash ls -la && cat app.js  [error, 54ms]
+    · grep_search VERSION  [ok, 1ms]
+[2] turn 2 (4849 tokens)
+    · read app.js  [ok, 3ms]
+[3] turn 3 (5153 tokens)
+    ! approval write: approved
+    · write app.js  [ok, 11ms]
+[4] turn 4 (5321 tokens)
+    · read app.js  [ok, 184ms]
+    · bash node -e "…"  [ok, 1ms]
+
+[✓] Model: opencode/deepseek-v4-pro | Role: feature, refactoring | apply (4 turns | 5 tool calls | 19113 tokens | 8294ms)
+[✓] Changed 1 file:
+    ~ app.js  (write)
+    diff: +1/-0 across 1 mutation
+```
+
+**Read-only is the default.** Without `--apply`, the harness risk-classifies each
+mutating call and runs only the ones it calls safe, so `ls`, `cat`, and `grep`
+work while a command that could write or open a port is declined and reported.
+`--apply` approves mutating calls so the agent can change files.
+
+Because tool attribution only covers the harness's own writer tools, an `--apply`
+run also reports `git status` when the workspace is a repository. A model that
+writes through `node -e fs.writeFileSync(...)` or a shell redirect changes the
+tree with no attributable call, and git is the artifact that does not care how
+the bytes were written.
+
+`--max-turns <n>` bounds the loop (harness default 8) and `--review` runs the
+read-only reviewer over the change afterwards.
+
+### 4. Adversarial Multi-Family Panel Review
 
 Dispatch an architecture question or proposed diff to a multi-model panel:
 
@@ -150,7 +206,7 @@ Dispatch an architecture question or proposed diff to a multi-model panel:
 zstack panel "Should we use optimistic concurrency or distributed locks for ledger balances?"
 ```
 
-### 4. Principle Grading
+### 5. Principle Grading
 
 Grade a proposed diff against the 20 principles with structured verdicts
 (`pass` / `warn` / `fail` plus rationale and evidence lines):
@@ -162,7 +218,7 @@ zstack grade --file diff.patch
 Oversized diffs chunk by file hunk (merged verdicts marked chunked); unparseable
 model output retries once and is reported as a parse error, never fabricated.
 
-### 5. Rule Synchronization
+### 6. Rule Synchronization
 
 Inspect active ModelHitch providers and generate or update Cursor rules:
 
@@ -174,7 +230,7 @@ zstack sync
 zstack sync --project
 ```
 
-### 6. Upstream Synchronization
+### 7. Upstream Synchronization
 
 Check the canonical `pstack` repository (`cursor/plugins/tree/main/pstack`) on demand for new commits, playbooks, or principle updates:
 
@@ -189,7 +245,7 @@ zstack update --apply
 zstack update --check
 ```
 
-### 7. Introspection & Health
+### 8. Introspection & Health
 
 ```bash
 # Display system overview, tenets, and package metadata
@@ -205,7 +261,7 @@ zstack playbooks
 zstack principles
 ```
 
-### 8. Scripting Output
+### 9. Scripting Output
 
 `status`, `playbooks`, `principles`, `budget`, `task`, `prompt`, and `panel`
 accept a global `--json` flag emitting a single JSON document on stdout
@@ -218,7 +274,7 @@ zstack status --json
 zstack budget max --source catalog --json  # preview only; add --confirm to apply
 ```
 
-### 9. Interactive Shell
+### 10. Interactive Shell
 
 A persistent session with sticky playbook, files, role, model, and JSON mode:
 
@@ -230,7 +286,7 @@ Each line runs the one-shot path (classification, guided selection, task).
 Session commands: `/playbook <id>`, `/files <a,b>`, `/role <role>`,
 `/model <m>`, `/json on|off`, `/context <tokens>`, `/status`, `/help`, `/exit`.
 
-### 10. Failure Triage
+### 11. Failure Triage
 
 Turn test output, stack traces, or logs into a ranked playbook decision:
 
@@ -243,7 +299,7 @@ follow-ups; when the gateway is reachable a strict-JSON model pass refines the
 choice, otherwise output is marked `[!] heuristic only`. Stdin is accepted when
 piped.
 
-### 11. Context Offload Search
+### 12. Context Offload Search
 
 Delegate bulk file reads to a throwaway subagent that returns only a distilled
 report (raw bodies never enter the parent context):
@@ -252,15 +308,37 @@ report (raw bodies never enter the parent context):
 zstack explore "where is context budget trimming implemented" --paths src,tests --json
 ```
 
-### 12. Run History
+### 13. Run History
 
 One JSON line per task/prompt/panel run in `~/.zstack/history.jsonl`
 (`ZSTACK_HISTORY_PATH` overrides; previews cap at 200 chars):
 
 ```bash
 zstack history --limit 10 [--json]
+zstack history --steps              # expand what each agentic run actually did
 zstack history --last --rerun [--yes]  # --yes required when the preview was truncated
 ```
+
+An agentic run records its progression, not just the invocation: turns, tool
+calls, outcomes, approvals, and the files that changed. `--steps` renders them.
+
+```bash
+$ zstack history --steps --limit 1
+  2026-01-01T00:00:00.000Z  [ok] agent:feature | opencode-go/deepseek-v4-pro
+    prompt (40 chars): Add a footer comment to main.js
+    agent: 4 turns | 4 tool calls | 1 failed | applied | /repo
+    changed 1 file: main.js
+    steps:
+      run started: opencode-go/deepseek-v4-pro in /repo
+      turn 1 (4562 tokens)
+      · turn 1: read main.js  [ok, 3ms]
+      turn 2 (4659 tokens)
+      ! approval bash: approved
+      · turn 2: bash node -e "…"  [ok, 162ms]
+```
+
+Stored steps cap at 200 per run; `stepsTruncated: true` marks a capped list so a
+partial progression is never mistaken for the whole run.
 
 ## Gateway Reliability
 
@@ -276,14 +354,19 @@ kinds `unreachable`/`timeout` (exit 3), `http`/`parse` (exit 1).
 The gateway normalizes provider tool-call behavior so clients never handle
 vendor wire quirks.
 
-- **DSML recovery.** DeepSeek V4 models sometimes write their internal
+- **Tool-call markup recovery.** DeepSeek V4 models sometimes write their
   tool-call syntax into the text channel instead of populating `tool_calls`,
-  which ships raw `<｜DSML｜function_calls>` markup to the caller. The gateway
-  parses that markup, returns real `tool_calls`, and strips the markup from
-  `content`. Recovery runs on streaming and non-streaming paths, and only when
-  the provider returned no genuine tool calls, so quoted markup in ordinary
-  prose is left alone. Named parameters map directly; positional parameters map
-  onto the declared tool schema's properties in order.
+  which ships raw markup to the caller. Two spellings occur, and both are
+  recovered. The canonical one carries the model's internal marker
+  (`<｜DSML｜function_calls>`); the bare one has the marker tokens stripped
+  entirely by decoding and arrives as `<tool_calls>` / `<invoke name="...">` /
+  `<parameter name="...">`. The gateway parses either form, returns real
+  `tool_calls`, and strips the markup from `content`. Recovery runs on streaming
+  and non-streaming paths, and only when the provider returned no genuine tool
+  calls, so quoted markup in ordinary prose is left alone. Bare-form detection
+  requires a closed `<invoke>…</invoke>` block, which is what keeps prose that
+  merely names the tags from being rewritten. Named parameters map directly;
+  positional parameters map onto the declared tool schema's properties in order.
 - **Session headers.** Requests carry a per-conversation session id, taken from
   the client's session header when present and derived from the conversation
   otherwise. OpenCode Go requires `x-opencode-session` and rejects requests
@@ -354,6 +437,36 @@ console.log(result.content);
 console.log(`Executed by ${result.model} (${result.durationMs}ms)`);
 console.log(`Tokens used: ${result.usage.total_tokens}`);
 ```
+
+### Agentic Runs
+
+`task()` returns text from one completion. `agent()` runs the tool loop, so the
+model can read the workspace, run commands, and change files:
+
+```typescript
+const run = await z.agent({
+  prompt: 'Add an events API and rename Chronos to OddEvents',
+  workspaceDir: process.cwd(),
+  apply: true,       // without this, mutating calls are declined
+  maxTurns: 12,
+  onEvent: (event) => {
+    // Same records the CLI renders; stream them into your own UI.
+    if (event.type === 'tool') console.log(`${event.name} -> ${event.outcome}`);
+  }
+});
+
+console.log(run.applied, run.turns, run.toolCalls);
+console.log(run.fileChanges);   // [{ path, tool, turn }]
+console.log(run.declinedTools); // calls the gate refused
+console.log(run.content);       // the model's closing message
+console.log(run.narrative);     // everything it said, across all turns
+```
+
+`run.ok` is false when the harness exits non-zero, and `run.malformedEvents`
+counts stream lines that could not be parsed, so a consumer can tell a clean run
+from a degraded one. Requires the ModelHitch harness on `PATH` (`mhh`), a
+sibling ModelHitch checkout, or `ZSTACK_HARNESS_BIN` pointing at
+`dist/harness-cli.js`.
 
 ### Provider Lanes
 

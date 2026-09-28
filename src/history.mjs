@@ -5,6 +5,63 @@ import { dirname, join } from 'node:path';
 export const HISTORY_PREVIEW_CHARS = 200;
 export const HISTORY_DEFAULT_LIMIT = 20;
 
+/**
+ * Steps persisted per agentic run.
+ *
+ * A run can produce hundreds of events, and history is read back in full to
+ * render the progression view. Capping keeps one long run from bloating the
+ * file, and `stepsTruncated` says so rather than letting a reader mistake a
+ * capped list for the whole run.
+ */
+export const HISTORY_MAX_STEPS = 200;
+
+/** Path-like argument names, in the order a reader most wants to see them. */
+const PATH_KEYS = ['file_path', 'filePath', 'path', 'target', 'filename'];
+
+/**
+ * The file a mutating tool call touched, when its arguments name one.
+ *
+ * The harness reports a change as the *tool* that made it, so a summary built
+ * from that reads "edit (+1/-0)" and never says which file. Recovering the path
+ * from the call is what makes the line useful.
+ */
+export function mutationPath(args) {
+  if (!args || typeof args !== 'object') return null;
+  for (const key of PATH_KEYS) {
+    const value = args[key];
+    if (typeof value === 'string' && value.trim() !== '') return value;
+  }
+  return null;
+}
+
+/**
+ * Reduce a run's steps to the compact form stored in history.
+ */
+export function compactSteps(steps) {
+  if (!Array.isArray(steps)) return [];
+  return steps
+    .filter((step) => step && typeof step === 'object')
+    .slice(0, HISTORY_MAX_STEPS)
+    .map((step) => {
+      const out = { kind: step.kind ?? 'unknown' };
+      if (step.turn != null) out.turn = step.turn;
+      if (step.name) out.name = step.name;
+      if (step.target) out.target = step.target;
+      if (step.outcome) out.outcome = step.outcome;
+      if (step.durationMs != null) out.durationMs = step.durationMs;
+      // Approvals carry `tool`, and the start step carries `model`; without
+      // these the stored step renders as "approval undefined" and
+      // "run started: default".
+      if (step.tool) out.tool = step.tool;
+      if (step.model) out.model = step.model;
+      if (step.decision) out.decision = step.decision;
+      if (step.risk) out.risk = step.risk;
+      if (step.tokens != null) out.tokens = step.tokens;
+      if (step.workspace) out.workspace = step.workspace;
+      return out;
+    });
+}
+
 export function historyPath(pathOverride) {
   return (
     pathOverride ||
@@ -46,6 +103,26 @@ export function appendHistory(entry, pathOverride) {
     errorKind: entry.errorKind || null,
     exitCode: entry.exitCode ?? (entry.ok === false ? 1 : 0)
   };
+
+  // Agentic runs carry progression. Absent for single-completion runs, which is
+  // why these are added conditionally rather than always present and null.
+  if (entry.agentic || entry.command === 'agent') {
+    record.agentic = true;
+    record.applied = entry.applied === true;
+    record.workspace = entry.workspace || null;
+    record.turns = entry.turns ?? null;
+    record.toolCalls = entry.toolCalls ?? null;
+    record.failedTools = entry.failedTools ?? null;
+    record.declinedTools = entry.declinedTools ?? null;
+    record.changes = Array.isArray(entry.changes) ? entry.changes : [];
+    record.fileChanges = Array.isArray(entry.fileChanges)
+      ? entry.fileChanges.slice(0, HISTORY_MAX_STEPS).map((c) => ({ path: c.path, tool: c.tool, turn: c.turn ?? null }))
+      : [];
+    const steps = compactSteps(entry.steps);
+    record.steps = steps;
+    record.stepsTruncated = Array.isArray(entry.steps) && entry.steps.length > steps.length;
+  }
+
   try {
     const file = historyPath(pathOverride);
     mkdirSync(dirname(file), { recursive: true });

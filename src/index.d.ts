@@ -97,6 +97,131 @@ export interface TaskResult {
   raw: any;
 }
 
+/**
+ * Options for an agentic run: the model gets tools, its calls execute, and the
+ * results feed back until the task is done or `maxTurns` is reached.
+ */
+export interface AgentOptions {
+  prompt: string;
+  playbook?: string;
+  type?: string;
+  role?: string;
+  model?: string;
+  /** Provider lane override for this run: auto | zen | go | hitch. */
+  lane?: string;
+  /** Directory the agent reads and writes. Defaults to the zstack workspace. */
+  workspaceDir?: string;
+  /**
+   * Approve mutating tool calls. Without it a call that could write is declined
+   * and the model is told so, which is what makes the default read-only.
+   */
+  apply?: boolean;
+  /** Model turns before the loop stops. The harness default is 8. */
+  maxTurns?: number;
+  /** Run the read-only reviewer over the change once the run finishes. */
+  review?: boolean;
+  /**
+   * Let the harness risk-classify mutating calls and auto-approve the ones it
+   * calls safe. Defaults to true, and is ignored when `apply` is set.
+   */
+  autoApproveSafe?: boolean;
+  /** Skip the zstack system prompt and playbook injection. */
+  noZstack?: boolean;
+  /** Extra arguments passed to the harness CLI verbatim. */
+  harnessArgs?: string[];
+  /** Run deadline in ms. `0` or absent means no deadline. */
+  timeoutMs?: number;
+  /** Called for every harness event, in order, as it arrives. */
+  onEvent?: (event: AgentEvent) => void;
+  /** Called with raw stderr chunks from the harness. */
+  onStderr?: (chunk: string) => void;
+}
+
+/** One event from the harness NDJSON stream. `type` discriminates the shape. */
+export interface AgentEvent {
+  type: 'run-start' | 'text' | 'tool' | 'approval' | 'turn' | 'done' | string;
+  at?: string;
+  turn?: number;
+  text?: string;
+  name?: string;
+  args?: Record<string, unknown>;
+  outcome?: string;
+  durationMs?: number;
+  truncated?: boolean;
+  bytes?: number;
+  tool?: string;
+  decision?: string;
+  risk?: string;
+  tokens?: number;
+  totalTokens?: number;
+  turns?: number;
+  tools?: number;
+  changes?: Array<{ name: string; added: number; removed: number }>;
+  sessionId?: string;
+  schema?: number;
+  model?: string;
+  provider?: string;
+  workspace?: string;
+  playbook?: string;
+  approvals?: string;
+  task?: string;
+}
+
+/** One line of the progress view for a run. */
+export interface AgentStep {
+  kind: 'start' | 'turn' | 'tool' | 'approval';
+  turn?: number | null;
+  name?: string;
+  target?: string;
+  outcome?: string;
+  durationMs?: number | null;
+  truncated?: boolean;
+  bytes?: number | null;
+  tool?: string;
+  decision?: string;
+  risk?: string | null;
+  tokens?: number | null;
+  model?: string | null;
+  workspace?: string | null;
+}
+
+export interface AgentResult {
+  /** The model's closing message. */
+  content: string;
+  /** Everything the model said across turns, in order. */
+  narrative: string;
+  model: string | null;
+  role: string;
+  playbook: string;
+  principles: string[];
+  classification: {
+    type: string;
+    candidates: PlaybookCandidate[];
+    confidence: number | null;
+    ambiguous: boolean;
+  };
+  applied: boolean;
+  workspaceDir: string;
+  playbookInjected: boolean;
+  ok: boolean;
+  exitCode: number;
+  turns: number;
+  toolCalls: number;
+  failedTools: number;
+  declinedTools: number;
+  approvals: Array<{ tool: string; decision: string; risk: string | null }>;
+  changes: Array<{ name: string; added: number; removed: number }>;
+  /** Files touched by a successful writer tool, with the tool that wrote them. */
+  fileChanges: Array<{ path: string; tool: string; turn: number | null }>;
+  steps: AgentStep[];
+  events: AgentEvent[];
+  usage: { total_tokens: number } | null;
+  durationMs: number | null;
+  sessionId: string | null;
+  malformedEvents: number;
+  harness: { source: string | null; schema: number | null };
+}
+
 export interface PanelCritique {
   model: string;
   ok: boolean;
@@ -177,6 +302,15 @@ export declare class ZStack {
   classifyPromptDetailed(prompt: string): DetailedClassification;
 
   task(options: string | TaskOptions): Promise<TaskResult>;
+
+  /**
+   * Run an agentic task: the model gets tools, its calls execute, and the
+   * results feed back until the task is done or `maxTurns` is reached.
+   *
+   * Use `task` for a single completion that cannot change anything. Without
+   * `apply`, mutating calls are declined, so the default run is read-only.
+   */
+  agent(options: string | AgentOptions): Promise<AgentResult>;
 
   runRole(role: string, prompt: string, options?: any): Promise<TaskResult>;
 

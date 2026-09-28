@@ -109,3 +109,137 @@ describe('task run history', () => {
     }
   });
 });
+
+describe('agentic run history', () => {
+  it('persists progression, not just the invocation', () => {
+    const file = tmpHistory();
+    appendHistory({
+      command: 'agent',
+      playbook: 'feature',
+      role: 'feature, refactoring',
+      model: 'opencode-go/deepseek-v4-pro',
+      durationMs: 1200,
+      usage: { total_tokens: 400 },
+      promptChars: 12,
+      promptPreview: 'do a thing',
+      ok: true,
+      applied: true,
+      workspace: 'C:/proj',
+      turns: 3,
+      toolCalls: 5,
+      failedTools: 1,
+      declinedTools: 2,
+      changes: [{ name: 'edit', added: 4, removed: 1 }],
+      fileChanges: [{ path: 'src/app.ts', tool: 'edit', turn: 2 }],
+      steps: [
+        { kind: 'start', turn: 0, model: 'opencode-go/deepseek-v4-pro', workspace: 'C:/proj' },
+        { kind: 'turn', turn: 1, tokens: 100 },
+        { kind: 'tool', turn: 1, name: 'bash', target: 'ls -la', outcome: 'ok', durationMs: 5 },
+        { kind: 'approval', tool: 'bash', decision: 'approved', risk: 'safe' },
+        { kind: 'tool', turn: 2, name: 'edit', target: 'src/app.ts', outcome: 'ok', durationMs: 7 }
+      ]
+    }, file);
+
+    const { entries } = readHistory({ path: file });
+    assert.equal(entries.length, 1);
+    const entry = entries[0];
+
+    assert.equal(entry.agentic, true);
+    assert.equal(entry.applied, true);
+    assert.equal(entry.workspace, 'C:/proj');
+    assert.equal(entry.turns, 3);
+    assert.equal(entry.toolCalls, 5);
+    assert.equal(entry.declinedTools, 2);
+    assert.deepEqual(entry.fileChanges, [{ path: 'src/app.ts', tool: 'edit', turn: 2 }]);
+    assert.equal(entry.stepsTruncated, false);
+    assert.equal(entry.steps.length, 5);
+
+    // The approval's tool name and the start step's model must survive, or the
+    // stored steps render as "approval undefined" and "run started: default".
+    const approval = entry.steps.find((s) => s.kind === 'approval');
+    assert.equal(approval.tool, 'bash');
+    assert.equal(approval.decision, 'approved');
+    const start = entry.steps.find((s) => s.kind === 'start');
+    assert.equal(start.model, 'opencode-go/deepseek-v4-pro');
+  });
+
+  it('caps stored steps and says so', () => {
+    const file = tmpHistory();
+    const steps = Array.from({ length: 250 }, (_, i) => ({
+      kind: 'tool',
+      turn: 1,
+      name: 'bash',
+      target: `cmd-${i}`,
+      outcome: 'ok'
+    }));
+    appendHistory({ command: 'agent', promptPreview: 'many steps', ok: true, steps }, file);
+
+    const { entries } = readHistory({ path: file });
+    assert.equal(entries[0].steps.length, 200);
+    assert.equal(entries[0].stepsTruncated, true);
+    assert.equal(entries[0].steps[0].target, 'cmd-0');
+    assert.equal(entries[0].steps[199].target, 'cmd-199');
+  });
+
+  it('leaves a single-completion run unmarked as agentic', () => {
+    const file = tmpHistory();
+    appendHistory({ command: 'task', playbook: 'feature', promptPreview: 'plain', ok: true }, file);
+    const { entries } = readHistory({ path: file });
+
+    assert.equal(entries[0].agentic, undefined);
+    assert.equal(entries[0].steps, undefined);
+    assert.equal(entries[0].fileChanges, undefined);
+  });
+
+  it('renders steps through the CLI view', async () => {
+    const file = tmpHistory();
+    const env = { ...process.env, ZSTACK_HISTORY_PATH: file };
+    appendHistory({
+      command: 'agent',
+      playbook: 'feature',
+      model: 'opencode-go/deepseek-v4-pro',
+      promptChars: 9,
+      promptPreview: 'step view',
+      ok: true,
+      applied: true,
+      workspace: 'C:/proj',
+      turns: 2,
+      toolCalls: 1,
+      fileChanges: [{ path: 'src/app.ts', tool: 'edit', turn: 1 }],
+      steps: [
+        { kind: 'start', turn: 0, model: 'opencode-go/deepseek-v4-pro', workspace: 'C:/proj' },
+        { kind: 'turn', turn: 1, tokens: 50 },
+        { kind: 'tool', turn: 1, name: 'edit', target: 'src/app.ts', outcome: 'ok', durationMs: 4 },
+        { kind: 'approval', tool: 'edit', decision: 'approved', risk: 'safe' }
+      ]
+    }, file);
+
+    const { stdout } = await run(process.execPath, [CLI, 'history', '--steps', '--limit', '1'], { cwd: ROOT, env });
+
+    assert.match(stdout, /run started: opencode-go\/deepseek-v4-pro in C:\/proj/);
+    assert.match(stdout, /turn 1 \(50 tokens\)/);
+    assert.match(stdout, /· turn 1: edit src\/app\.ts {2}\[ok, 4ms\]/);
+    assert.match(stdout, /approval edit: approved \(safe\)/);
+    assert.match(stdout, /changed 1 file: src\/app\.ts/);
+    // No stored step may render as an undefined field.
+    assert.doesNotMatch(stdout, /undefined/);
+  });
+
+  it('hints at --steps only when an agentic run is present', async () => {
+    const plain = tmpHistory();
+    appendHistory({ command: 'task', promptPreview: 'plain run', ok: true }, plain);
+    const plainOut = await run(process.execPath, [CLI, 'history'], {
+      cwd: ROOT,
+      env: { ...process.env, ZSTACK_HISTORY_PATH: plain }
+    });
+    assert.doesNotMatch(plainOut.stdout, /Add --steps/);
+
+    const agentic = tmpHistory();
+    appendHistory({ command: 'agent', promptPreview: 'agent run', ok: true, steps: [] }, agentic);
+    const agenticOut = await run(process.execPath, [CLI, 'history'], {
+      cwd: ROOT,
+      env: { ...process.env, ZSTACK_HISTORY_PATH: agentic }
+    });
+    assert.match(agenticOut.stdout, /Add --steps to expand/);
+  });
+});

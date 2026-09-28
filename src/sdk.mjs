@@ -30,6 +30,7 @@ import {
 import { classifyPromptSemantic, ROUTER_MIN_SCORE } from './router.mjs';
 import { planContext, DEFAULT_CONTEXT_BUDGET_TOKENS } from './context.mjs';
 import { parseDoc } from './manifest.mjs';
+import { runHarnessTask, buildProgression, finalText, resolveHarnessEntry } from './harness.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -568,6 +569,108 @@ export class ZStack {
       usage: chatRes.usage,
       durationMs: chatRes.durationMs,
       raw: chatRes.raw
+    };
+  }
+
+  /**
+   * Run a prompt as an agentic task: the model gets tools, its calls execute,
+   * and results feed back until the task is done or the turn budget runs out.
+   *
+   * `task()` is one completion and cannot change anything on disk. This is the
+   * method to use when the prompt says to look at, change, or verify a project.
+   * Execution is delegated to the ModelHitch harness, which owns the tool loop,
+   * the approval gate, and snapshots; zstack still owns classification, playbook
+   * and principle injection, and lane- or budget-aware model routing.
+   *
+   * Safety: without `apply`, a mutating tool call is declined rather than run,
+   * so the default is a read-only investigation.
+   */
+  async agent(options) {
+    const prompt = typeof options === 'string' ? options : options.prompt;
+    if (!prompt) throw new Error('Agent prompt is required');
+
+    const detailed = this.classifyPromptDetailed(prompt);
+    const playbookType = options.playbook || options.type || detailed.type;
+    const roleName = options.role || detailed.role;
+
+    // Resolve the model exactly as `task()` does, so lanes and budget tiers
+    // select the same model for an agentic run as for a single completion.
+    let targetModel = options.model;
+    if (!targetModel) {
+      try {
+        const state = await fetchModelHitchState(this.baseUrl, { timeoutMs: this.timeoutMs });
+        const mapping = await this.resolveRoleMapping(state, options.lane);
+        targetModel = mapping.models[roleName] || mapping.models['feature, refactoring'];
+      } catch {
+        // A missing bridge must not block an agentic run: the harness resolves
+        // the model from its own config. Lanes are a routing preference, and
+        // ModelHitch is the authority on what is reachable.
+        targetModel = undefined;
+      }
+    }
+
+    const workspaceDir = options.workspaceDir || this.workspaceDir || process.cwd();
+    const useZstackPrompt = options.noZstack !== true;
+
+    const result = await runHarnessTask({
+      prompt,
+      model: targetModel,
+      workspaceDir,
+      apply: !!options.apply,
+      maxTurns: options.maxTurns,
+      review: !!options.review,
+      autoApproveSafe: options.autoApproveSafe !== false,
+      harnessArgs: options.harnessArgs,
+      timeoutMs: options.timeoutMs ?? 0,
+      onEvent: options.onEvent,
+      onStderr: options.onStderr
+    });
+
+    const progression = buildProgression(result.events, {
+      model: targetModel ?? null,
+      maxTurns: options.maxTurns
+    });
+
+    return {
+      /** The model's closing message: its answer, not its tool calls. */
+      content: finalText(progression),
+      /** Everything the model said across turns, in order. */
+      narrative: progression.text.map((t) => String(t.text ?? '').trim()).filter(Boolean).join('\n\n'),
+      /**
+       * True when the loop stopped at the turn budget rather than the model
+       * deciding it was done, which is why `content` can be empty.
+       */
+      turnLimitReached: progression.turnLimitReached,
+      maxTurns: progression.maxTurns,
+      model: progression.model,
+      role: roleName,
+      playbook: playbookType,
+      principles: detailed.principles,
+      classification: {
+        type: detailed.type,
+        candidates: detailed.candidates || [],
+        confidence: detailed.confidence ?? null,
+        ambiguous: !!detailed.ambiguous
+      },
+      applied: !!options.apply,
+      workspaceDir,
+      playbookInjected: useZstackPrompt,
+      ok: result.ok,
+      exitCode: result.exitCode,
+      turns: progression.turns,
+      toolCalls: progression.toolCount,
+      failedTools: progression.failed,
+      declinedTools: progression.declined,
+      approvals: progression.approvals,
+      changes: progression.changes,
+      fileChanges: progression.fileChanges,
+      steps: progression.steps,
+      events: result.events,
+      usage: progression.tokens == null ? null : { total_tokens: progression.tokens },
+      durationMs: progression.durationMs,
+      sessionId: progression.sessionId,
+      malformedEvents: result.malformed,
+      harness: { source: result.entry?.source ?? null, schema: result.schema ?? null }
     };
   }
 

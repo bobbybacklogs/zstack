@@ -16,6 +16,7 @@ const HERMETIC_FILES = [
   'tests/cli-json.test.mjs',
   'tests/context.test.mjs',
   'tests/grader.test.mjs',
+  'tests/harness.test.mjs',
   'tests/history.test.mjs',
   'tests/manifest.test.mjs',
   'tests/router.test.mjs',
@@ -53,13 +54,17 @@ function runNode(args) {
 }
 
 async function runSuite(name, files, pattern) {
-  const args = ['--test'];
+  // The TAP reporter is requested explicitly. Node's default reporter became
+  // `spec` in Node 20, which emits `ℹ pass 20` rather than `# pass 20`, so
+  // relying on the default made every count parse as zero and reported a
+  // passing suite as a failure.
+  const args = ['--test', '--test-reporter=tap'];
   if (pattern) args.push('--test-name-pattern', pattern);
   args.push(...files);
   const { code, stdout, stderr } = await runNode(args);
   const counts = parseTAP(stdout);
   const failed = code !== 0 || (counts.fail ?? 1) > 0;
-  return { name, code, failed, counts, stdout, stderr };
+  return { name, code, failed, counts, stdout, stderr, files: files.join(' ') };
 }
 
 async function main() {

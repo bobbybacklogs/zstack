@@ -8,6 +8,7 @@ import { gradeDiff, formatVerdictTable } from '../src/grader.mjs';
 import { appendHistory, readHistory, lastEntry, needsRerunConfirm, HISTORY_PREVIEW_CHARS } from '../src/history.mjs';
 import { triageFailure } from '../src/triage.mjs';
 import { runContextOffload, formatOffloadReport } from '../src/subagent.mjs';
+import { formatEventLine, createProgressRenderer, explainEmptyContent, resolveHarnessEntry, harnessEntryExists, observeGitStatus } from '../src/harness.mjs';
 
 /** Structured exit codes: 0 success, 1 failure, 2 usage, 3 gateway, 4 partial. */
 export const EXIT = { OK: 0, FAIL: 1, USAGE: 2, GATEWAY: 3, PARTIAL: 4 };
@@ -28,14 +29,26 @@ const z = new ZStack();
 
 // Parse flags (--files, --role, --model, --project, --apply, -y, --check,
 // --tier, --source, --confirm, --json, --no-prune, --context-budget, --file,
-// --playbook, --timeout, --paths, --max-files, --limit, --last, --rerun, --live)
+// --playbook, --timeout, --paths, --max-files, --limit, --last, --rerun, --live,
+// --agent, --max-turns, --review)
 function parseArgs(args) {
-  const flags = { files: [], project: false, apply: false, check: false, confirm: false, yes: false, json: false, noPrune: false, live: true, last: false, rerun: false };
+  const flags = { files: [], project: false, apply: false, check: false, confirm: false, yes: false, json: false, noPrune: false, live: true, last: false, rerun: false, agent: false, review: false };
   const positional = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--project') {
       flags.project = true;
+    } else if (arg === '--agent') {
+      flags.agent = true;
+    } else if (arg === '--review') {
+      flags.review = true;
+    } else if (arg === '--max-turns' && i + 1 < args.length) {
+      const n = Number(args[++i]);
+      if (!Number.isInteger(n) || n <= 0) {
+        flags.maxTurnsError = args[i];
+      } else {
+        flags.maxTurns = n;
+      }
     } else if (arg === '--confirm' || arg === '--yes') {
       flags.confirm = true;
       flags.yes = true;
@@ -90,6 +103,8 @@ function parseArgs(args) {
       }
     } else if (arg === '--last') {
       flags.last = true;
+    } else if (arg === '--steps') {
+      flags.steps = true;
     } else if (arg === '--rerun') {
       flags.rerun = true;
     } else if (arg === '--live') {
@@ -192,7 +207,7 @@ Usage:
   zstack grade [--file <diff>] [--json]            Grade a diff against the 20 principles
   zstack triage [--file <log>] [--json]            Rank playbooks for failure output
   zstack explore "<query>" [--paths src,tests]     Distill bulk file reads via a subagent
-  zstack history [--limit N] [--json]              Show recent runs (--last --rerun repeats)
+  zstack history [--limit N] [--steps] [--json]    Show recent runs (--last --rerun repeats)
   zstack shell | repl                              Start an interactive session with sticky context
   zstack status [--json]                           Show ModelHitch health and active role mappings
   zstack sync [--project]                          Sync Cursor rules (~/.cursor/rules/zstack-models.mdc)
@@ -219,11 +234,30 @@ Usage:
   guided playbook selection (threshold: top score >= 1.0 with >= 0.5 margin).
   The semantic router refines ambiguous matches when the gateway is reachable.
 
+  Agentic runs (the tool loop):
+    A plain prompt makes one model call and prints the reply: it cannot read or
+    change anything. Adding --agent, --apply, or --project instead runs the
+    ModelHitch harness, which gives the model tools, executes its calls, and
+    feeds the results back until the task is done or --max-turns is reached.
+    Every turn and tool call streams as it happens and is recorded in history
+    (see: zstack history --steps).
+      read-only (default)  Commands the harness risk-classifies safe run;
+                           anything that could write or reach the network is
+                           declined, and the run reports what it declined.
+      --apply              Approves mutating calls, so the agent can change
+                           files. Diffs are reported from writer tools and from
+                           git status when the workspace is a repository.
+
 Options:
   --tier <tier>              Budget tier (low-med, med-high, high, max)
   --source <config|catalog>  Model selection source (Option A vs Option B)
   --lane <auto|zen|go|hitch> Provider lane for this invocation (overrides stored lane)
   --zen, --go, --hitch       Shortcuts for --lane zen | go | hitch
+  --agent                    Run the agentic tool loop (single completion without it)
+  --apply, -y                Agent: approve mutating calls so files can change
+                             (also: zstack update, record upstream sync checkpoint)
+  --max-turns <n>            Agent: model turns before the loop stops (harness default 8)
+  --review                   Agent: run the read-only reviewer over the change afterwards
   --confirm, --yes, -y       Confirm and apply budget mapping without interactive prompt
   --json                     Emit a single JSON document on stdout (diagnostics to stderr)
   --timeout <ms>             Per-request gateway timeout (default 30000, env MODELHITCH_TIMEOUT)
@@ -233,6 +267,7 @@ Options:
   --paths <a,b>              Restrict explore to these paths (default: .)
   --max-files <n>            Cap explore file attachments (positive integer)
   --limit <n>                History entries to show, newest first (positive integer)
+  --steps                    History: expand each agentic run into its steps
   --last                     History: show only the last run
   --rerun                    History: re-dispatch the last run (--yes if preview truncated)
   --live / --no-live         Triage: use the gateway model (default live) or heuristic only
@@ -240,8 +275,7 @@ Options:
   --role <role>            Override role assignment (e.g., 'feature, refactoring', 'judgment and prose')
   --model <provider/model> Override model directly (e.g., 'deepseek/deepseek-v4-flash')
   --playbook <id>          Bypass guided selection with an explicit playbook
-  --project                Target current project directory instead of user home
-  --apply, -y              Automatically record upstream sync checkpoint
+  --project                Agent: run in the current directory reading/writing real files
   --check                  Check upstream without prompting for update
   --about, -a              Show architecture and design overview
   --version, -v            Show package version
@@ -333,6 +367,32 @@ function taskOptions(prompt, playbook, flags) {
   };
 }
 
+/**
+ * Whether this invocation runs the agent loop instead of a single completion.
+ *
+ * `task` cannot change anything: it makes one request and returns text. So any
+ * flag that only means something if work actually happens implies an agentic
+ * run. Turning them into silent no-ops is what made `--project --apply` look
+ * like it had run when nothing had been touched.
+ */
+function isAgentic(flags) {
+  return !!(flags.agent || flags.apply || flags.project);
+}
+
+function agentOptions(prompt, playbook, flags) {
+  return {
+    playbook,
+    prompt,
+    role: flags.role,
+    model: flags.model,
+    lane: flags.lane,
+    apply: !!flags.apply,
+    maxTurns: flags.maxTurns,
+    review: !!flags.review,
+    workspaceDir: flags.project ? process.cwd() : undefined
+  };
+}
+
 function reportContext(plan, flags) {
   if (!plan) return;
   const lines = [];
@@ -357,6 +417,14 @@ async function handleTask(args) {
 
   if (!flags.json) console.log(`[>] Running task with playbook [${playbookArg}]...`);
   else console.error(`Running task with playbook [${playbookArg}]...`);
+
+  // Same rule as the bare-prompt path: a flag that only matters if work happens
+  // selects the agent loop.
+  if (isAgentic(flags)) {
+    const classification = z.classifyPromptDetailed(prompt);
+    return await runAgentPrompt(prompt, playbookArg, classification, flags);
+  }
+
   try {
     const res = await z.task(taskOptions(prompt, playbookArg, flags));
     recordRun({
@@ -471,8 +539,203 @@ async function resolveGuidedPlaybook(prompt, flags, asker) {
 }
 
 /**
+ * Agentic execution: run the tool loop and stream its progression.
+ *
+ * The stream is the point. Once zstack executes tool calls, "what did it do?"
+ * stops being answerable from the final message, so every turn and tool call is
+ * printed as it happens and recorded in run history. `--json` emits the same
+ * steps as structured records rather than lines.
+ */
+async function runAgentPrompt(prompt, playbookId, classification, flags) {
+  const mode = flags.apply ? 'apply' : 'read-only';
+  if (!flags.json) {
+    console.log(`[>] Agentic run (${mode}${flags.maxTurns ? `, max ${flags.maxTurns} turns` : ''}) in ${flags.project ? process.cwd() : 'the zstack workspace'}`);
+    if (!flags.apply) {
+      console.log('    Mutating tool calls will be declined. Pass --apply to let the agent change files.');
+    }
+  }
+
+  const started = Date.now();
+  const steps = [];
+  // Coalesces streamed text deltas into readable blocks; `push` and `flush`
+  // keep the live view identical to what run history records.
+  const renderer = createProgressRenderer({
+    write: (line) => console.log(line)
+  });
+  try {
+    const res = await z.agent({
+      ...agentOptions(prompt, playbookId, flags),
+      onEvent: (event) => {
+        steps.push(event);
+        if (flags.json) {
+          // One record per line on stderr, keeping stdout parseable.
+          console.error(JSON.stringify({ zstack: 'step', ...event }));
+          return;
+        }
+        renderer.push(event);
+      }
+    });
+    if (!flags.json) renderer.flush();
+
+    recordRun({
+      command: 'agent',
+      playbook: res.playbook,
+      role: res.role,
+      model: res.model,
+      durationMs: res.durationMs,
+      usage: res.usage,
+      contextEstimate: null,
+      promptChars: prompt.length,
+      promptPreview: prompt,
+      files: flags.files || [],
+      ok: res.ok,
+      applied: res.applied,
+      turns: res.turns,
+      toolCalls: res.toolCalls,
+      failedTools: res.failedTools,
+      declinedTools: res.declinedTools,
+      workspace: res.workspaceDir,
+      changes: res.changes,
+      fileChanges: res.fileChanges,
+      steps: res.steps
+    });
+
+    if (flags.json) {
+      emitJson({
+        ok: res.ok,
+        content: res.content,
+        model: res.model,
+        role: res.role,
+        playbook: res.playbook,
+        principles: res.principles,
+        classification: res.classification,
+        applied: res.applied,
+        workspace: res.workspaceDir,
+        turns: res.turns,
+        toolCalls: res.toolCalls,
+        failedTools: res.failedTools,
+        declinedTools: res.declinedTools,
+        approvals: res.approvals,
+        changes: res.changes,
+        fileChanges: res.fileChanges,
+        gitStatus: res.applied ? observeGitStatus(res.workspaceDir) : null,
+        steps: res.steps,
+        usage: res.usage,
+        durationMs: res.durationMs,
+        sessionId: res.sessionId,
+        harness: res.harness
+      });
+      return res;
+    }
+
+    reportProgression(res, Date.now() - started, mode);
+    if (res.content) {
+      console.log(`\n${res.content}`);
+    } else {
+      // An empty answer is ambiguous on its own, so say which case this is
+      // rather than printing a blank line and letting the user guess.
+      const why = explainEmptyContent(res);
+      if (why) console.log(`\n[!] ${why}`);
+    }
+    return res;
+  } catch (err) {
+    if (err?.kind === 'harness-missing') {
+      fail(
+        `${err.message}\n    Install it with: npm i -g modelhitch`,
+        EXIT.FAIL,
+        flags
+      );
+    }
+    recordRun({
+      command: 'agent',
+      playbook: playbookId,
+      role: classification.role,
+      model: null,
+      durationMs: Date.now() - started,
+      usage: null,
+      contextEstimate: null,
+      promptChars: prompt.length,
+      promptPreview: prompt,
+      files: flags.files || [],
+      ok: false,
+      errorKind: err?.kind || 'error',
+      exitCode: exitCodeFor(err)
+    });
+    failWith(err, flags, EXIT.FAIL, '[!] Agent run failed');
+  }
+}
+
+/** Closing summary for an agentic run. */
+function reportProgression(res, wallMs, mode) {
+  const parts = [
+    `${res.turns} turn${res.turns === 1 ? '' : 's'}`,
+    `${res.toolCalls} tool call${res.toolCalls === 1 ? '' : 's'}`
+  ];
+  if (res.declinedTools) parts.push(`${res.declinedTools} declined`);
+  if (res.failedTools) parts.push(`${res.failedTools} failed`);
+  if (res.usage?.total_tokens) parts.push(`${res.usage.total_tokens} tokens`);
+  parts.push(`${wallMs}ms`);
+
+  console.log(`\n[${res.ok ? '✓' : '!'}] Model: ${res.model || 'default'} | Role: ${res.role} | ${mode} (${parts.join(' | ')})`);
+
+  if (res.fileChanges?.length) {
+    const unique = [...new Set(res.fileChanges.map((c) => c.path))];
+    console.log(`[✓] Changed ${unique.length} file${unique.length === 1 ? '' : 's'}:`);
+    for (const path of unique) {
+      const tools = [...new Set(res.fileChanges.filter((c) => c.path === path).map((c) => c.tool))];
+      console.log(`    ~ ${path}  (${tools.join(', ')})`);
+    }
+    if (res.changes?.length) {
+      const added = res.changes.reduce((n, c) => n + (c.added || 0), 0);
+      const removed = res.changes.reduce((n, c) => n + (c.removed || 0), 0);
+      console.log(`    diff: +${added}/-${removed} across ${res.changes.length} mutation${res.changes.length === 1 ? '' : 's'}`);
+    }
+  }
+
+  // Git is the artifact that does not care which tool wrote the bytes, so it
+  // catches writes that arrived through a shell command.
+  if (res.applied) {
+    const git = observeGitStatus(res.workspaceDir);
+    if (git && git.count > 0) {
+      if (!res.fileChanges?.length) {
+        console.log(`[✓] Workspace changed (${git.count} path${git.count === 1 ? '' : 's'} per git):`);
+      } else {
+        console.log(`[✓] git status: ${git.count} path${git.count === 1 ? '' : 's'} changed`);
+      }
+      for (const entry of git.entries.slice(0, 20)) {
+        console.log(`    ${entry.status.padEnd(2)} ${entry.path}`);
+      }
+      if (git.entries.length > 20) console.log(`    … and ${git.entries.length - 20} more`);
+    } else if (git && git.count === 0 && !res.fileChanges?.length) {
+      console.log('[·] git status is clean: no file changes.');
+    } else if (!git && !res.fileChanges?.length) {
+      // Not a git repo and no tool-attributed writes: say what is actually
+      // known rather than claiming nothing changed.
+      console.log('[·] No file changes attributed to a writer tool, and this workspace is not a git repository, so changes made through shell commands cannot be confirmed either way.');
+    }
+  } else if (res.changes?.length) {
+    const added = res.changes.reduce((n, c) => n + (c.added || 0), 0);
+    const removed = res.changes.reduce((n, c) => n + (c.removed || 0), 0);
+    console.log(`[!] ${res.changes.length} mutation${res.changes.length === 1 ? '' : 's'} (+${added}/-${removed}) seen in a read-only run.`);
+  }
+
+  if (res.declinedTools && !res.applied) {
+    console.log(`[!] ${res.declinedTools} mutating call${res.declinedTools === 1 ? '' : 's'} declined. Re-run with --apply to allow changes.`);
+  }
+  if (res.malformedEvents) {
+    console.log(`[!] ${res.malformedEvents} unreadable event line${res.malformedEvents === 1 ? '' : 's'} from the harness.`);
+  }
+  if (!res.ok) {
+    console.log(`[!] The harness exited ${res.exitCode}. The work above may be incomplete.`);
+  }
+}
+
+/**
  * Shared one-shot execution used by `prompt`/`run`, bare prompts, and the
  * interactive shell. Records exactly one history line per invocation.
+ *
+ * An agentic invocation (`--agent`, `--apply`, `--project`) runs the tool loop
+ * and streams its progression; everything else is a single completion.
  */
 async function runOneShotPrompt(prompt, flags, asker) {
   const { playbookId, classification, guided } = await resolveGuidedPlaybook(prompt, flags, asker);
@@ -481,6 +744,10 @@ async function runOneShotPrompt(prompt, flags, asker) {
     console.log(`    Principles: ${(flags.playbook ? z.classifyPrompt(prompt).principles : classification.principles).join(', ')}`);
   } else {
     console.error(`Task classified as [${playbookId}]${guided ? ' (guided, top candidate)' : ''}`);
+  }
+
+  if (isAgentic(flags)) {
+    return await runAgentPrompt(prompt, playbookId, classification, flags);
   }
 
   try {
@@ -869,11 +1136,60 @@ async function handleExplore(args) {
   }
 }
 
-function printHistoryEntry(e) {
+function printHistoryEntry(e, options = {}) {
   const status = e.ok ? 'ok' : `FAILED(${e.exitCode ?? 1}${e.errorKind ? ':' + e.errorKind : ''})`;
   const model = e.model ? ` | ${e.model}` : '';
   console.log(`  ${e.ts}  [${status}] ${e.command}${e.playbook ? ':' + e.playbook : ''}${model}`);
   console.log(`    prompt (${e.promptChars ?? '?'} chars): ${(e.promptPreview || '').replace(/\s+/g, ' ').slice(0, 100)}`);
+
+  if (e.agentic) {
+    const parts = [];
+    if (e.turns != null) parts.push(`${e.turns} turns`);
+    if (e.toolCalls != null) parts.push(`${e.toolCalls} tool calls`);
+    if (e.declinedTools) parts.push(`${e.declinedTools} declined`);
+    if (e.failedTools) parts.push(`${e.failedTools} failed`);
+    parts.push(e.applied ? 'applied' : 'read-only');
+    if (e.workspace) parts.push(e.workspace);
+    console.log(`    agent: ${parts.join(' | ')}`);
+
+    const paths = [...new Set((e.fileChanges || []).map((c) => c.path))];
+    if (paths.length > 0) {
+      console.log(`    changed ${paths.length} file${paths.length === 1 ? '' : 's'}: ${paths.join(', ')}`);
+    }
+  }
+
+  if (options.steps && Array.isArray(e.steps) && e.steps.length > 0) {
+    console.log('    steps:');
+    for (const step of e.steps) {
+      const line = formatStoredStep(step);
+      if (line) console.log(`      ${line}`);
+    }
+    if (e.stepsTruncated) console.log('      … further steps not recorded');
+  }
+}
+
+/**
+ * One stored step as a line.
+ *
+ * History stores a compact step shape, not the raw event, so this renders that
+ * shape rather than reusing `formatEventLine` and silently printing blanks.
+ */
+function formatStoredStep(step) {
+  switch (step.kind) {
+    case 'start':
+      return `run started: ${step.model || 'default'}${step.workspace ? ` in ${step.workspace}` : ''}`;
+    case 'turn':
+      return `turn ${step.turn}${step.tokens ? ` (${step.tokens} tokens)` : ''}`;
+    case 'tool': {
+      const detail = [step.outcome, step.durationMs != null ? `${step.durationMs}ms` : null].filter(Boolean).join(', ');
+      const mark = step.outcome === 'ok' || step.outcome === 'dry-run' ? '·' : '!';
+      return `${mark} turn ${step.turn ?? '?'}: ${step.name}${step.target ? ` ${step.target}` : ''}  [${detail}]`;
+    }
+    case 'approval':
+      return `! approval ${step.tool}: ${step.decision}${step.risk ? ` (${step.risk})` : ''}`;
+    default:
+      return null;
+  }
 }
 
 async function handleHistory(args) {
@@ -918,9 +1234,16 @@ async function handleHistory(args) {
     console.log('No run history yet.');
     return;
   }
+  // `--steps` expands the progression of each run: what the agent actually did,
+  // which for an agentic run is the part the final message does not contain.
+  const showSteps = !!flags.steps;
   console.log('\n=== zstack Run History (newest first) ===\n');
-  for (const e of entries) printHistoryEntry(e);
-  console.log(`\nShowing ${entries.length} of ${total} runs${skipped > 0 ? ` (${skipped} malformed lines skipped)` : ''}.\n`);
+  for (const e of entries) printHistoryEntry(e, { steps: showSteps });
+  console.log(`\nShowing ${entries.length} of ${total} runs${skipped > 0 ? ` (${skipped} malformed lines skipped)` : ''}.`);
+  if (!showSteps && entries.some((e) => e.agentic)) {
+    console.log('Add --steps to expand what each agentic run did.');
+  }
+  console.log('');
 }
 
 function printShellHelp() {
