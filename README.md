@@ -3,7 +3,7 @@
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](package.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
-[![Tests](https://img.shields.io/badge/tests-9%20passed-brightgreen.svg)](tests/connector.test.mjs)
+[![Tests](https://img.shields.io/badge/tests-209%20passed-brightgreen.svg)](scripts/verify.mjs)
 [![Gateway](https://img.shields.io/badge/gateway-ModelHitch%203939-orange.svg)](https://github.com/bobbybacklogs/ModelHitch)
 
 An opinionated Agent Operating System, TypeScript SDK, and CLI for rigorous software engineering.
@@ -16,6 +16,7 @@ An opinionated Agent Operating System, TypeScript SDK, and CLI for rigorous soft
 
 - **15 Standard Operating Playbooks**: Structured execution recipes for features, bug fixes, refactoring, performance forensics, and pull requests.
 - **20 Durable Principles**: Non-negotiable engineering rules (laziness protocol, root cause remediation, boundary discipline, context preservation) cited against concrete code changes.
+- **Local UI**: `zstack serve` opens runs as pages in a browser, streams a run in progress, and starts new ones. Same records the CLI writes, so a run started in the UI appears in `zstack history`.
 - **Dynamic Workload Routing**: Routes tasks to the optimal model based on available providers (OpenCode Zen/Go, OpenAI, Anthropic, Gemini, DeepSeek).
 - **Adversarial Multi-Family Panels**: Concurrently queries models across distinct provider families (`/arena`, `/panel`) to surface architectural blind spots.
 - **Unified SDK & CLI**: Programmatic TypeScript API and terminal binary for direct task execution, prompt classification, and rule synchronization.
@@ -339,6 +340,85 @@ $ zstack history --steps --limit 1
 
 Stored steps cap at 200 per run; `stepsTruncated: true` marks a capped list so a
 partial progression is never mistaken for the whole run.
+
+Every record carries an `id`. Appending a run never renumbers the ones already
+there, so an address stays valid: a run opened in the UI keeps the same URL in
+history tomorrow.
+
+### 14. Local UI
+
+Browse, watch, and start runs in a browser. Runs render as pages: properties at
+the top, an ordered body of blocks below. One renderer serves both an archived
+run read from `history.jsonl` and a live run streaming off the harness, so the
+page you watch during a run is the page you open next week.
+
+```bash
+zstack serve                        # http://127.0.0.1:4141
+zstack serve --port 4300 --open     # pick a port and open a browser
+zstack serve --json                 # prints { ok, url } once the socket is bound
+```
+
+What it does:
+
+- Lists runs newest first, merging runs still in flight with archived ones.
+- Opens any run as a page: turns, tool calls with outcomes and durations,
+  approvals, the model's own words, and the files that changed.
+- Streams a run in progress token by token, patching the page in place.
+- Starts a run with controls for playbook, provider lane, workspace, max turns,
+  and approval policy.
+- Shows bridge health, the active lane, and the resolved role-to-model mapping,
+  and lets you change the budget tier, source, and lane.
+- Organizes runs into projects: a project is a name plus the directory it owns,
+  listed in the sidebar, opened as a page of its own runs, and picked in the
+  composer so the run executes there.
+
+Projects are stored in `~/.zstack/projects.json` next to history, deliberately
+as plain JSON: a human creates a handful of them by pointing at folders, not a
+database's worth. Creating one needs a name and an existing directory.
+Renaming never changes the id its runs refer to, and deleting one never deletes
+work — the runs stay in history and keep rendering, listed under no project
+until re-attached. Starting a run under a project takes the directory from the
+stored project, never from the request, so a stored area cannot be talked into
+executing somewhere else.
+
+A project can also set a default playbook and policy. The composer pre-selects
+them when a run starts there, but an explicit choice always wins — a default
+that overrode the reader would be a trap. A default naming something the server
+has never loaded faults with the project's name, so the fix lands where the
+preference lives. A run page names its project next to the status chip and
+links back to the project page; a run whose project was deleted shows no link
+rather than one that leads nowhere.
+
+A run page also offers Rename, Move to project, and Delete run. A rename sets
+a custom title — empty restores the derived one — and the prompt preview stays
+in the body, so renaming never destroys the record of what was asked. A move
+re-attaches the run to another project, or detaches it entirely. Delete hides
+the run from every list without rewriting history: the record stays, and the
+page still resolves by id, so the action never produces a 404 for itself. All
+three write a sidecar file (`~/.zstack/run-overrides.json`) keyed by run id,
+because history is append-only and editing its lines in place would break the
+trust every reader places in it.
+
+Two honest limits:
+
+**Approval is run-level, not per-call.** `runHarnessTask` pipes the prompt on
+stdin and passes `--yes` or `--auto-approve-safe`; under a non-interactive stdin
+the harness declines rather than blocking on a question. So the composer offers
+three policies instead of approve/deny buttons that could not work:
+
+| Policy | What runs |
+| :--- | :--- |
+| `read-only` (default) | Read-only calls the risk classifier calls safe. A write or a listening port is declined. |
+| `apply` | Mutating calls run without asking. |
+| `strict` | Nothing is auto-approved, not even a safe read. |
+
+**It binds loopback only.** This process starts agent runs, so the default is
+`127.0.0.1` and `--host` warns before exposing it. A `Host` header naming a host
+the server does not answer for is refused, which is what stops a page on another
+site from reaching it through DNS rebinding.
+
+No build step, no dependency: the client is vanilla ES modules and one
+stylesheet served straight from `web/`.
 
 ## Gateway Reliability
 

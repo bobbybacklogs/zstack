@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>zstack</title>
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="sidebar__head">
+          <div class="workspace">
+            <span class="workspace__mark">z</span>
+            <span>zstack</span>
+            <span class="workspace__sub">runs</span>
+          </div>
+          <div class="search">
+            <input
+              id="search"
+              type="search"
+              placeholder="Search runs"
+              aria-label="Search runs"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </div>
+        </div>
+        <nav class="nav" id="nav"></nav>
+        <div class="sidebar__foot" id="footer"></div>
+      </aside>
+      <main class="main">
+        <div class="topbar" id="topbar"></div>
+        <div id="view">
+          <div class="loading">Loading runs...</div>
+        </div>
+      </main>
+    </div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

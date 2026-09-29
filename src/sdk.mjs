@@ -622,6 +622,7 @@ export class ZStack {
       autoApproveSafe: options.autoApproveSafe !== false,
       harnessArgs: options.harnessArgs,
       timeoutMs: options.timeoutMs ?? 0,
+      signal: options.signal,
       onEvent: options.onEvent,
       onStderr: options.onStderr
     });
@@ -657,6 +658,8 @@ export class ZStack {
       playbookInjected: useZstackPrompt,
       ok: result.ok,
       exitCode: result.exitCode,
+      /** True when the caller aborted the run rather than the model failing. */
+      cancelled: !!result.aborted,
       turns: progression.turns,
       toolCalls: progression.toolCount,
       failedTools: progression.failed,

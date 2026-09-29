@@ -9,7 +9,10 @@ import { fileURLToPath } from 'node:url';
 import {
   appendHistory,
   readHistory,
+  readHistoryTail,
   lastEntry,
+  newRunId,
+  recordId,
   needsRerunConfirm,
   resetHistoryWarnings,
   HISTORY_PREVIEW_CHARS
@@ -107,6 +110,90 @@ describe('task run history', () => {
       assert.equal(err.code, 2, `want exit 2, got ${err.code}`);
       assert.match(JSON.parse(err.stdout).error, /incomplete/);
     }
+  });
+});
+
+describe('run addressing', () => {
+  it('stamps a stored id on every record it appends', () => {
+    const file = tmpHistory();
+    appendHistory({ command: 'task', promptPreview: 'addressed', promptChars: 9 }, file);
+    const { entries } = readHistory({ path: file });
+    assert.match(entries[0].id, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(entries[0].id, readHistoryTail(1, file)[0].id);
+  });
+
+  it('mints ids that are unique and sortable', () => {
+    const ids = Array.from({ length: 50 }, () => newRunId());
+    assert.equal(new Set(ids).size, 50);
+    // Timestamp-first means lexicographic order equals creation order.
+    assert.deepEqual(ids, [...ids].sort());
+  });
+
+  it('gives a legacy record an id derived from its own line, not its position', () => {
+    const file = tmpHistory();
+    // Write raw lines, the shape a history file had before ids existed.
+    for (const name of ['first', 'second', 'third']) {
+      appendFileSync(file, JSON.stringify({ ts: `2026-01-0${name.length}`, command: 'task', promptPreview: name }) + '\n', 'utf8');
+    }
+    const before = readHistory({ path: file, limit: 10 }).entries.map((e) => e.id);
+    assert.equal(before.length, 3);
+    assert.ok(before.every((id) => id.startsWith('l-')));
+
+    // Appending must not renumber the records that were already there, which is
+    // exactly what a positional id would do.
+    appendFileSync(file, JSON.stringify({ ts: '2026-01-09', command: 'task', promptPreview: 'fourth' }) + '\n', 'utf8');
+    const after = readHistory({ path: file, limit: 10 }).entries.map((e) => e.id);
+    assert.equal(after.length, 4);
+    // `after` is newest-first, so the original three now sit one slot later.
+    assert.deepEqual(after.slice(1), before);
+  });
+
+  it('reads the same records from the tail as from a full scan', () => {
+    const file = tmpHistory();
+    for (let i = 0; i < 12; i++) {
+      appendHistory({ command: 'agent', promptPreview: `run ${i}`, promptChars: 5, ok: true, steps: [] }, file);
+    }
+    const full = readHistory({ limit: 100, path: file });
+    assert.equal(full.total, 12);
+    for (const n of [1, 5, 12, 40]) {
+      const tail = readHistoryTail(n, file);
+      assert.deepEqual(tail.map((e) => e.id), full.entries.slice(0, n).map((e) => e.id), `limit ${n}`);
+    }
+    assert.deepEqual(readHistoryTail(0, file), []);
+  });
+
+  it('reads a tail spanning several chunks without corrupting multi-byte characters', () => {
+    const file = tmpHistory();
+    // Past the 64 KiB read chunk, with characters that straddle chunk boundaries.
+    const filler = '日本語のテキスト、テスト。';
+    for (let i = 0; i < 220; i++) {
+      appendHistory({ command: 'task', promptPreview: `${i}:${filler.repeat(8)}`, promptChars: 900 }, file);
+    }
+    const full = readHistory({ limit: 1000, path: file });
+    assert.equal(full.total, 220);
+    const tail = readHistoryTail(30, file);
+    assert.deepEqual(tail.map((e) => e.id), full.entries.slice(0, 30).map((e) => e.id));
+    // The newest record's preview must survive intact, replacement characters
+    // and all other corruption aside.
+    assert.match(tail[0].promptPreview, /^219:日本語のテキスト、テスト。/);
+    assert.doesNotMatch(tail[0].promptPreview, /\uFFFD/);
+  });
+
+  it('skips a malformed line at the tail instead of losing the records around it', () => {
+    const file = tmpHistory();
+    appendHistory({ command: 'task', promptPreview: 'oldest', promptChars: 6 }, file);
+    appendFileSync(file, 'not json {{{\n', 'utf8');
+    appendHistory({ command: 'task', promptPreview: 'newest', promptChars: 6 }, file);
+    const tail = readHistoryTail(5, file);
+    assert.equal(tail.length, 2);
+    assert.equal(tail[0].promptPreview, 'newest');
+    assert.equal(tail[1].promptPreview, 'oldest');
+  });
+
+  it('derives record ids without depending on the parse succeeding twice', () => {
+    assert.equal(recordId({ id: 'stored' }, 'ignored'), 'stored');
+    assert.equal(recordId({ ts: 'x' }, '{"ts":"x"}'), recordId({ ts: 'x' }, '{"ts":"x"}'));
+    assert.notEqual(recordId({ ts: 'x' }, 'a'), recordId({ ts: 'x' }, 'b'));
   });
 });
 

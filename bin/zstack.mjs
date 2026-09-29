@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createInterface } from 'node:readline/promises';
+import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { ZStack, DEFAULT_BRIDGE_URL, fetchModelHitchState } from '../src/index.mjs';
 import { BUDGET_TIERS, BUDGET_SOURCES, LANES, getStoredBudget, isKnownLane, normalizeLane, promptAndSetBudget } from '../src/budget.mjs';
@@ -9,6 +10,7 @@ import { appendHistory, readHistory, lastEntry, needsRerunConfirm, HISTORY_PREVI
 import { triageFailure } from '../src/triage.mjs';
 import { runContextOffload, formatOffloadReport } from '../src/subagent.mjs';
 import { formatEventLine, createProgressRenderer, explainEmptyContent, resolveHarnessEntry, harnessEntryExists, observeGitStatus } from '../src/harness.mjs';
+import { startServer, DEFAULT_PORT, DEFAULT_HOST, isLoopback } from '../src/serve.mjs';
 
 /** Structured exit codes: 0 success, 1 failure, 2 usage, 3 gateway, 4 partial. */
 export const EXIT = { OK: 0, FAIL: 1, USAGE: 2, GATEWAY: 3, PARTIAL: 4 };
@@ -21,7 +23,7 @@ export function exitForKind(kind) {
 
 const KNOWN_COMMANDS = new Set([
   'task', 'prompt', 'run', 'panel', 'arena', 'interrogate', 'budget', 'grade',
-  'triage', 'explore', 'history', 'shell', 'repl',
+  'triage', 'explore', 'history', 'shell', 'repl', 'serve',
   'status', 'sync', 'update', 'playbooks', 'principles', 'about', 'version', 'help'
 ]);
 
@@ -119,6 +121,17 @@ function parseArgs(args) {
       flags.model = args[++i];
     } else if (arg === '--playbook' && i + 1 < args.length) {
       flags.playbook = args[++i];
+    } else if (arg === '--port' && i + 1 < args.length) {
+      const n = Number(args[++i]);
+      if (!Number.isInteger(n) || n < 0 || n > 65535) {
+        flags.portError = args[i];
+      } else {
+        flags.port = n;
+      }
+    } else if (arg === '--host' && i + 1 < args.length) {
+      flags.host = args[++i];
+    } else if (arg === '--open') {
+      flags.open = true;
     } else {
       positional.push(arg);
     }
@@ -208,6 +221,7 @@ Usage:
   zstack triage [--file <log>] [--json]            Rank playbooks for failure output
   zstack explore "<query>" [--paths src,tests]     Distill bulk file reads via a subagent
   zstack history [--limit N] [--steps] [--json]    Show recent runs (--last --rerun repeats)
+  zstack serve [--port N] [--host H] [--open]      Local UI: browse runs, watch one live, start one
   zstack shell | repl                              Start an interactive session with sticky context
   zstack status [--json]                           Show ModelHitch health and active role mappings
   zstack sync [--project]                          Sync Cursor rules (~/.cursor/rules/zstack-models.mdc)
@@ -1246,8 +1260,81 @@ async function handleHistory(args) {
   console.log('');
 }
 
-function printShellHelp() {
-  console.log(`
+/**
+ * Run the local UI server until interrupted.
+ *
+ * The process stays in the foreground on purpose. A backgrounded server that
+ * nobody is watching is one you forget about, and this one can start agent runs
+ * that change files, so it should be as visible as any other long-running
+ * command. Ctrl-C stops it.
+ */
+async function handleServe(args) {
+  const { flags } = parseArgs(args);
+  if (flags.portError !== undefined) {
+    fail(`Error: --port expects an integer from 0 to 65535 (got "${flags.portError}").`, EXIT.USAGE, flags);
+  }
+  const host = flags.host || DEFAULT_HOST;
+  const port = flags.port ?? DEFAULT_PORT;
+
+  if (!isLoopback(host)) {
+    console.error(`[!] Binding ${host} exposes this server beyond this machine.`);
+    console.error('    It starts agent runs and executes shell commands. Anyone who can reach');
+    console.error('    this port can change files on this machine. Prefer the default 127.0.0.1.');
+  }
+
+  let started;
+  try {
+    started = await startServer({ host, port });
+  } catch (err) {
+    fail(`[!] Cannot start the UI server: ${err.message}`, err.exitCode || EXIT.FAIL, flags);
+  }
+
+  if (flags.json) {
+    // Printed once, after the socket is actually bound, so a caller can read the
+    // real port rather than the one it asked for.
+    emitJson({ ok: true, url: started.url, host: started.host, port: started.port });
+  } else {
+    console.log(`\nzstack UI listening on ${started.url}`);
+    console.log(`    Runs are recorded in ${process.env.ZSTACK_HISTORY_PATH || '~/.zstack/history.jsonl'}`);
+    console.log('    Press Ctrl-C to stop.\n');
+  }
+
+  if (flags.open) openBrowser(started.url);
+
+  await new Promise((resolve) => {
+    let closing = false;
+    const stop = () => {
+      if (closing) return;
+      closing = true;
+      console.log('\n[>] Stopping the UI server...');
+      started.server.close(() => resolve());
+      // A run in flight holds its own child process, which is stopped with the
+      // server so nothing keeps working after the UI is gone.
+      started.registry.shutdown();
+      setTimeout(() => resolve(), 2000).unref();
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+  });
+  process.exit(EXIT.OK);
+}
+
+/** Open a URL in the platform's default browser, best-effort. */
+function openBrowser(url) {
+  const command =
+    process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]]
+      : process.platform === 'darwin' ? ['open', [url]]
+        : ['xdg-open', [url]];
+  try {
+    const child = spawn(command[0], command[1], { stdio: 'ignore', detached: true });
+    child.on('error', () => {});
+    child.unref();
+  } catch {
+    // A browser that will not open is not a reason to refuse to serve.
+  }
+}
+
+function printShellHelp() {  console.log(`
 Session commands:
   /playbook <id>     Pin a playbook for subsequent prompts (/playbook clear to unset)
   /files <a,b>       Attach files (/files clear to unset)
@@ -1553,6 +1640,9 @@ async function main() {
     case 'shell':
     case 'repl':
       await handleShell(rawArgs);
+      break;
+    case 'serve':
+      await handleServe(rawArgs);
       break;
     case 'update':
     case '--update': {

@@ -254,6 +254,7 @@ export function runHarnessTask(options) {
     onEvent,
     onStderr,
     timeoutMs = 0,
+    signal,
     env = process.env,
     entry = resolveHarnessEntry({ env })
   } = options;
@@ -314,6 +315,20 @@ export function runHarnessTask(options) {
       }, timeoutMs);
     }
 
+    /**
+     * Killing the child lets the run settle through the normal path: `close`
+     * fires with a non-zero code and the promise resolves with `ok: false`
+     * rather than rejecting. A caller that asked to stop still gets the events
+     * the run produced before it stopped, which is the point of stopping.
+     */
+    const onAbort = () => {
+      if (!settled) child.kill();
+    };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => parser.push(chunk));
 
@@ -327,6 +342,7 @@ export function runHarnessTask(options) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
       rejectPromise(err);
     });
 
@@ -334,12 +350,14 @@ export function runHarnessTask(options) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
       const { malformed } = parser.flush();
       const done = events.find((e) => e.type === 'done') ?? null;
       const schema = events.find((e) => e.type === 'run-start')?.schema;
       resolvePromise({
-        ok: code === 0,
+        ok: code === 0 && !signal?.aborted,
         exitCode: code ?? 0,
+        aborted: !!signal?.aborted,
         events,
         done,
         stderr,

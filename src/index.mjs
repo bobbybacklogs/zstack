@@ -9,3 +9,5 @@ export * from './manifest.mjs';
 export * from './triage.mjs';
 export * from './subagent.mjs';
 export * from './history.mjs';
+export * from './projects.mjs';
+export * from './overrides.mjs';
