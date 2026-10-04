@@ -569,6 +569,174 @@ a resolved model the gateway does not serve is never selected.
 
 ---
 
+## HTTP API
+
+`zstack serve` exposes a small, documented HTTP API for external callers and automation to establish, stream, and observe agent runs by reusing server internals.
+
+### Authentication & Access
+
+The server binds loopback (`127.0.0.1:4141`) by default and checks the `Host` header to defend against DNS rebinding.
+
+When the environment variable `ZSTACK_API_TOKEN` is set, all routes require the shared token and return `401 Unauthorized` if it is missing or invalid. Pass the token via:
+- `Authorization: Bearer <token>`
+- `x-api-token: <token>`
+
+### Error Format
+
+Errors return structured JSON with standard HTTP status codes (`400`, `401`, `404`, `409`):
+
+```json
+{
+  "ok": false,
+  "error": "Short description",
+  "detail": "Detailed explanation of the problem"
+}
+```
+
+- `400`: Invalid request payload, empty prompt, unknown playbook or lane, or workspace outside the named project.
+- `401`: Missing or invalid `ZSTACK_API_TOKEN`.
+- `404`: Unknown run or project ID.
+- `409`: A run is already active in the same canonical git repository.
+
+### Endpoints
+
+#### 1. `GET /api/health`
+
+Health check and ModelHitch gateway connectivity status.
+
+**Response (`200 OK`):**
+```json
+{
+  "ok": true,
+  "bridge": {
+    "ok": true,
+    "baseUrl": "http://127.0.0.1:3939",
+    "providers": ["opencode"],
+    "mode": "catalog"
+  }
+}
+```
+
+#### 2. `POST /api/runs`
+
+Starts an agent run. Returns `201 Created` with the run ID so callers can poll or stream.
+
+**Request Body:**
+```json
+{
+  "prompt": "Fix race condition in session cleanup",
+  "project": "proj-xyz",
+  "playbook": "bug-fix",
+  "lane": "auto",
+  "policy": "read-only",
+  "maxTurns": 25,
+  "workspace": "/path/to/repo"
+}
+```
+
+- `prompt` (*string, required*): The task prompt (non-empty).
+- `project` (*string, optional*): Project ID. When named, the workspace is resolved strictly from the stored project's directory (never client-supplied paths); a request for a workspace outside the named project is refused with 400.
+- `playbook` (*string, optional*): Task playbook ID (e.g. `feature`, `bug-fix`, `refactor`). Rejected with 400 if not loaded by the server.
+- `lane` (*string, optional*): Provider lane (`auto`, `zen`, `go`, `hitch`). Rejected with 400 if unknown.
+- `policy` (*string, optional*): Execution policy (`read-only`, `apply`, `strict`). Defaults to `read-only`.
+- `maxTurns` (*number or string preset, optional*): Turn budget preset (`quick`, `standard`, `deep`, `marathon`) or integer.
+- `workspace` (*string, optional*): Workspace path when not specifying a project.
+
+**Response (`201 Created`):**
+```json
+{
+  "ok": true,
+  "id": "run-abcdef123",
+  "page": { ... }
+}
+```
+
+#### 3. `GET /api/runs/:id`
+
+Retrieves the run record (the same record rendered by the web run page).
+
+**Response (`200 OK`):**
+```json
+{
+  "ok": true,
+  "id": "run-abcdef123",
+  "status": "completed",
+  "turns": 3,
+  "toolCalls": 5,
+  "outcomes": [
+    { "name": "read_file", "target": "src/auth.mjs", "outcome": "ok", "tone": "ok" }
+  ],
+  "fileChanges": [
+    { "path": "src/auth.mjs", "tool": "edit_file" }
+  ],
+  "projectId": "proj-xyz",
+  "workspace": "/path/to/repo"
+}
+```
+
+Returns `404 Not Found` if `:id` is unknown.
+
+#### 4. `GET /api/runs/:id/events`
+
+Server-Sent Events (SSE) stream for live runs. Replays event backlog and streams real-time updates until the terminal event (`end`). Client disconnection closes cleanly without cancelling the active run.
+
+#### 5. `GET /api/budget`
+
+Reads current budget settings (`tier`, `source`, `lane`), validates them against the live ModelHitch catalog, and returns the resolved role-to-model mapping and `laneApplied` flag without mutating state.
+
+**Response (`200 OK`):**
+```json
+{
+  "ok": true,
+  "budget": {
+    "tier": "med-high",
+    "source": "catalog",
+    "lane": "auto",
+    "lastUpdated": "2026-10-04T12:00:00.000Z"
+  },
+  "tier": "med-high",
+  "source": "catalog",
+  "lane": "auto",
+  "models": {
+    "feature, refactoring": "opencode/deepseek-v4-pro",
+    "judgment and prose": "opencode/claude-opus-5-5",
+    "deep reasoning": "opencode/gpt-6-sol"
+  },
+  "laneApplied": true,
+  "panel": ["opencode/claude-opus-5-5", "opencode/gpt-6-sol"],
+  "mode": "opencode-zen",
+  "effectiveFor": "subsequently started runs",
+  "note": null
+}
+```
+
+If the ModelHitch bridge is unreachable, returns `502 Bad Gateway` (or `504 Gateway Timeout`) with structured details `{ "ok": false, "error": "...", "kind": "unreachable" }`.
+
+#### 6. `POST /api/budget`
+
+Previews or updates the zstack budget configuration.
+
+**Request Body:**
+```json
+{
+  "tier": "high",
+  "source": "catalog",
+  "lane": "go",
+  "confirm": true
+}
+```
+
+- `tier` (*string, optional*): Budget tier (`low-med`, `med-high`, `high`, `max`). Preserves current stored tier if omitted.
+- `source` (*string, optional*): Model selection source (`catalog`, `config`). Preserves current stored source if omitted. When `source` is `config`, models are pinned by ModelHitch policy and `laneApplied` is returned as `false`.
+- `lane` (*string, optional*): Provider lane (`auto`, `zen`, `go`, `hitch`). Preserves current stored lane if omitted.
+- `confirm` (*boolean, optional*): When `true`, writes the new configuration atomically to disk. When omitted or `false`, behaves as a **preview** returning the prospective mapping without modifying disk.
+
+Strict body validation rejects any unknown fields (e.g. `workspace`, `prompt`) with `400 Bad Request`. Every prospective lane is validated against the live ModelHitch catalog before writing; if the gateway is unreachable, returns `502`/`504` and preserves stored configuration without writing.
+
+Writes are whole-file and atomic (temporary file write then atomic rename), and concurrent requests are serialized safely. A budget change takes effect for subsequently started runs; runs already in flight are unaffected.
+
+---
+
 ## TypeScript SDK Reference
 
 ### Basic Usage

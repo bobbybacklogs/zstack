@@ -74,7 +74,7 @@ for (const kind of ['start', 'resume', 'continue']) {
       assert.equal(refused.status, 409); assert.match((await refused.json()).error, /mutation.*in flight/);
       assert.equal(s.activations(), 0);
       release(); release = null; assert.equal((await mutation).status, 200);
-      assert.equal((await s.action(kind)).status, 202); assert.equal(s.activations(), 1);
+      assert.ok([201, 202].includes((await s.action(kind)).status)); assert.equal(s.activations(), 1);
       assert.equal((await s.mutation()).status, 409);
     } finally { release?.(); await s.close(); }
   });
@@ -88,7 +88,7 @@ for (const kind of ['start', 'resume', 'continue']) {
       const refused = await s.mutation();
       assert.equal(refused.status, 409); assert.match((await refused.json()).error, /being admitted/);
       assert.equal(s.activations(), 0);
-      release(); release = null; assert.equal((await admission).status, 202);
+      release(); release = null; assert.ok([201, 202].includes((await admission).status));
       assert.equal(s.activations(), 1);
       assert.equal((await s.mutation()).status, 409);
     } finally { release?.(); await s.close(); }
@@ -105,6 +105,6 @@ test('mutation reserves its root before asynchronous active-run checks; a stale 
     for (const kind of ['start', 'resume', 'continue']) assert.equal((await s.action(kind)).status, 409);
     assert.equal(s.activations(), 0);
     release(); release = null; assert.equal((await mutation).status, 200);
-    assert.equal((await s.action('start')).status, 202);
+    assert.ok([201, 202].includes((await s.action('start')).status));
   } finally { release?.(); await s.close(); }
 });

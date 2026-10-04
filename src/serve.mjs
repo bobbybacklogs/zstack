@@ -20,10 +20,21 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { ZStack } from './sdk.mjs';
 import { ZSTACK_ROOT } from './harness.mjs';
-import { BUDGET_TIERS, BUDGET_SOURCES, LANES } from './budget.mjs';
+import {
+  BUDGET_TIERS,
+  BUDGET_SOURCES,
+  LANES,
+  normalizeLane,
+  isKnownLane,
+  getStoredBudget,
+  saveStoredBudget,
+  resolveBudgetMapping,
+  DEFAULT_BUDGET_FILE
+} from './budget.mjs';
+import { fetchModelHitchState, GatewayError } from './connector.mjs';
 import { readHistoryTail, readHistory, findHistoryEntry, historyPath, HISTORY_DEFAULT_LIMIT } from './history.mjs';
 import { projectStoredRun, projectRunSummary } from './blocks.mjs';
-import { RunRegistry, POLICIES } from './runs.mjs';
+import { RunRegistry, POLICIES, isKnownPolicy } from './runs.mjs';
 import {
   readProjects,
   createProject,
@@ -51,7 +62,7 @@ import {
   defaultBaseDir
 } from './github.mjs';
 import { gitOp, canonicalGitRoot } from './git.mjs';
-import { DEFAULT_MAX_TURNS, MAX_MAX_TURNS, TURN_PRESETS } from './turns.mjs';
+import { DEFAULT_MAX_TURNS, MAX_MAX_TURNS, TURN_PRESETS, maxTurnsProblem } from './turns.mjs';
 import { validateChatRequest, chatWireMessages } from './chat.mjs';
 import { validateOptimizeRequest } from './optimize.mjs';
 import {
@@ -115,7 +126,30 @@ function sendJson(res, status, body) {
 }
 
 function fail(res, status, message, extra = {}) {
-  sendJson(res, status, { ok: false, error: message, ...extra });
+  const detail = extra.detail ?? (Array.isArray(extra.problems) && extra.problems.length > 0 ? extra.problems[0] : message);
+  sendJson(res, status, { ok: false, error: message, detail, ...extra });
+}
+
+function getAuthToken(req, url) {
+  const auth = req.headers.authorization;
+  if (typeof auth === 'string' && auth.trim() !== '') {
+    const trimmed = auth.trim();
+    if (trimmed.toLowerCase().startsWith('bearer ')) {
+      return trimmed.slice(7).trim();
+    }
+    return trimmed;
+  }
+  const xToken = req.headers['x-api-token'];
+  if (typeof xToken === 'string' && xToken.trim() !== '') {
+    return xToken.trim();
+  }
+  if (url) {
+    const qToken = url.searchParams.get('token') || url.searchParams.get('api_token');
+    if (typeof qToken === 'string' && qToken.trim() !== '') {
+      return qToken.trim();
+    }
+  }
+  return null;
 }
 
 /** Read a JSON request body, refusing anything oversized. */
@@ -219,7 +253,7 @@ const FIXED_ROUTES = Object.freeze({
   '/api/projects': ['GET', 'POST'],
   '/api/dashboard': ['GET'],
   '/api/config': ['GET'],
-  '/api/budget': ['PUT'],
+  '/api/budget': ['GET', 'POST', 'PUT'],
   '/api/status': ['GET'],
   '/api/chat': ['POST'],
   '/api/models': ['GET'],
@@ -437,7 +471,11 @@ function streamRun(req, res, registry, id) {
  * socket on an ephemeral port without reaching into the binding logic.
  */
 export function createApp(options = {}) {
-  const zstack = options.zstack || new ZStack();
+  const budgetFile = options.budgetPath || options.zstack?.budgetPath || undefined;
+  const zstack = options.zstack || new ZStack({ budgetPath: budgetFile });
+  if (budgetFile && zstack && !zstack.budgetPath) {
+    zstack.budgetPath = budgetFile;
+  }
   const historyFile = options.historyPath;
   const projectsFile = options.projectsPath;
   const overridesFile = options.overridesPath;
@@ -446,6 +484,11 @@ export function createApp(options = {}) {
   // Injectable so the sync endpoints are testable without the network.
   const githubFetch = options.githubFetch || fetch;
   const ghExecFile = options.ghExecFile;
+  const fetchState = options.fetchModelHitchState
+    || (typeof zstack?.fetchModelHitchState === 'function'
+      ? zstack.fetchModelHitchState.bind(zstack)
+      : (baseUrl, opts) => fetchModelHitchState(baseUrl, opts));
+  let budgetMutationLock = Promise.resolve();
   // Chats with a turn in flight. One writer per conversation keeps two replies
   // from interleaving into the same transcript out of order.
   const busyChats = new Set();
@@ -476,12 +519,43 @@ export function createApp(options = {}) {
       if (root && workspaceMutations.has(root)) {
         throw Object.assign(new Error('A Git mutation is in flight in this repository. Wait before starting or resuming a run.'), { kind: 'git-workspace-busy' });
       }
+      if (root) {
+        for (const card of registry.listLive()) {
+          if (!card.live) continue;
+          const activeRun = registry.get(card.id);
+          if (!activeRun || activeRun.settled) continue;
+          const activeWs = activeRun.workspace || activeRun.request?.workspaceDir;
+          if (!activeWs) continue;
+          let activeRoot;
+          try { activeRoot = await canonicalGitRoot(activeWs, gitOptions); } catch { continue; }
+          if (activeRoot === root) {
+            throw Object.assign(
+              new Error(`A run is already active in repository "${root}".`),
+              { kind: 'git-repo-busy', detail: `A run (${activeRun.id}) is already active in repository "${root}".` }
+            );
+          }
+        }
+      } else if (workspace) {
+        for (const card of registry.listLive()) {
+          if (!card.live) continue;
+          const activeRun = registry.get(card.id);
+          if (!activeRun || activeRun.settled) continue;
+          const activeWs = activeRun.workspace || activeRun.request?.workspaceDir;
+          if (activeWs && resolve(activeWs) === resolve(workspace)) {
+            throw Object.assign(
+              new Error(`A run is already active in workspace "${resolve(workspace)}".`),
+              { kind: 'git-repo-busy', detail: `A run (${activeRun.id}) is already active in workspace "${resolve(workspace)}".` }
+            );
+          }
+        }
+      }
       // No await between checking the reservation and activating the registry.
       return activate();
     } finally { resolvingRunAdmissions--; }
   };
   const startedAt = Date.now();
   const boundHost = options.host || DEFAULT_HOST;
+  const apiToken = options.apiToken ?? options.token ?? process.env.ZSTACK_API_TOKEN ?? null;
 
   // Every projection of a stored run passes through here: the history record
   // with its sidecar override applied, so a renamed, moved, or hidden run
@@ -490,6 +564,33 @@ export function createApp(options = {}) {
     if (!entry || typeof entry !== 'object') return entry;
     const override = readOverrides(overridesFile).overrides[entry.id] || null;
     return applyOverride(entry, override);
+  };
+
+  /**
+   * Annotate a projected page with status, turn counts, tool calls, outcomes,
+   * file changes, and project ID so it satisfies both the UI and external API callers.
+   */
+  const annotateRunPage = (page, liveRun, entry) => {
+    if (!page) return page;
+    if (page.turns === undefined) {
+      page.turns = page.counts?.turns ?? liveRun?.turns ?? entry?.turns ?? 0;
+    }
+    if (page.toolCalls === undefined) {
+      page.toolCalls = page.counts?.toolCalls ?? liveRun?.toolCalls ?? entry?.toolCalls ?? 0;
+    }
+    if (page.fileChanges === undefined) {
+      page.fileChanges = liveRun?.fileChanges ?? entry?.fileChanges ?? [];
+    }
+    if (page.outcomes === undefined) {
+      const toolBlocks = (page.blocks || []).filter((b) => b && b.kind === 'tool');
+      page.outcomes = toolBlocks.map((b) => ({
+        name: b.name,
+        target: b.target ?? null,
+        outcome: b.outcome ?? 'unknown',
+        tone: b.tone ?? null
+      }));
+    }
+    return page;
   };
 
   /**
@@ -525,6 +626,7 @@ export function createApp(options = {}) {
     if (livePage) {
       const page = withProjectName(livePage, projectsById);
       if (page.turnBudget) page.turnBudget.inPlace = registry.canResume(id);
+      annotateRunPage(page, registry.get(id), null);
       return page;
     }
     let entry = null;
@@ -534,7 +636,9 @@ export function createApp(options = {}) {
       return null;
     }
     if (!entry) return null;
-    return withProjectName(archivedPageFor(entry, id), projectsById);
+    const page = withProjectName(archivedPageFor(entry, id), projectsById);
+    annotateRunPage(page, null, entry);
+    return page;
   };
 
   /**
@@ -615,6 +719,14 @@ export function createApp(options = {}) {
     if (!hostAllowed(req, boundHost)) {
       fail(res, 403, `This server does not answer for host ${req.headers.host || '(none)'}.`);
       return;
+    }
+
+    if (apiToken) {
+      const clientToken = getAuthToken(req, url);
+      if (!clientToken || clientToken !== apiToken) {
+        fail(res, 401, 'Unauthorized', { detail: 'Missing or invalid API token.' });
+        return;
+      }
     }
 
     if (!path.startsWith('/api/')) {
@@ -804,35 +916,151 @@ export function createApp(options = {}) {
       try {
         body = await readJsonBody(req);
       } catch (err) {
-        fail(res, err.status || 400, err.message);
+        fail(res, err.status || 400, err.message, { detail: err.message });
         return;
       }
-      try {
-        // A project names a directory at creation time, and the request must
-        // not bypass that: the directory the run executes in comes from the
-        // stored project, never from a client-supplied path. An explicit
-        // workspaceDir alongside a projectId is a contradiction, so it faults.
-        const request = { ...body };
-        if (request.projectId) {
-          const project = findProject(String(request.projectId).trim(), projectsFile);
-          if (!project) {
-            fail(res, 400, `No project with id ${request.projectId}.`, {
-              problems: [`No project with id ${request.projectId}.`]
-            });
-            return;
-          }
-          if (request.workspaceDir) {
-            fail(res, 400, 'Pass a project or a workspaceDir, not both.', {
-              problems: ['Pass a project or a workspaceDir, not both.']
-            });
-            return;
-          }
-          request.workspaceDir = project.dir;
+
+      const problems = [];
+
+      // Prompt check: empty or whitespace-only is 400
+      const prompt = typeof body?.prompt === 'string' ? body.prompt.trim() : '';
+      if (!prompt) {
+        problems.push('A run needs a prompt.');
+      }
+
+      // Playbook check: reject unknown/unloaded with 400 naming offending value
+      if (body.playbook !== undefined && body.playbook !== null && body.playbook !== '') {
+        let loadedPlaybooks = [];
+        try {
+          loadedPlaybooks = (zstack.listPlaybooks?.() || []).map((p) => p.id);
+        } catch {
+          loadedPlaybooks = [];
         }
+        if (!loadedPlaybooks.includes(body.playbook)) {
+          problems.push(`Unknown playbook "${body.playbook}".`);
+        }
+      }
+
+      // Lane check: reject unknown with 400 naming offending value
+      if (body.lane !== undefined && body.lane !== null && body.lane !== '') {
+        const knownLanes = Object.keys(LANES);
+        if (!knownLanes.includes(body.lane)) {
+          problems.push(`Unknown lane "${body.lane}". Valid lanes: ${knownLanes.join(', ')}.`);
+        }
+      }
+
+      // Policy check & default: default policy to 'read-only'
+      const policy = body.policy !== undefined && body.policy !== null && body.policy !== ''
+        ? body.policy
+        : 'read-only';
+      if (!isKnownPolicy(policy)) {
+        problems.push(`Unknown policy "${policy}". Valid policies: ${Object.keys(POLICIES).join(', ')}.`);
+      }
+
+      // MaxTurns check
+      if (body.maxTurns !== undefined) {
+        const prob = maxTurnsProblem(body.maxTurns);
+        if (prob) problems.push(prob);
+      }
+
+      if (problems.length > 0) {
+        fail(res, 400, problems[0], {
+          problems,
+          detail: problems.join(' ')
+        });
+        return;
+      }
+
+      // Project & workspace resolution
+      const rawProjectId = body.project ?? body.projectId;
+      const requestedWorkspace = body.workspace ?? body.workspaceDir;
+      let resolvedWorkspace;
+      let targetProjectId = undefined;
+
+      if (rawProjectId !== undefined && rawProjectId !== null && rawProjectId !== '') {
+        if (typeof rawProjectId !== 'string' || rawProjectId.trim() === '') {
+          fail(res, 400, 'Invalid project id.', { detail: 'Project must be a non-empty string.', problems: ['Project must be a non-empty string.'] });
+          return;
+        }
+        const trimmedId = rawProjectId.trim();
+        const project = findProject(trimmedId, projectsFile);
+        if (!project) {
+          fail(res, 404, `No project with id ${trimmedId}.`, {
+            detail: `No project with id "${trimmedId}".`,
+            problems: [`No project with id ${trimmedId}.`]
+          });
+          return;
+        }
+        targetProjectId = project.id;
+
+        // Check project directory exists on disk
+        try {
+          const st = statSync(resolve(project.dir));
+          if (!st.isDirectory()) throw new Error('Not a directory');
+        } catch {
+          fail(res, 400, `Project "${project.name}" directory no longer exists.`, {
+            detail: `Directory for project "${project.name}" (${project.dir}) no longer exists.`,
+            problems: [`Project "${project.name}" directory no longer exists.`]
+          });
+          return;
+        }
+
+        // Refuse workspace alongside named project / outside named project
+        if (requestedWorkspace !== undefined && requestedWorkspace !== null && requestedWorkspace !== '') {
+          if (typeof requestedWorkspace !== 'string') {
+            fail(res, 400, 'Workspace must be a string.', { detail: 'Workspace must be a string.', problems: ['Workspace must be a string.'] });
+            return;
+          }
+          const targetDir = resolve(requestedWorkspace.trim());
+          const projectDir = resolve(project.dir);
+          if (targetDir !== projectDir && !targetDir.startsWith(projectDir + sep)) {
+            fail(res, 400, `Workspace is outside project "${project.name}". Pass a project or a workspaceDir, not both.`, {
+              detail: `Requested workspace "${requestedWorkspace}" is outside project "${project.name}" directory (${project.dir}).`,
+              problems: [`Workspace is outside project "${project.name}". Pass a project or a workspaceDir, not both.`]
+            });
+            return;
+          }
+          fail(res, 400, 'Pass a project or a workspaceDir, not both.', {
+            detail: 'Pass a project or a workspaceDir, not both.',
+            problems: ['Pass a project or a workspaceDir, not both.']
+          });
+          return;
+        }
+
+        // Always resolve workspace from stored project
+        resolvedWorkspace = project.dir;
+      } else {
+        if (requestedWorkspace !== undefined && requestedWorkspace !== null && requestedWorkspace !== '') {
+          if (typeof requestedWorkspace !== 'string') {
+            fail(res, 400, 'Workspace must be a string.', { detail: 'Workspace must be a string.', problems: ['Workspace must be a string.'] });
+            return;
+          }
+          resolvedWorkspace = resolve(requestedWorkspace.trim());
+        }
+      }
+
+      const request = {
+        prompt,
+        policy,
+        playbook: body.playbook || undefined,
+        lane: body.lane || undefined,
+        maxTurns: body.maxTurns !== undefined ? body.maxTurns : undefined,
+        projectId: targetProjectId,
+        workspaceDir: resolvedWorkspace,
+        autoPr: body.autoPr === true || body.pr === true
+      };
+
+      try {
         const run = await admitRun(request.workspaceDir, () => registry.start(request));
-        sendJson(res, 202, { ok: true, id: run.id, page: registry.getPage(run.id) });
+        sendJson(res, 201, { ok: true, id: run.id, page: registry.getPage(run.id) });
       } catch (err) {
-        fail(res, err.kind === 'git-workspace-busy' ? 409 : err.kind === 'invalid-request' ? 400 : 500, err.message, {
+        const status = (err.kind === 'git-workspace-busy' || err.kind === 'git-repo-busy' || err.kind === 'git-active-run')
+          ? 409
+          : err.kind === 'invalid-request'
+            ? 400
+            : 500;
+        fail(res, status, err.message, {
+          detail: err.detail || err.message,
           problems: err.problems
         });
       }
@@ -1220,10 +1448,10 @@ export function createApp(options = {}) {
       }
       const page = await pageForRun(id, projectsById);
       if (!page) {
-        fail(res, 404, `No run with id ${id}.`);
+        fail(res, 404, `No run with id ${id}.`, { detail: `No run with id ${id}.` });
         return;
       }
-      sendJson(res, 200, { ok: true, page });
+      sendJson(res, 200, { ok: true, page, ...page });
       return;
     }
 
@@ -1394,29 +1622,194 @@ export function createApp(options = {}) {
 
     // --- budget -----------------------------------------------------------
     if (path === '/api/budget') {
-      let body;
-      try {
-        body = await readJsonBody(req);
-      } catch (err) {
-        fail(res, err.status || 400, err.message);
-        return;
-      }
-      try {
-        const mapping = await zstack.setBudget(body.tier, body.source ?? null, body.lane ?? null);
+      if (method === 'GET') {
+        let state;
+        try {
+          state = await fetchState(zstack.baseUrl, { timeoutMs: zstack.timeoutMs });
+        } catch (err) {
+          const kind = err?.kind || 'unreachable';
+          const status = kind === 'timeout'
+            ? 504
+            : (kind === 'unreachable' || kind === 'http' || kind === 'parse' ? 502 : 500);
+          fail(res, status, err?.message || 'Cannot reach ModelHitch', {
+            kind,
+            detail: err?.detail || err?.message || 'Cannot reach ModelHitch'
+          });
+          return;
+        }
+
+        const stored = getStoredBudget(budgetFile);
+        const mapping = resolveBudgetMapping({
+          tier: stored.tier,
+          source: stored.source,
+          lane: stored.lane,
+          state
+        });
+
         sendJson(res, 200, {
           ok: true,
-          budget: zstack.getBudget(),
+          budget: stored,
+          tier: stored.tier,
+          source: stored.source,
+          lane: stored.lane,
           models: mapping.models ?? {},
           laneApplied: mapping.laneApplied !== false,
           panel: mapping.panelList ?? [],
+          mode: mapping.mode,
+          effectiveFor: 'subsequently started runs',
           note: mapping.laneApplied === false
             ? 'The stored models come from your ModelHitch config, so the lane was recorded but not applied.'
             : null
         });
-      } catch (err) {
-        fail(res, 400, err.message);
+        return;
       }
-      return;
+
+      if (method === 'POST') {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          fail(res, err.status || 400, err.message);
+          return;
+        }
+
+        const allowedKeys = new Set(['tier', 'source', 'lane', 'confirm']);
+        const unknownKeys = Object.keys(body).filter((k) => !allowedKeys.has(k));
+        if (unknownKeys.length > 0) {
+          fail(res, 400, `Unknown field(s): ${unknownKeys.join(', ')}. Allowed fields: tier, source, lane, confirm.`, {
+            detail: `Unknown field(s): ${unknownKeys.join(', ')}. Allowed fields: tier, source, lane, confirm.`
+          });
+          return;
+        }
+
+        if (body.confirm !== undefined && typeof body.confirm !== 'boolean') {
+          fail(res, 400, 'Invalid confirm: must be a boolean.', {
+            detail: 'Field "confirm" must be a boolean.'
+          });
+          return;
+        }
+
+        if (body.tier !== undefined) {
+          if (typeof body.tier !== 'string' || !body.tier.trim() || !BUDGET_TIERS[body.tier.trim().toLowerCase()]) {
+            const validTiers = Object.keys(BUDGET_TIERS).join(', ');
+            fail(res, 400, `Unknown budget tier: "${body.tier}". Allowed tiers: ${validTiers}.`, {
+              detail: `Unknown budget tier: "${body.tier}". Allowed tiers: ${validTiers}.`
+            });
+            return;
+          }
+        }
+
+        if (body.source !== undefined) {
+          if (typeof body.source !== 'string' || !body.source.trim() || !['catalog', 'config'].includes(body.source.trim().toLowerCase())) {
+            fail(res, 400, `Unknown budget source: "${body.source}". Allowed sources: catalog, config.`, {
+              detail: `Unknown budget source: "${body.source}". Allowed sources: catalog, config.`
+            });
+            return;
+          }
+        }
+
+        if (body.lane !== undefined) {
+          if (typeof body.lane !== 'string' || !body.lane.trim() || !isKnownLane(body.lane)) {
+            fail(res, 400, `Unknown provider lane: "${body.lane}". Allowed lanes: auto, zen, go, hitch.`, {
+              detail: `Unknown provider lane: "${body.lane}". Allowed lanes: auto, zen, go, hitch.`
+            });
+            return;
+          }
+        }
+
+        const stored = getStoredBudget(budgetFile);
+        const nextTier = body.tier ? body.tier.trim().toLowerCase() : stored.tier;
+        const nextSource = body.source ? body.source.trim().toLowerCase() : (stored.source || 'catalog');
+        const nextLane = body.lane !== undefined ? normalizeLane(body.lane) : (stored.lane || 'auto');
+
+        let state;
+        try {
+          state = await fetchState(zstack.baseUrl, { timeoutMs: zstack.timeoutMs });
+        } catch (err) {
+          const kind = err?.kind || 'unreachable';
+          const status = kind === 'timeout'
+            ? 504
+            : (kind === 'unreachable' || kind === 'http' || kind === 'parse' ? 502 : 500);
+          fail(res, status, err?.message || 'Cannot reach ModelHitch', {
+            kind,
+            detail: err?.detail || err?.message || 'Cannot reach ModelHitch'
+          });
+          return;
+        }
+
+        const mapping = resolveBudgetMapping({
+          tier: nextTier,
+          source: nextSource,
+          lane: nextLane,
+          state
+        });
+
+        const isConfirmed = body.confirm === true;
+        let savedBudget = null;
+
+        if (isConfirmed) {
+          const prevLock = budgetMutationLock;
+          let releaseLock;
+          budgetMutationLock = new Promise((resolveLock) => {
+            releaseLock = resolveLock;
+          });
+          try {
+            await prevLock;
+            savedBudget = saveStoredBudget({
+              tier: nextTier,
+              source: nextSource,
+              lane: nextLane
+            }, budgetFile);
+          } finally {
+            releaseLock();
+          }
+        }
+
+        sendJson(res, 200, {
+          ok: true,
+          applied: isConfirmed,
+          preview: !isConfirmed,
+          budget: isConfirmed ? savedBudget : { tier: nextTier, source: nextSource, lane: nextLane },
+          tier: nextTier,
+          source: nextSource,
+          lane: nextLane,
+          models: mapping.models ?? {},
+          laneApplied: mapping.laneApplied !== false,
+          panel: mapping.panelList ?? [],
+          mode: mapping.mode,
+          effectiveFor: isConfirmed ? 'subsequently started runs' : 'subsequently started runs (once confirmed)',
+          note: mapping.laneApplied === false
+            ? 'The stored models come from your ModelHitch config, so the lane was recorded but not applied.'
+            : null
+        });
+        return;
+      }
+
+      if (method === 'PUT') {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          fail(res, err.status || 400, err.message);
+          return;
+        }
+        try {
+          const mapping = await zstack.setBudget(body.tier, body.source ?? null, body.lane ?? null);
+          sendJson(res, 200, {
+            ok: true,
+            budget: zstack.getBudget(),
+            models: mapping.models ?? {},
+            laneApplied: mapping.laneApplied !== false,
+            panel: mapping.panelList ?? [],
+            note: mapping.laneApplied === false
+              ? 'The stored models come from your ModelHitch config, so the lane was recorded but not applied.'
+              : null
+          });
+        } catch (err) {
+          fail(res, 400, err.message);
+        }
+        return;
+      }
     }
 
     // --- bridge status ----------------------------------------------------

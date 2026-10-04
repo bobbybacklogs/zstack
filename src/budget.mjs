@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,7 +6,7 @@ import { ZSTACK_ROLES, syncCursorRules } from './connector.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const DEFAULT_BUDGET_FILE = join(__dirname, '..', 'verification', 'budget.json');
+export const DEFAULT_BUDGET_FILE = join(__dirname, '..', 'verification', 'budget.json');
 
 export const BUDGET_TIERS = {
   'low-med': {
@@ -124,7 +124,7 @@ export function getStoredBudget(filePath = DEFAULT_BUDGET_FILE) {
 }
 
 /**
- * Save budget configuration to disk.
+ * Save budget configuration to disk atomically.
  */
 export function saveStoredBudget(data, filePath = DEFAULT_BUDGET_FILE) {
   const current = getStoredBudget(filePath);
@@ -133,7 +133,15 @@ export function saveStoredBudget(data, filePath = DEFAULT_BUDGET_FILE) {
     ...data,
     lastUpdated: new Date().toISOString()
   };
-  writeFileSync(filePath, JSON.stringify(updated, null, 2) + '\n', 'utf8');
+  mkdirSync(dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(updated, null, 2) + '\n', 'utf8');
+    renameSync(tmp, filePath);
+  } catch (err) {
+    try { rmSync(tmp, { force: true }); } catch {}
+    throw err;
+  }
   return updated;
 }
 

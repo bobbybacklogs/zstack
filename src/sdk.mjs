@@ -168,6 +168,7 @@ export class ZStack {
     // Per-request gateway timeout override (ms); undefined falls back to
     // MODELHITCH_TIMEOUT env, then the 30000ms default in connector.mjs.
     this.timeoutMs = options.timeoutMs;
+    this.budgetPath = options.budgetPath;
   }
 
   /**
@@ -201,7 +202,7 @@ export class ZStack {
    * Read the stored budget tier/source selection.
    */
   getBudget() {
-    return getStoredBudget();
+    return getStoredBudget(this.budgetPath);
   }
 
   /**
@@ -213,7 +214,7 @@ export class ZStack {
     try {
       return await this.getBudgetMapping(state, lane);
     } catch {
-      const stored = getStoredBudget();
+      const stored = getStoredBudget(this.budgetPath);
       return resolveRoleMapping(state, { lane: normalizeLane(lane || stored.lane) });
     }
   }
@@ -225,7 +226,7 @@ export class ZStack {
    */
   async getBudgetMapping(cachedState = null, lane = null) {
     const state = cachedState || await fetchModelHitchState(this.baseUrl, { timeoutMs: this.timeoutMs });
-    const stored = getStoredBudget();
+    const stored = getStoredBudget(this.budgetPath);
     return resolveBudgetMapping({
       tier: stored.tier,
       source: stored.source,
@@ -243,13 +244,13 @@ export class ZStack {
     if (!BUDGET_TIERS[tier]) {
       throw new Error(`Unknown budget tier: ${tier}. Valid tiers: ${Object.keys(BUDGET_TIERS).join(', ')}`);
     }
-    const stored = getStoredBudget();
+    const stored = getStoredBudget(this.budgetPath);
     const nextSource = source || stored.source || 'catalog';
     if (nextSource !== 'config' && nextSource !== 'catalog') {
       throw new Error(`Unknown budget source: ${nextSource}. Valid sources: config, catalog`);
     }
     const nextLane = normalizeLane(lane || stored.lane);
-    const saved = saveStoredBudget({ tier, source: nextSource, lane: nextLane });
+    const saved = saveStoredBudget({ tier, source: nextSource, lane: nextLane }, this.budgetPath);
     void saved;
     return await this.getBudgetMapping();
   }

@@ -11,6 +11,7 @@ const ROOT = join(__dirname, '..');
 const EXIT = { OK: 0, FAIL: 1, USAGE: 2 };
 
 const HERMETIC_FILES = [
+  'tests/api.test.mjs',
   'tests/blocks.test.mjs',
   'tests/budget.test.mjs',
   'tests/chat.test.mjs',
