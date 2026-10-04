@@ -31,12 +31,15 @@ const HERMETIC_FILES = [
   'tests/projects.test.mjs',
   'tests/router.test.mjs',
   'tests/runs.test.mjs',
+  'tests/schedules.test.mjs',
+  'tests/schedules_cli.test.mjs',
   'tests/server.test.mjs',
   'tests/shell.test.mjs',
   'tests/skill.test.mjs',
   'tests/subagent.test.mjs',
   'tests/triage.test.mjs',
-  'tests/turns.test.mjs'
+  'tests/turns.test.mjs',
+  'tests/workfolk.test.mjs'
 ];
 
 const CONNECTOR_FILE = 'tests/connector.test.mjs';

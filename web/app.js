@@ -36,6 +36,10 @@ import {
   renderBadgeRow,
   renderGithubPage,
   renderGitWork,
+  renderSchedulesPage,
+  renderRoutineDialog,
+  renderWorkfolkPage,
+  renderWorkfolkDispatchDialog,
   renderIcon,
   turnBudgetLine,
   relativeTime
@@ -64,7 +68,11 @@ const state = {
   chat: null,
   chatModels: null,
   github: null,
-  githubSyncing: false
+  githubSyncing: false,
+  schedules: [],
+  workfolkStatus: null,
+  workfolkWorkers: [],
+  workfolkJobs: []
 };
 
 /** One open stream per run, closed when the run ends or the view moves on. */
@@ -158,6 +166,8 @@ function parseHash() {
   if (head === 'budget') return { name: 'budget' };
   if (head === 'chats') return { name: 'chats' };
   if (head === 'github') return { name: 'github' };
+  if (head === 'schedules' || head === 'routines') return { name: 'schedules', id: null };
+  if (head === 'workfolk' || head === 'workers') return { name: 'workfolk', id: null };
   if (head === 'chat' && id) return { name: 'chat', id: decodeURIComponent(id) };
   // An old `#/chat` link has no conversation to open, so it lands on the list.
   if (head === 'chat') return { name: 'chats' };
@@ -239,6 +249,31 @@ async function loadGithub() {
     state.error = err.message;
   }
   return state.github;
+}
+
+async function loadSchedules() {
+  try {
+    const doc = await api.schedules();
+    state.schedules = doc.schedules || [];
+  } catch {
+    state.schedules = [];
+  }
+  return state.schedules;
+}
+
+async function loadWorkfolk() {
+  try {
+    const [statusDoc, rosterDoc] = await Promise.all([
+      api.workfolkStatus().catch((err) => ({ ok: false, error: err.message })),
+      api.workfolkWorkers().catch(() => ({ ok: false, workers: [] }))
+    ]);
+    state.workfolkStatus = statusDoc;
+    state.workfolkWorkers = rosterDoc.workers || [];
+  } catch (err) {
+    state.workfolkStatus = { ok: false, error: err.message };
+    state.workfolkWorkers = [];
+  }
+  return { status: state.workfolkStatus, workers: state.workfolkWorkers };
 }
 
 function filteredRuns() {
@@ -514,6 +549,22 @@ function renderSidebar() {
     count: state.chats.length || null,
     active: state.route.name === 'chats',
     onClick: () => go('#/chats')
+  }));
+
+  nav.append(navItem({
+    icon: 'clock',
+    label: 'Routines',
+    count: state.schedules.filter((s) => s.enabled).length || null,
+    active: state.route.name === 'schedules',
+    onClick: () => go('#/schedules')
+  }));
+
+  nav.append(navItem({
+    icon: 'workfolk',
+    label: 'Workfolk',
+    count: state.workfolkWorkers.length || null,
+    active: state.route.name === 'workfolk',
+    onClick: () => go('#/workfolk')
   }));
 
   // 2. Section: RUNS
@@ -888,7 +939,68 @@ function renderMain() {
       onPin: pinChatModel,
       onRename: () => renameChatFlow(state.chat),
       onDelete: () => deleteChatFlow(state.chat),
-      onContinueAsRun: (message, chat) => continueChatAsRun(message, chat)
+      onContinueAsRun: (message, chat) => continueChatAsRun(message, chat),
+      onScheduleRoutine: (message, chat) => openRoutineDialog({
+        prompt: message?.content || '',
+        projectId: chat?.projectId || undefined
+      }),
+      onHandoffToWorkfolk: (message) => {
+        const defaultWorker = state.workfolkWorkers[0] || { tag: 'coordinator', name: 'Coordinator' };
+        openWorkfolkDispatch(defaultWorker, message?.content || '');
+      }
+    }));
+    return;
+  }
+  if (state.route.name === 'schedules') {
+    main.append(renderSchedulesPage({
+      schedules: state.schedules,
+      projects: state.projects,
+      onNew: () => openRoutineDialog(),
+      onToggle: async (id, enabled) => {
+        try {
+          await api.updateSchedule(id, { enabled });
+          await loadSchedules();
+          render();
+        } catch (err) {
+          state.error = err.message;
+          render();
+        }
+      },
+      onRun: async (id) => {
+        try {
+          await api.runSchedule(id);
+          await loadSchedules();
+          await loadRuns().catch(() => {});
+          render();
+        } catch (err) {
+          state.error = err.message;
+          render();
+        }
+      },
+      onDelete: async (id) => {
+        if (!window.confirm('Delete this routine?')) return;
+        try {
+          await api.deleteSchedule(id);
+          await loadSchedules();
+          render();
+        } catch (err) {
+          state.error = err.message;
+          render();
+        }
+      }
+    }));
+    return;
+  }
+  if (state.route.name === 'workfolk') {
+    main.append(renderWorkfolkPage({
+      status: state.workfolkStatus || {},
+      workers: state.workfolkWorkers || [],
+      jobs: state.workfolkJobs || [],
+      onDispatch: (worker) => openWorkfolkDispatch(worker),
+      onRefresh: async () => {
+        await loadWorkfolk();
+        render();
+      }
     }));
     return;
   }
@@ -1343,6 +1455,50 @@ async function openNewChatDialog() {
   document.body.append(overlay);
 }
 
+/** Open dialog to schedule an unattended routine. */
+async function openRoutineDialog(initial = {}) {
+  await loadProjects().catch(() => {});
+  const overlay = renderRoutineDialog({
+    initial,
+    projects: state.projects || [],
+    onClose: () => overlay.remove(),
+    onInfer: async (text) => {
+      try {
+        return await api.inferSchedule({ prompt: text });
+      } catch {
+        return null;
+      }
+    },
+    onSubmit: async (payload) => {
+      await api.createSchedule(payload);
+      overlay.remove();
+      await loadSchedules();
+      go('#/schedules');
+    }
+  });
+  document.body.append(overlay);
+}
+
+function openWorkfolkDispatch(worker, initialTask = '') {
+  const overlay = renderWorkfolkDispatchDialog({
+    worker,
+    initialTask,
+    onClose: () => overlay.remove(),
+    onSubmit: async ({ worker_tag, task, wait }) => {
+      const result = await api.workfolkDispatch({ worker_tag, task, wait });
+      state.workfolkJobs.unshift({
+        job_id: result.job_id,
+        worker_tag: worker_tag.replace(/^@/, ''),
+        task,
+        status: result.status,
+        result: result.result || null
+      });
+      render();
+    }
+  });
+  document.body.append(overlay);
+}
+
 /**
  * Send one turn and stream the reply.
  *
@@ -1570,6 +1726,16 @@ async function route() {
       render();
       return;
     }
+    if (state.route.name === 'schedules') {
+      await Promise.all([loadSchedules(), loadProjects().catch(() => {})]);
+      render();
+      return;
+    }
+    if (state.route.name === 'workfolk') {
+      await loadWorkfolk();
+      render();
+      return;
+    }
     if (state.route.name === 'chat') {
       await Promise.all([loadChat(state.route.id), loadChatModels()]);
       render();
@@ -1582,6 +1748,8 @@ async function route() {
       try {
         await Promise.all([
           loadDashboard(),
+          loadSchedules().catch(() => {}),
+          loadWorkfolk().catch(() => {}),
           state.runList.length === 0 ? loadRuns().catch(() => {}) : null,
           loadProjects().catch(() => {}),
           loadHealth().catch(() => {})
@@ -1595,6 +1763,7 @@ async function route() {
     }
     await loadRuns();
     await loadProjects().catch(() => {});
+    await loadSchedules().catch(() => {});
     render();
   } catch (err) {
     state.error = err.message;

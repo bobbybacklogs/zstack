@@ -59,7 +59,10 @@ const ICON_PATHS = {
   sidebar: '<rect x="3" y="3" width="18" height="18" rx="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line>',
   sun: '<circle cx="12" cy="12" r="4"></circle><line x1="12" y1="2" x2="12" y2="4"></line><line x1="12" y1="20" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"></line><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="4" y2="12"></line><line x1="20" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"></line><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"></line>',
   moon: '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>',
-  monitor: '<rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line>'
+  monitor: '<rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line>',
+  clock: '<circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline>',
+  users: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path>',
+  workfolk: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path>'
 };
 
 /** Render the zstack 3D cube logo mark as an adaptive light/dark image node. */
@@ -2023,3 +2026,537 @@ export function renderGithubPage({ github, syncing, onSync, onSetPath, onGitActi
     ])
   ]);
 }
+
+/**
+ * Routines & Schedules page view.
+ */
+export function renderSchedulesPage({ schedules = [], projects = [], onNew, onToggle, onRun, onDelete }) {
+  const projectsById = new Map(projects.map((p) => [p.id, p]));
+  const activeCount = schedules.filter((s) => s.enabled).length;
+
+  const heroHeader = el('header', { class: 'page__header' }, [
+    el('div', { class: 'page__icon-box' }, [renderIcon('clock', 'page__header-icon')]),
+    el('div', { class: 'page__badge' }, [el('span', { class: 'chip chip--neutral', text: 'routines' })]),
+    el('h1', { class: 'page__title', text: 'Routines & Schedules' }),
+    el('div', { class: 'page__meta', text: 'Unattended autonomous agent routines running on schedule. Your agents work while you sleep.' })
+  ]);
+
+  const newBtn = el('button', {
+    class: 'btn btn--primary',
+    type: 'button',
+    text: 'New routine',
+    onClick: onNew
+  });
+
+  const head = el('div', { class: 'panel' }, [
+    el('div', { class: 'panel__title' }, [
+      renderIcon('clock', 'panel__icon'),
+      el('span', { text: 'Scheduled Routines' })
+    ]),
+    el('p', { class: 'hint', style: 'margin:0 0 10px' }, [
+      'Routines run automatically in the background daemon while the server is alive. ',
+      'Unattended safety is preserved: policy defaults to read-only, and repository busy conflicts skip safely without interleaving git state.'
+    ]),
+    el('div', { style: 'display:flex; gap:12px; align-items:center' }, [
+      newBtn,
+      el('span', { class: 'hint', text: `${schedules.length} routine${schedules.length === 1 ? '' : 's'} (${activeCount} active)` })
+    ])
+  ]);
+
+  if (schedules.length === 0) {
+    return el('div', { class: 'page page--wide' }, [
+      heroHeader,
+      head,
+      el('div', { class: 'panel' }, [
+        el('div', { class: 'empty', style: 'padding:32px 0' }, [
+          el('h2', { text: 'No routines scheduled yet' }),
+          el('p', { text: 'Create recurring routines using cron expressions, or infer them from natural language chats (e.g. "every morning at 9am check...").' })
+        ])
+      ])
+    ]);
+  }
+
+  const rows = schedules.map((s) => {
+    const project = s.projectId ? projectsById.get(s.projectId) : null;
+    let statusChip = el('span', { class: 'hint', text: 'never' });
+    if (s.lastStatus === 'triggered') {
+      statusChip = el('span', { class: 'chip chip--ok', text: 'triggered' });
+    } else if (s.lastStatus === 'skipped-busy') {
+      statusChip = el('span', { class: 'chip chip--warn', text: 'skipped-busy', title: s.lastError || 'Repository busy' });
+    } else if (s.lastStatus === 'error') {
+      statusChip = el('span', { class: 'chip chip--error', text: 'error', title: s.lastError || '' });
+    }
+
+    return el('tr', { dataset: { id: s.id } }, [
+      el('td', {}, [
+        el('div', { style: 'font-weight:600', text: s.name || s.prompt }),
+        el('div', { class: 'hint', style: 'max-width:320px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;', text: s.prompt, title: s.prompt })
+      ]),
+      el('td', {}, [
+        el('div', { class: 'mono', text: s.cron }),
+        el('div', { class: 'hint', text: s.humanCadence || 'Cron cadence' })
+      ]),
+      el('td', {}, [
+        project ? el('span', { class: 'chip chip--neutral', style: 'margin-right:4px', text: project.name }) : null,
+        el('span', { class: s.policy === 'apply' ? 'chip chip--warn' : 'chip chip--neutral', text: s.policy || 'read-only' }),
+        s.lane ? el('span', { class: 'chip chip--neutral mono', style: 'margin-left:4px', text: s.lane }) : null
+      ]),
+      el('td', {}, [
+        s.enabled && s.nextRunAt
+          ? el('span', { text: relativeTime(s.nextRunAt) || 'soon', title: s.nextRunAt })
+          : el('span', { class: 'hint', text: 'paused' })
+      ]),
+      el('td', {}, [
+        statusChip,
+        s.lastRunId ? el('a', {
+          href: `#/runs/${encodeURIComponent(s.lastRunId)}`,
+          class: 'mono',
+          style: 'margin-left:6px; font-size:11px;',
+          text: s.lastRunId.slice(0, 8),
+          title: 'View last run'
+        }) : null,
+        s.lastRunAt ? el('div', { class: 'hint', text: relativeTime(s.lastRunAt) }) : null
+      ]),
+      el('td', {}, [
+        el('button', {
+          class: `btn btn--xs${s.enabled ? '' : ' btn--primary'}`,
+          type: 'button',
+          text: s.enabled ? 'Pause' : 'Enable',
+          onClick: () => onToggle?.(s.id, !s.enabled)
+        })
+      ]),
+      el('td', {}, [
+        el('div', { style: 'display:flex; gap:6px; align-items:center' }, [
+          el('button', {
+            class: 'btn btn--xs',
+            type: 'button',
+            text: 'Run now',
+            title: 'Trigger routine immediately',
+            onClick: () => onRun?.(s.id)
+          }),
+          el('button', {
+            class: 'btn btn--xs btn--danger',
+            type: 'button',
+            text: 'Delete',
+            onClick: () => onDelete?.(s.id)
+          })
+        ])
+      ])
+    ]);
+  });
+
+  return el('div', { class: 'page page--wide' }, [
+    heroHeader,
+    head,
+    el('div', { class: 'panel' }, [
+      el('table', { class: 'data routine-table' }, [
+        el('tr', {}, [
+          el('th', { text: 'Routine / Task' }),
+          el('th', { text: 'Cadence (Cron)' }),
+          el('th', { text: 'Project & Policy' }),
+          el('th', { text: 'Next run' }),
+          el('th', { text: 'Last run' }),
+          el('th', { text: 'Status' }),
+          el('th', { text: 'Actions' })
+        ]),
+        ...rows
+      ])
+    ])
+  ]);
+}
+
+/**
+ * Routine creation dialog with live inference and presets.
+ */
+export function renderRoutineDialog({ initial = {}, projects = [], onClose, onSubmit, onInfer }) {
+  const promptTextarea = el('textarea', {
+    rows: 3,
+    style: 'width:100%; box-sizing:border-box; font-family:inherit; resize:vertical;',
+    placeholder: 'e.g. Every weekday at 9am check git status and run tests'
+  });
+  promptTextarea.value = initial.prompt || '';
+
+  const nameInput = el('input', {
+    type: 'text',
+    placeholder: 'Routine name (optional)'
+  });
+  nameInput.value = initial.name || '';
+
+  const cronInput = el('input', {
+    type: 'text',
+    class: 'mono',
+    placeholder: '0 9 * * 1-5'
+  });
+  cronInput.value = initial.cron || '0 9 * * 1-5';
+
+  const projectSelect = el('select', {}, [
+    el('option', { value: '', text: 'No project' }),
+    ...projects.map((p) => el('option', {
+      value: p.id,
+      text: `${p.name} — ${p.dir}`,
+      selected: initial.projectId === p.id
+    }))
+  ]);
+
+  const policySelect = el('select', {}, [
+    el('option', { value: 'read-only', text: 'read-only (safe, no file changes)', selected: initial.policy !== 'apply' }),
+    el('option', { value: 'apply', text: 'apply (can write files and commit)', selected: initial.policy === 'apply' })
+  ]);
+
+  const laneSelect = el('select', {}, [
+    el('option', { value: '', text: 'auto (default lane)', selected: !initial.lane }),
+    el('option', { value: 'zen', text: 'zen (OpenCode Zen)', selected: initial.lane === 'zen' }),
+    el('option', { value: 'go', text: 'go (OpenCode Go)', selected: initial.lane === 'go' }),
+    el('option', { value: 'hitch', text: 'hitch (standard Hitch providers)', selected: initial.lane === 'hitch' })
+  ]);
+
+  const inferenceNotice = el('div', { class: 'field__hint', style: 'margin-top:6px; color:var(--text-accent, #3b82f6); display:none;' });
+
+  const presets = [
+    { label: 'Hourly', cron: '0 * * * *' },
+    { label: 'Every 4h', cron: '0 */4 * * *' },
+    { label: 'Weekdays 9am', cron: '0 9 * * 1-5' },
+    { label: 'Daily 9am', cron: '0 9 * * *' },
+    { label: 'Nightly', cron: '0 0 * * *' }
+  ];
+
+  const presetBtns = el('div', { style: 'display:flex; gap:6px; flex-wrap:wrap; margin-top:6px;' },
+    presets.map((p) => el('button', {
+      class: 'btn btn--xs',
+      type: 'button',
+      text: p.label,
+      onClick: () => { cronInput.value = p.cron; }
+    }))
+  );
+
+  let inferTimer = null;
+  const runInference = () => {
+    const text = promptTextarea.value.trim();
+    if (!text || typeof onInfer !== 'function') return;
+    clearTimeout(inferTimer);
+    inferTimer = setTimeout(async () => {
+      try {
+        const doc = await onInfer(text);
+        if (doc?.inferred?.matched) {
+          const inf = doc.inferred;
+          inferenceNotice.style.display = 'block';
+          clear(inferenceNotice);
+          inferenceNotice.append(
+            el('span', { text: `Detected schedule: ${inf.humanCadence} (${inf.cron}) ` }),
+            el('button', {
+              class: 'btn btn--xs',
+              type: 'button',
+              text: 'Use detected cadence',
+              onClick: () => {
+                cronInput.value = inf.cron;
+                if (!nameInput.value) nameInput.value = `${inf.humanCadence} routine`;
+                if (inf.cleanedPrompt) promptTextarea.value = inf.cleanedPrompt;
+                inferenceNotice.style.display = 'none';
+              }
+            })
+          );
+        } else {
+          inferenceNotice.style.display = 'none';
+        }
+      } catch {
+        inferenceNotice.style.display = 'none';
+      }
+    }, 300);
+  };
+
+  promptTextarea.addEventListener('input', runInference);
+  if (initial.prompt) setTimeout(runInference, 10);
+
+  const problem = el('div', { class: 'composer__warning' });
+  const submit = el('button', { class: 'btn btn--primary', type: 'button', text: 'Save routine' });
+
+  const save = async () => {
+    submit.disabled = true;
+    problem.textContent = '';
+    const prompt = promptTextarea.value.trim();
+    const cron = cronInput.value.trim();
+    if (!prompt) {
+      submit.disabled = false;
+      problem.textContent = 'A prompt or instruction is required for the routine.';
+      return;
+    }
+    if (!cron) {
+      submit.disabled = false;
+      problem.textContent = 'A cron schedule is required.';
+      return;
+    }
+
+    try {
+      await onSubmit({
+        name: nameInput.value.trim() || undefined,
+        prompt,
+        cron,
+        projectId: projectSelect.value || undefined,
+        policy: policySelect.value,
+        lane: laneSelect.value || undefined,
+        enabled: true
+      });
+    } catch (err) {
+      submit.disabled = false;
+      problem.textContent = err.problems ? err.problems.join(' ') : err.message;
+    }
+  };
+
+  submit.addEventListener('click', save);
+
+  const box = el('div', { class: 'composer', onClick: (e) => e.stopPropagation() }, [
+    el('div', { class: 'composer__head', text: initial.id ? 'Edit routine' : 'New routine' }),
+    el('div', { class: 'composer__controls' }, [
+      el('div', { class: 'field' }, [
+        el('label', { text: 'Task Prompt' }),
+        promptTextarea,
+        inferenceNotice,
+        el('div', { class: 'field__hint' }, 'Natural language schedules like "every morning at 9am check pull requests" are auto-detected.')
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', { text: 'Schedule (5-part Cron)' }),
+        cronInput,
+        presetBtns
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', { text: 'Routine Name' }),
+        nameInput
+      ]),
+      el('div', { style: 'display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px;' }, [
+        el('div', { class: 'field' }, [
+          el('label', { text: 'Project' }),
+          projectSelect
+        ]),
+        el('div', { class: 'field' }, [
+          el('label', { text: 'Policy' }),
+          policySelect
+        ]),
+        el('div', { class: 'field' }, [
+          el('label', { text: 'Lane' }),
+          laneSelect
+        ])
+      ]),
+      problem
+    ]),
+    el('div', { class: 'composer__foot' }, [
+      submit,
+      el('span', { class: 'hint' }, [
+        el('span', { class: 'kbd', text: 'Esc' }),
+        ' to close'
+      ]),
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn', type: 'button', text: 'Cancel', onClick: onClose })
+    ])
+  ]);
+
+  const overlay = el('div', { class: 'overlay', onClick: onClose }, [box]);
+  overlay.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') onClose();
+  });
+  setTimeout(() => promptTextarea.focus(), 0);
+  return overlay;
+}
+
+export function renderWorkfolkPage({ status = {}, workers = [], jobs = [], onDispatch, onRefresh }) {
+  const isOk = status.ok;
+  const isConfigured = status.configured;
+  const workerCount = workers.length || status.workerCount || 0;
+
+  const heroHeader = el('header', { class: 'page__header' }, [
+    el('div', { class: 'page__icon-box' }, [renderIcon('workfolk', 'page__header-icon')]),
+    el('div', { class: 'page__badge' }, [el('span', { class: 'chip chip--neutral', text: 'workfolk bridge' })]),
+    el('h1', { class: 'page__title', text: 'Workfolk Worker Roster' }),
+    el('div', { class: 'page__meta', text: 'Connected to Workfolk agent swarm. Dispatch engineering tasks directly to specialized agents or review active rosters.' })
+  ]);
+
+  const refreshBtn = el('button', {
+    class: 'btn',
+    type: 'button',
+    text: 'Refresh roster',
+    onClick: onRefresh
+  });
+
+  const statusDot = el('span', { class: `dot ${isOk ? 'dot--ok' : 'dot--error'}` });
+
+  const head = el('div', { class: 'panel' }, [
+    el('div', { class: 'panel__title' }, [
+      renderIcon('workfolk', 'panel__icon'),
+      el('span', { text: 'Gateway Status & Connectivity' })
+    ]),
+    el('div', { style: 'display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-top:10px;' }, [
+      el('div', { style: 'display:flex; align-items:center; gap:8px;' }, [
+        statusDot,
+        el('span', { style: 'font-weight:600;', text: isOk ? 'Connected to Workfolk Gateway' : 'Gateway Unreachable' }),
+        el('span', { class: 'hint mono', text: status.baseUrl || 'http://127.0.0.1:3000' })
+      ]),
+      el('div', { style: 'display:flex; gap:10px; align-items:center;' }, [
+        el('span', { class: 'chip chip--neutral', text: isConfigured ? 'Auth token configured' : 'Unauthenticated (public roster)' }),
+        el('span', { class: 'chip chip--neutral', text: `${workerCount} worker${workerCount === 1 ? '' : 's'}` }),
+        refreshBtn
+      ])
+    ]),
+    status.error ? el('div', { class: 'notice notice--error', style: 'margin-top:12px;', text: status.error }) : null
+  ]);
+
+  if (!isOk && workers.length === 0) {
+    return el('div', { class: 'page page--wide' }, [
+      heroHeader,
+      head,
+      el('div', { class: 'panel' }, [
+        el('div', { class: 'empty', style: 'padding:32px 0' }, [
+          el('h2', { text: 'Unable to reach Workfolk gateway' }),
+          el('p', { text: `Start Workfolk on ${status.baseUrl || 'http://127.0.0.1:3000'} or configure WORKFOLK_URL in your environment.` })
+        ])
+      ])
+    ]);
+  }
+
+  const workerCards = el('div', {
+    style: 'display:grid; grid-template-columns:repeat(auto-fill, minmax(320px, 1fr)); gap:16px; margin-top:16px;'
+  }, workers.map((w) => {
+    const tag = `@${w.tag || w.name}`;
+    const tools = Array.isArray(w.tools) ? w.tools : [];
+    const dispatchBtn = el('button', {
+      class: 'btn btn--primary btn--sm',
+      type: 'button',
+      text: `Dispatch to ${tag}`,
+      onClick: () => onDispatch(w)
+    });
+
+    return el('div', { class: 'card', style: 'display:flex; flex-direction:column; justify-content:space-between; padding:16px;' }, [
+      el('div', {}, [
+        el('div', { style: 'display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:8px;' }, [
+          el('div', {}, [
+            el('div', { style: 'font-weight:700; font-size:16px;', text: w.name || tag }),
+            el('div', { class: 'mono', style: 'color:var(--text-accent, #3b82f6); font-size:13px;', text: tag })
+          ]),
+          el('span', { class: `chip chip--${w.status === 'active' || w.status === 'idle' ? 'ok' : 'neutral'}`, text: w.status || 'active' })
+        ]),
+        el('p', { style: 'font-size:13px; color:var(--text-muted); margin:8px 0 12px; min-height:36px;', text: w.role || w.description || '' }),
+        tools.length > 0 ? el('div', { style: 'display:flex; flex-wrap:wrap; gap:4px; margin-bottom:14px;' },
+          tools.map((t) => el('span', { class: 'chip chip--neutral mono', style: 'font-size:11px;', text: t }))
+        ) : null
+      ]),
+      el('div', { style: 'margin-top:12px; padding-top:12px; border-top:1px solid var(--border-subtle); display:flex; justify-content:flex-end;' }, [
+        dispatchBtn
+      ])
+    ]);
+  }));
+
+  const rosterPanel = el('div', { class: 'panel', style: 'margin-top:16px;' }, [
+    el('div', { class: 'panel__title' }, [
+      renderIcon('users', 'panel__icon'),
+      el('span', { text: 'Available Swarm Workers' })
+    ]),
+    workerCards
+  ]);
+
+  let jobsPanel = null;
+  if (jobs.length > 0) {
+    const jobRows = jobs.map((j) => {
+      return el('div', { class: 'table-row', style: 'padding:12px 16px; border-bottom:1px solid var(--border-subtle);' }, [
+        el('div', { style: 'display:flex; justify-content:space-between; align-items:center;' }, [
+          el('div', {}, [
+            el('span', { class: 'mono', style: 'font-weight:600;', text: j.job_id }),
+            el('span', { style: 'margin-left:8px; color:var(--text-accent);', text: `@${j.worker_tag || ''}` })
+          ]),
+          el('span', { class: `chip chip--${j.status === 'completed' ? 'ok' : j.status === 'failed' ? 'error' : 'neutral'}`, text: j.status })
+        ]),
+        el('div', { style: 'margin-top:6px; font-size:13px;', text: j.task || '' }),
+        j.result ? el('pre', { class: 'diff-view mono', style: 'margin-top:8px; max-height:200px; overflow:auto;', text: j.result }) : null
+      ]);
+    });
+    jobsPanel = el('div', { class: 'panel', style: 'margin-top:16px;' }, [
+      el('div', { class: 'panel__title' }, [
+        renderIcon('task', 'panel__icon'),
+        el('span', { text: 'Session Dispatched Jobs' })
+      ]),
+      el('div', {}, jobRows)
+    ]);
+  }
+
+  return el('div', { class: 'page page--wide' }, [
+    heroHeader,
+    head,
+    rosterPanel,
+    jobsPanel
+  ]);
+}
+
+export function renderWorkfolkDispatchDialog({ worker, initialTask = '', onClose, onSubmit }) {
+  const tag = `@${worker.tag || worker.name}`;
+  const taskTextarea = el('textarea', {
+    rows: 4,
+    style: 'width:100%; box-sizing:border-box; font-family:inherit; resize:vertical;',
+    placeholder: `Enter task instructions for ${tag}...`
+  });
+  taskTextarea.value = initialTask || '';
+
+  const waitCheckbox = el('input', { type: 'checkbox', id: 'wf-wait', checked: true });
+
+  const problem = el('div', { class: 'composer__problem' });
+  const showProblem = (msg) => {
+    problem.textContent = msg;
+    problem.classList.add('composer__problem--visible');
+  };
+
+  const submit = el('button', {
+    class: 'btn btn--primary',
+    type: 'button',
+    text: `Dispatch to ${tag}`,
+    onClick: async () => {
+      const task = taskTextarea.value.trim();
+      if (!task) {
+        showProblem('Task instructions are required.');
+        return;
+      }
+      submit.disabled = true;
+      submit.textContent = 'Dispatching...';
+      try {
+        await onSubmit({
+          worker_tag: worker.tag || worker.name,
+          task,
+          wait: waitCheckbox.checked
+        });
+        onClose();
+      } catch (err) {
+        submit.disabled = false;
+        submit.textContent = `Dispatch to ${tag}`;
+        showProblem(err.message || 'Dispatch failed');
+      }
+    }
+  });
+
+  const box = el('div', { class: 'composer', onClick: (e) => e.stopPropagation() }, [
+    el('div', { class: 'composer__head' }, [
+      el('span', { class: 'composer__title', text: `Dispatch Task to ${tag}` }),
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn btn--icon', type: 'button', text: '×', onClick: onClose })
+    ]),
+    el('div', { class: 'composer__body' }, [
+      el('div', { style: 'margin-bottom:8px; font-size:13px; color:var(--text-muted);', text: worker.role || worker.description || '' }),
+      el('div', { class: 'field' }, [
+        el('label', { class: 'field__label', text: 'Task instructions' }),
+        taskTextarea
+      ]),
+      el('div', { style: 'margin-top:10px; display:flex; align-items:center; gap:8px;' }, [
+        waitCheckbox,
+        el('label', { for: 'wf-wait', style: 'font-size:13px;', text: 'Wait for job completion and show result' })
+      ]),
+      problem
+    ]),
+    el('div', { class: 'composer__foot' }, [
+      submit,
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn', type: 'button', text: 'Cancel', onClick: onClose })
+    ])
+  ]);
+
+  const overlay = el('div', { class: 'overlay', onClick: onClose }, [box]);
+  overlay.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') onClose();
+  });
+  setTimeout(() => taskTextarea.focus(), 0);
+  return overlay;
+}
+

@@ -67,6 +67,20 @@ export function renderChatMessage(message, options = {}) {
       })
     );
   }
+  if (role === 'user' && options.onSchedule) {
+    headChildren.push(
+      el('button', {
+        class: 'btn btn--xs chat__msg-action',
+        type: 'button',
+        text: 'Save as routine',
+        title: 'Save this instruction as a scheduled routine',
+        onClick: (e) => {
+          e.stopPropagation();
+          options.onSchedule(message);
+        }
+      })
+    );
+  }
 
   return el('div', {
     class: `chat__msg chat__msg--${role}${selected ? ' chat__msg--selected' : ''}`,
@@ -134,7 +148,7 @@ export function renderChatList({ chats, onOpen, onNew }) {
  * arriving or finished.
  */
 export function renderChatPage(chat, listing = {}, handlers = {}) {
-  const { onSend, onStop, onPin, onRename, onDelete, onContinueAsRun } = handlers;
+  const { onSend, onStop, onPin, onRename, onDelete, onContinueAsRun, onScheduleRoutine, onHandoffToWorkfolk } = handlers;
   const models = Array.isArray(listing.models) ? listing.models : [];
   const pending = chat.pending === true;
   const messages = Array.isArray(chat.messages) ? chat.messages : [];
@@ -192,6 +206,44 @@ export function renderChatPage(chat, listing = {}, handlers = {}) {
     })
     : null;
 
+  const scheduleRoutineBtn = onScheduleRoutine
+    ? el('button', {
+      class: 'btn',
+      type: 'button',
+      text: 'Save as routine',
+      disabled: pending || userMessages.length === 0,
+      title: userMessages.length === 0
+        ? 'No user messages to schedule'
+        : 'Open routine scheduler pre-filled with this conversation',
+      onClick: () => {
+        if (userMessages.length === 0) return;
+        const target = selectedMessageId
+          ? userMessages.find((m) => m.id === selectedMessageId) || userMessages[userMessages.length - 1]
+          : userMessages[userMessages.length - 1];
+        onScheduleRoutine(target, chat);
+      }
+    })
+    : null;
+
+  const handoffWorkfolkBtn = onHandoffToWorkfolk
+    ? el('button', {
+      class: 'btn',
+      type: 'button',
+      text: 'Hand off to Workfolk',
+      disabled: pending || userMessages.length === 0,
+      title: userMessages.length === 0
+        ? 'No user messages to hand off'
+        : 'Dispatch this conversation to a Workfolk specialist',
+      onClick: () => {
+        if (userMessages.length === 0) return;
+        const target = selectedMessageId
+          ? userMessages.find((m) => m.id === selectedMessageId) || userMessages[userMessages.length - 1]
+          : userMessages[userMessages.length - 1];
+        onHandoffToWorkfolk(target, chat);
+      }
+    })
+    : null;
+
   const controls = el('div', { class: 'chat__controls' }, [
     el('div', { class: 'field' }, [
       el('label', { text: 'Pinned model' }),
@@ -205,6 +257,8 @@ export function renderChatPage(chat, listing = {}, handlers = {}) {
     ]),
     el('div', { class: 'chat__controls-actions' }, [
       continueRunBtn,
+      scheduleRoutineBtn,
+      handoffWorkfolkBtn,
       onRename
         ? el('button', { class: 'btn', type: 'button', text: 'Rename', disabled: pending, onClick: () => onRename() })
         : null,
@@ -232,6 +286,7 @@ export function renderChatPage(chat, listing = {}, handlers = {}) {
         log.append(renderChatMessage(message, {
           selected: message.id === selectedMessageId,
           onContinue: onContinueAsRun ? (msg) => onContinueAsRun(msg, chat) : null,
+          onSchedule: onScheduleRoutine ? (msg) => onScheduleRoutine(msg, chat) : null,
           onSelect: message.role === 'user' ? (msgId) => {
             selectedMessageId = selectedMessageId === msgId ? null : msgId;
             renderMessages();

@@ -14,6 +14,27 @@ import { startServer, DEFAULT_PORT, DEFAULT_HOST, isLoopback } from '../src/serv
 import { DEFAULT_MAX_TURNS, continuationBudget, runWithExtensions } from '../src/turns.mjs';
 import { commitAndPushBranch } from '../src/git.mjs';
 import { createPullRequest } from '../src/github.mjs';
+import {
+  readSchedules,
+  writeSchedules,
+  createSchedule,
+  updateSchedule,
+  deleteSchedule,
+  findSchedule,
+  validateCron,
+  computeNextRun,
+  describeCron,
+  inferScheduleFromText,
+  Scheduler
+} from '../src/schedules.mjs';
+import {
+  getWorkfolkStatus,
+  fetchWorkfolkRoster,
+  dispatchWorkfolkTask,
+  getWorkfolkJobStatus,
+  pollWorkfolkJob,
+  getWorkfolkConfig
+} from '../src/workfolk.mjs';
 
 /** Structured exit codes: 0 success, 1 failure, 2 usage, 3 gateway, 4 partial. */
 export const EXIT = { OK: 0, FAIL: 1, USAGE: 2, GATEWAY: 3, PARTIAL: 4 };
@@ -26,7 +47,8 @@ export function exitForKind(kind) {
 
 const KNOWN_COMMANDS = new Set([
   'task', 'prompt', 'run', 'panel', 'arena', 'interrogate', 'budget', 'grade',
-  'triage', 'explore', 'history', 'shell', 'repl', 'serve', 'skill',
+  'triage', 'explore', 'history', 'shell', 'repl', 'serve', 'skill', 'schedule', 'schedules', 'cron',
+  'workfolk', 'workers',
   'status', 'sync', 'update', 'playbooks', 'principles', 'about', 'version', 'help'
 ]);
 
@@ -37,7 +59,7 @@ const z = new ZStack();
 // --playbook, --timeout, --paths, --max-files, --limit, --last, --rerun, --live,
 // --agent, --max-turns, --review)
 function parseArgs(args) {
-  const flags = { files: [], project: false, apply: false, check: false, confirm: false, yes: false, json: false, noPrune: false, live: true, last: false, rerun: false, agent: false, review: false, autoPr: false, dryRun: false, force: false };
+  const flags = { files: [], project: false, apply: false, check: false, confirm: false, yes: false, json: false, noPrune: false, live: true, last: false, rerun: false, agent: false, review: false, autoPr: false, dryRun: false, force: false, wait: false, includeRetired: false };
   const positional = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -157,6 +179,22 @@ function parseArgs(args) {
       flags.dryRun = true;
     } else if (arg === '--force') {
       flags.force = true;
+    } else if (arg === '--cron' && i + 1 < args.length) {
+      flags.cron = args[++i];
+    } else if (arg === '--name' && i + 1 < args.length) {
+      flags.name = args[++i];
+    } else if (arg === '--disabled') {
+      flags.disabled = true;
+    } else if (arg === '--enabled') {
+      flags.enabled = true;
+    } else if (arg === '--policy' && i + 1 < args.length) {
+      flags.policy = args[++i];
+    } else if (arg === '--project-id' && i + 1 < args.length) {
+      flags.projectId = args[++i];
+    } else if (arg === '--wait') {
+      flags.wait = true;
+    } else if (arg === '--include-retired') {
+      flags.includeRetired = true;
     } else {
       positional.push(arg);
     }
@@ -250,6 +288,16 @@ Usage:
   zstack shell | repl                              Start an interactive session with sticky context
   zstack skill <playbook-id> [--out <dir>] [--dry-run] [--force]
                                                    Package a playbook into a SKILL.md
+  zstack schedule list [--json]                    List scheduled routines and next run times
+  zstack schedule add "<prompt>" [options]         Add a routine (infers cadence or use --cron)
+  zstack schedule run <id> [--json]                Trigger a scheduled routine immediately
+  zstack schedule enable <id> | disable <id>       Enable or pause a scheduled routine
+  zstack schedule delete <id>                      Delete a scheduled routine
+  zstack schedule infer "<text>"                   Infer cron cadence and task from natural language
+  zstack workfolk [list] [--json]                  List Workfolk worker roster and capabilities
+  zstack workfolk dispatch <tag> "<task>" [--wait] Dispatch a task to a Workfolk specialist
+  zstack workfolk job <id> [--wait] [--json]       Query status and result of a Workfolk job
+  zstack workfolk status [--json]                  Check Workfolk gateway connectivity and auth
   zstack status [--json]                           Show ModelHitch health and active role mappings
   zstack sync [--project]                          Sync Cursor rules (~/.cursor/rules/zstack-models.mdc)
   zstack update [--apply]                          Check upstream pstack repository for updates
@@ -326,6 +374,9 @@ Options:
   --out <dir>              Skill: target directory for packaged SKILL.md
   --dry-run                Skill: print generated SKILL.md to stdout without writing
   --force                  Skill: overwrite existing target and bypass cross-location collisions
+  --cron "<expr>"          Schedule: cron expression (e.g. '0 9 * * 1-5' or '@hourly')
+  --policy <read-only|apply> Schedule: execution policy (default read-only)
+  --disabled               Schedule: create routine in paused state
   --about, -a              Show architecture and design overview
   --version, -v            Show package version
 
@@ -1779,6 +1830,382 @@ Core Tenets:
 `);
 }
 
+async function handleSchedule(args) {
+  const { flags, positional } = parseArgs(args);
+  const subcommand = positional[0] || 'list';
+  const rest = positional.slice(1);
+
+  if (subcommand === 'list' || subcommand === 'ls') {
+    const { schedules } = readSchedules();
+    if (flags.json) {
+      emitJson({ ok: true, count: schedules.length, schedules });
+      return;
+    }
+    if (schedules.length === 0) {
+      console.log('\nNo routines scheduled yet. Add one with: zstack schedule add "<prompt>"');
+      console.log('Or with an explicit cron: zstack schedule add "<prompt>" --cron "0 9 * * 1-5"\n');
+      return;
+    }
+    console.log('\n=== zstack Scheduled Routines ===\n');
+    const header = `${'ID'.padEnd(10)} ${'NAME'.padEnd(24)} ${'SCHEDULE'.padEnd(28)} ${'POLICY'.padEnd(11)} ${'STATUS'.padEnd(10)} ${'NEXT RUN'}`;
+    console.log(header);
+    console.log('-'.repeat(100));
+    for (const s of schedules) {
+      const id = String(s.id).padEnd(10);
+      const name = String(s.name || s.prompt || '').slice(0, 22).padEnd(24);
+      const sched = `${s.cron} (${describeCron(s.cron)})`.slice(0, 26).padEnd(28);
+      const policy = String(s.policy || 'read-only').padEnd(11);
+      const status = (s.enabled ? 'enabled' : 'disabled').padEnd(10);
+      const next = s.enabled && s.nextRunAt ? new Date(s.nextRunAt).toLocaleString() : 'paused';
+      console.log(`${id} ${name} ${sched} ${policy} ${status} ${next}`);
+    }
+    console.log(`\nTotal: ${schedules.length} routine${schedules.length === 1 ? '' : 's'}\n`);
+    return;
+  }
+
+  if (subcommand === 'add') {
+    const rawPrompt = rest.join(' ').trim();
+    if (!rawPrompt) {
+      fail('Error: Prompt is required. Usage: zstack schedule add "<prompt>" [--cron "<expr>"]', EXIT.USAGE, flags);
+    }
+    let cron = flags.cron;
+    let taskPrompt = rawPrompt;
+    let routineName = flags.name;
+
+    if (!cron) {
+      const inferred = inferScheduleFromText(rawPrompt);
+      if (inferred.matched) {
+        cron = inferred.cron;
+        taskPrompt = inferred.cleanedPrompt || rawPrompt;
+        if (!routineName) {
+          routineName = `${inferred.humanCadence} routine`;
+        }
+      } else {
+        fail('Error: No schedule detected. Specify --cron "<expression>" or include routine wording (e.g. "every morning at 9am check...").', EXIT.USAGE, flags);
+      }
+    } else {
+      const { valid, error } = validateCron(cron);
+      if (!valid) {
+        fail(`Error: Invalid cron expression "${cron}": ${error}`, EXIT.USAGE, flags);
+      }
+      if (!routineName) {
+        routineName = taskPrompt.slice(0, 30);
+      }
+    }
+
+    const policy = flags.policy || (flags.apply ? 'apply' : 'read-only');
+    const enabled = flags.disabled ? false : true;
+    try {
+      const schedule = createSchedule({
+        name: routineName,
+        prompt: taskPrompt,
+        cron,
+        enabled,
+        policy,
+        lane: flags.lane,
+        playbook: flags.playbook,
+        maxTurns: flags.maxTurns,
+        projectId: flags.projectId || (typeof flags.project === 'string' ? flags.project : undefined)
+      });
+
+      if (flags.json) {
+        emitJson({ ok: true, schedule });
+        return;
+      }
+
+      console.log(`\n[✓] Created routine "${schedule.name}" (${schedule.id})`);
+      console.log(`    Schedule: ${schedule.cron} (${describeCron(schedule.cron)})`);
+      console.log(`    Policy:   ${schedule.policy}`);
+      console.log(`    Next run: ${schedule.nextRunAt || 'disabled'}`);
+      console.log(`    Task:     ${schedule.prompt}\n`);
+    } catch (err) {
+      failWith(err, flags, EXIT.FAIL, '[!] Failed to create schedule');
+    }
+    return;
+  }
+
+  if (subcommand === 'run') {
+    const id = rest[0];
+    if (!id) {
+      fail('Error: Schedule ID is required. Usage: zstack schedule run <id>', EXIT.USAGE, flags);
+    }
+    const sched = findSchedule(id);
+    if (!sched) {
+      fail(`No schedule with id "${id}".`, EXIT.FAIL, flags);
+    }
+
+    let triggered = false;
+    let liveResult = null;
+    try {
+      const res = await fetch(`http://127.0.0.1:3939/api/schedules/${encodeURIComponent(id)}/run`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' }
+      });
+      if (res.ok) {
+        liveResult = await res.json();
+        triggered = true;
+      } else if (res.status === 409) {
+        const body = await res.json().catch(() => ({}));
+        fail(`Cannot trigger routine: repository is busy (${body.error || 'in flight run'}).`, EXIT.FAIL, flags);
+      }
+    } catch {
+      // Server not running; proceed with direct execution
+    }
+
+    if (triggered && liveResult) {
+      if (flags.json) {
+        emitJson(liveResult);
+      } else {
+        console.log(`\n[✓] Triggered routine "${sched.name}" (${id}) on live server (Run ID: ${liveResult.runId || 'started'})\n`);
+      }
+      return;
+    }
+
+    try {
+      const { RunRegistry } = await import('../src/runs.mjs');
+      const registry = new RunRegistry({ zstack: z });
+      const scheduler = new Scheduler({ registry });
+      const outcome = await scheduler.triggerSchedule(sched);
+      if (!outcome.ok) {
+        fail(`Failed to trigger routine: ${outcome.error} (${outcome.status})`, EXIT.FAIL, flags);
+      }
+      if (flags.json) {
+        emitJson({ ok: true, scheduleId: id, runId: outcome.runId, status: outcome.status });
+      } else {
+        console.log(`\n[✓] Triggered routine "${sched.name}" (${id}) (Run ID: ${outcome.runId})\n`);
+      }
+    } catch (err) {
+      failWith(err, flags, EXIT.FAIL, '[!] Failed to run schedule');
+    }
+    return;
+  }
+
+  if (subcommand === 'enable') {
+    const id = rest[0];
+    if (!id) {
+      fail('Error: Schedule ID is required. Usage: zstack schedule enable <id>', EXIT.USAGE, flags);
+    }
+    const sched = findSchedule(id);
+    if (!sched) {
+      fail(`No schedule with id "${id}".`, EXIT.FAIL, flags);
+    }
+    const nextRun = computeNextRun(sched.cron);
+    const updated = updateSchedule(id, { enabled: true, nextRunAt: nextRun.toISOString() });
+    if (!updated) {
+      fail(`Failed to enable schedule "${id}".`, EXIT.FAIL, flags);
+    }
+    if (flags.json) {
+      emitJson({ ok: true, id, enabled: true, nextRunAt: nextRun.toISOString() });
+    } else {
+      console.log(`[✓] Enabled routine "${sched.name}" (${id}). Next run: ${nextRun.toLocaleString()}`);
+    }
+    return;
+  }
+
+  if (subcommand === 'disable') {
+    const id = rest[0];
+    if (!id) {
+      fail('Error: Schedule ID is required. Usage: zstack schedule disable <id>', EXIT.USAGE, flags);
+    }
+    const sched = findSchedule(id);
+    if (!sched) {
+      fail(`No schedule with id "${id}".`, EXIT.FAIL, flags);
+    }
+    const updated = updateSchedule(id, { enabled: false });
+    if (!updated) {
+      fail(`Failed to disable schedule "${id}".`, EXIT.FAIL, flags);
+    }
+    if (flags.json) {
+      emitJson({ ok: true, id, enabled: false });
+    } else {
+      console.log(`[✓] Disabled routine "${sched.name}" (${id}).`);
+    }
+    return;
+  }
+
+  if (subcommand === 'delete' || subcommand === 'rm') {
+    const id = rest[0];
+    if (!id) {
+      fail('Error: Schedule ID is required. Usage: zstack schedule delete <id>', EXIT.USAGE, flags);
+    }
+    const deleted = deleteSchedule(id);
+    if (!deleted) {
+      fail(`No schedule with id "${id}".`, EXIT.FAIL, flags);
+    }
+    if (flags.json) {
+      emitJson({ ok: true, deleted: id });
+    } else {
+      console.log(`[✓] Deleted routine "${id}".`);
+    }
+    return;
+  }
+
+  if (subcommand === 'infer') {
+    const text = rest.join(' ').trim();
+    if (!text) {
+      fail('Error: Text is required to infer routine. Usage: zstack schedule infer "<text>"', EXIT.USAGE, flags);
+    }
+    const inferred = inferScheduleFromText(text);
+    if (flags.json) {
+      emitJson({ ok: true, inferred });
+      return;
+    }
+    if (inferred.matched) {
+      console.log('\n[✓] Inferred routine schedule:');
+      console.log(`    Cadence: ${inferred.humanCadence}`);
+      console.log(`    Cron:    ${inferred.cron}`);
+      console.log(`    Task:    ${inferred.cleanedPrompt}\n`);
+    } else {
+      console.log(`\n[!] No schedule cadence detected in "${text}".\n`);
+    }
+    return;
+  }
+
+  fail(`Unknown schedule subcommand "${subcommand}". Allowed: list, add, run, enable, disable, delete, infer.`, EXIT.USAGE, flags);
+}
+
+async function handleWorkfolk(rawArgs) {
+  const { flags, positional } = parseArgs(rawArgs);
+  const subcommand = positional[0]?.toLowerCase();
+  const rest = positional.slice(1);
+
+  if (!subcommand || subcommand === 'list' || subcommand === 'workers' || subcommand === 'roster') {
+    try {
+      const workers = await fetchWorkfolkRoster({ includeRetired: flags.includeRetired });
+      if (flags.json) {
+        emitJson({ ok: true, count: workers.length, workers });
+        return;
+      }
+      console.log('\nWorkfolk Worker Roster:');
+      console.log('='.repeat(78));
+      if (workers.length === 0) {
+        console.log('No active workers returned by Workfolk gateway.');
+      } else {
+        for (const w of workers) {
+          const tag = `@${w.tag || w.name}`.padEnd(16);
+          const name = (w.name || '').padEnd(18);
+          const status = (w.status || 'active').padEnd(10);
+          console.log(`${tag} ${name} [${status}] ${w.role || w.description || ''}`);
+          if (Array.isArray(w.tools) && w.tools.length > 0) {
+            console.log(`  Capabilities: ${w.tools.join(', ')}`);
+          }
+        }
+      }
+      console.log('='.repeat(78));
+      console.log(`Total: ${workers.length} workers. Dispatch with: zstack workfolk dispatch <tag> "<task>"\n`);
+    } catch (err) {
+      fail(`Failed to fetch Workfolk roster: ${err.message}`, EXIT.FAIL, flags);
+    }
+    return;
+  }
+
+  if (subcommand === 'status') {
+    try {
+      const status = await getWorkfolkStatus();
+      if (flags.json) {
+        emitJson(status);
+        return;
+      }
+      console.log('\nWorkfolk Bridge Status:');
+      console.log(`  Gateway URL: ${status.baseUrl}`);
+      console.log(`  Configured:  ${status.configured ? 'yes (token found)' : 'no (set WORKFOLK_TOKEN or GATEWAY_WORKERS_TOKEN)'}`);
+      console.log(`  Reachability: ${status.ok ? 'connected' : 'unreachable'}`);
+      if (status.authValid !== null) {
+        console.log(`  Auth valid:   ${status.authValid ? 'yes' : 'no'}`);
+      }
+      console.log(`  Workers:      ${status.workerCount}`);
+      if (status.error) {
+        console.log(`  Error:        ${status.error}`);
+      }
+      console.log('');
+    } catch (err) {
+      fail(`Failed to check Workfolk status: ${err.message}`, EXIT.FAIL, flags);
+    }
+    return;
+  }
+
+  if (subcommand === 'dispatch') {
+    const tag = rest[0];
+    const task = rest.slice(1).join(' ').trim() || (flags.file ? readFileSync(flags.file, 'utf8').trim() : '');
+    if (!tag) {
+      fail('Usage: zstack workfolk dispatch <worker-tag> "<task>" [--wait] [--json]', EXIT.USAGE, flags);
+    }
+    if (!task) {
+      fail('Task is required. Usage: zstack workfolk dispatch <worker-tag> "<task>"', EXIT.USAGE, flags);
+    }
+    try {
+      if (!flags.json) {
+        console.log(`Dispatching task to ${tag.startsWith('@') ? tag : '@' + tag}...`);
+      }
+      const dispatchResult = await dispatchWorkfolkTask(tag, task);
+      if (flags.wait) {
+        if (!flags.json) {
+          console.log(`Job queued: ${dispatchResult.job_id}. Waiting for completion...`);
+        }
+        const terminalJob = await pollWorkfolkJob(dispatchResult.job_id, {
+          onPoll: (job) => {
+            if (!flags.json && process.stdout.isTTY) {
+              process.stdout.write(`\rJob ${job.job_id} status: ${job.status}... `);
+            }
+          }
+        });
+        if (flags.json) {
+          emitJson({ ok: true, ...terminalJob });
+          return;
+        }
+        console.log(`\n\n[✓] Job ${terminalJob.job_id} status: ${terminalJob.status}`);
+        if (terminalJob.result) {
+          console.log('\nResult:');
+          console.log(terminalJob.result);
+        }
+        return;
+      }
+      if (flags.json) {
+        emitJson({ ok: true, ...dispatchResult });
+        return;
+      }
+      console.log(`[✓] Job queued with ID: ${dispatchResult.job_id}`);
+      console.log(`Check status with: zstack workfolk job ${dispatchResult.job_id}`);
+    } catch (err) {
+      fail(`Workfolk dispatch failed: ${err.message}`, EXIT.FAIL, flags);
+    }
+    return;
+  }
+
+  if (subcommand === 'job') {
+    const jobId = rest[0];
+    if (!jobId) {
+      fail('Usage: zstack workfolk job <job-id> [--wait] [--json]', EXIT.USAGE, flags);
+    }
+    try {
+      let job;
+      if (flags.wait) {
+        job = await pollWorkfolkJob(jobId);
+      } else {
+        job = await getWorkfolkJobStatus(jobId);
+      }
+      if (flags.json) {
+        emitJson({ ok: true, ...job });
+        return;
+      }
+      console.log(`\nWorkfolk Job: ${job.job_id}`);
+      console.log(`  Worker:  @${job.worker_tag || 'unknown'}`);
+      console.log(`  Status:  ${job.status}`);
+      console.log(`  Task:    ${job.task || ''}`);
+      if (job.result) {
+        console.log('\nResult:');
+        console.log(job.result);
+      }
+      console.log('');
+    } catch (err) {
+      fail(`Failed to fetch job ${jobId}: ${err.message}`, EXIT.FAIL, flags);
+    }
+    return;
+  }
+
+  fail(`Unknown workfolk subcommand "${subcommand}". Allowed: list, dispatch, job, status.`, EXIT.USAGE, flags);
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const { cmd, rawArgs } = splitCmd(argv);
@@ -1835,6 +2262,15 @@ async function main() {
       break;
     case 'skill':
       await handleSkill(rawArgs);
+      break;
+    case 'schedule':
+    case 'schedules':
+    case 'cron':
+      await handleSchedule(rawArgs);
+      break;
+    case 'workfolk':
+    case 'workers':
+      await handleWorkfolk(rawArgs);
       break;
     case 'update':
     case '--update': {

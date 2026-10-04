@@ -494,6 +494,20 @@ site from reaching it through DNS rebinding.
 No build step, no dependency: the client is vanilla ES modules and one
 stylesheet served straight from `web/`.
 
+### 15. Workfolk Integration
+
+Inspect the Workfolk worker roster and dispatch asynchronous tasks to specialist teammates (`@coordinator`, `@developer`, `@researcher`, `@infra`, etc.) via the local Workfolk gateway (`http://127.0.0.1:3000` or `WORKFOLK_URL`):
+
+```bash
+zstack workfolk status                      # verify connection and authorization
+zstack workfolk list [--include-retired]    # view active workers and declared capabilities
+zstack workfolk dispatch @researcher "Analyze memory leak trends across nodes"
+zstack workfolk dispatch @developer "Add rate-limiting to auth endpoint" --wait
+zstack workfolk job <job-id>                # check result of a dispatched task
+```
+
+`--wait` blocks and polls until the task reaches a terminal state (`completed`, `failed`, `cancelled`, or `expired`), streaming the final result to stdout. In the web interface, a dedicated **Workfolk** view lists the live roster and session jobs, and chat conversations provide a 1-click **Hand off to Workfolk** action.
+
 ## Gateway Reliability
 
 Per-request timeout defaults to 30000ms (`--timeout <ms>` or
@@ -734,6 +748,195 @@ Previews or updates the zstack budget configuration.
 Strict body validation rejects any unknown fields (e.g. `workspace`, `prompt`) with `400 Bad Request`. Every prospective lane is validated against the live ModelHitch catalog before writing; if the gateway is unreachable, returns `502`/`504` and preserves stored configuration without writing.
 
 Writes are whole-file and atomic (temporary file write then atomic rename), and concurrent requests are serialized safely. A budget change takes effect for subsequently started runs; runs already in flight are unaffected.
+
+#### 7. `GET /api/schedules`
+
+Lists all stored routine schedules, their configured cron expressions, policy, status, and last/next execution times.
+
+#### 8. `POST /api/schedules`
+
+Creates a new routine schedule.
+
+**Request Body:**
+```json
+{
+  "prompt": "Check git status and run tests",
+  "cron": "0 9 * * 1-5",
+  "name": "Daily test run",
+  "policy": "read-only",
+  "projectId": "proj-xyz",
+  "lane": "auto",
+  "enabled": true
+}
+```
+
+#### 9. `POST /api/schedules/infer`
+
+Infers routine schedule and cron expression from natural language text (e.g. "every morning at 9am check...").
+
+**Request Body:**
+```json
+{
+  "prompt": "every morning at 9am check git status and run tests"
+}
+```
+
+**Response (`200 OK`):**
+```json
+{
+  "ok": true,
+  "inferred": {
+    "matched": true,
+    "cron": "0 9 * * *",
+    "humanCadence": "Every morning at 09:00",
+    "cleanedPrompt": "Check git status and run tests"
+  }
+}
+```
+
+#### 10. `POST /api/schedules/:id/run`
+
+Triggers immediate execution of a scheduled routine.
+
+#### 11. `GET /api/workfolk/status`
+
+Inspects connectivity and authentication status with the local Workfolk gateway.
+
+**Response (`200 OK`):**
+```json
+{
+  "ok": true,
+  "gatewayUrl": "http://127.0.0.1:3000",
+  "hasToken": true,
+  "authValid": true,
+  "workersCount": 9
+}
+```
+
+#### 12. `GET /api/workfolk/workers`
+
+Lists the active specialist workers registered in the Workfolk swarm, their roles, and capabilities.
+
+**Query Parameters:**
+- `includeRetired` (*boolean, optional*): Include retired workers when `true`. Defaults to `false`.
+
+**Response (`200 OK`):**
+```json
+{
+  "ok": true,
+  "workers": [
+    {
+      "tag": "developer",
+      "name": "Developer",
+      "role": "Senior Full-Stack Engineer",
+      "description": "Writes production-ready code, implements features, and runs tests",
+      "tools": ["terminal", "editor", "git", "browser"],
+      "status": "active"
+    }
+  ]
+}
+```
+
+#### 13. `POST /api/workfolk/dispatch`
+
+Submits an asynchronous work order to a specialist Workfolk worker.
+
+**Request Body:**
+```json
+{
+  "worker_tag": "@developer",
+  "task": "Add exponential backoff retry logic to HTTP client",
+  "wait": false
+}
+```
+
+- `worker_tag` (*string, required*): The target worker tag (with or without leading `@`).
+- `task` (*string, required*): The task description (1..16000 characters).
+- `wait` (*boolean, optional*): When `true`, long-polls the gateway until the job reaches a terminal state before returning.
+
+**Response (`202 Accepted` or `200 OK` when `wait: true`):**
+```json
+{
+  "ok": true,
+  "job_id": "job_550e8400-e29b-41d4-a716-446655440000",
+  "status": "queued"
+}
+```
+
+#### 14. `GET /api/workfolk/jobs/:id`
+
+Retrieves the current status and output for a dispatched Workfolk job.
+
+**Response (`200 OK`):**
+```json
+{
+  "ok": true,
+  "job_id": "job_550e8400-e29b-41d4-a716-446655440000",
+  "status": "completed",
+  "result": "Successfully added exponential backoff retry logic with jitter."
+}
+```
+
+---
+
+## Schedules & Unattended Routines
+
+zstack includes a zero-dependency scheduler daemon with natural-language routine inference, cron execution, and unattended safety guards. Your agents work while you sleep.
+
+### Routine Inference from Chat
+Workfolk frequently ask agents to perform recurring tasks using everyday language ("every morning...", "every weekday at 9am...", "nightly at midnight...").
+In the web chat interface, every user message and conversation header provides a 1-click **Save as routine** action. The server automatically parses the cadence into standard 5-part cron syntax and strips schedule boilerplate to produce a clean task prompt.
+
+### Unattended Safety
+- **Safe defaults**: Scheduled runs default to `policy: "read-only"`. Mutating actions require explicit `policy: "apply"`.
+- **Repo concurrency guard**: If a routine fires while a developer or another agent has an active run in the same git repository, the scheduler skips the execution cleanly (`status: "skipped-busy"`) rather than interleaving git mutations or corrupting working trees.
+- **Audit trail**: Scheduled runs record `trigger: "schedule"` in history with the routine's ID and name.
+
+### CLI Usage
+
+```bash
+# List all routines
+zstack schedule list [--json]
+
+# Add a routine with automatic natural-language cadence inference
+zstack schedule add "every weekday at 9am run daily checks and verify build"
+
+# Add a routine with explicit cron and mutating policy
+zstack schedule add "clean stale build artifacts" --cron "0 2 * * *" --policy apply
+
+# Infer cron cadence from text
+zstack schedule infer "every 2 hours review open PRs"
+
+# Pause, resume, trigger, or delete routines
+zstack schedule disable <id>
+zstack schedule enable <id>
+zstack schedule run <id>
+zstack schedule delete <id>
+```
+
+---
+
+## Workfolk ↔ zstack Bridge
+
+zstack and Workfolk (`gateway_workers`) form a bidirectional agent mesh:
+
+1. **zstack → Workfolk (Task Dispatch & Team Delegation)**
+   - zstack discovers available Workfolk specialists via `GET /api/workers` (`@coordinator`, `@developer`, `@researcher`, `@infra`, etc.).
+   - Dispatches autonomous work orders via `POST /api/dispatch` using the trusted bearer token (`WORKFOLK_TOKEN` or `GATEWAY_WORKERS_TOKEN`).
+   - Polls job progression via `GET /api/jobs/:id` with zero external dependencies.
+   - Web UI integrates a 1-click **Hand off to Workfolk** button directly on chat messages and conversation headers.
+
+2. **Workfolk → zstack (Playbook Execution & Sibling Lane)**
+   - Workfolk's swarm registry registers `@zstack` as an autonomous playbook executor.
+   - Workfolk advertises `zstack: true` in `siblingAgentLanesOffered`.
+   - Workfolk routes external agent handoffs to zstack's HTTP API (`POST /api/runs`).
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `WORKFOLK_URL` | `http://127.0.0.1:3000` | Base URL of the Workfolk gateway server. |
+| `WORKFOLK_TOKEN` | — | Bearer token for authenticating task dispatch and polling (`GATEWAY_WORKERS_TOKEN` also accepted). |
 
 ---
 

@@ -1918,6 +1918,19 @@ table.data td {
   font-weight: 600;
 }
 
+.routine-table {
+  width: 100%;
+  table-layout: auto;
+}
+.routine-table th, .routine-table td {
+  padding: 10px 12px;
+  vertical-align: middle;
+}
+@media (max-width: 768px) {
+  .routine-table, .routine-table tbody, .routine-table tr, .routine-table td { display: block; width: 100%; box-sizing: border-box; }
+  .routine-table th { display: none; }
+}
+
 .repo-path {
   font-family: var(--mono, monospace);
   font-size: 12px;

@@ -64,7 +64,18 @@ export const api = {
   syncGithub: () => request('POST', '/github/sync'),
   setRepoPath: (payload) => request('PUT', '/github/repos', payload),
   repoGit: (payload) => request('POST', '/github/git', payload),
-  runGit: (id, payload) => request('POST', `/runs/${encodeURIComponent(id)}/git`, payload)
+  runGit: (id, payload) => request('POST', `/runs/${encodeURIComponent(id)}/git`, payload),
+  schedules: () => request('GET', '/schedules'),
+  createSchedule: (payload) => request('POST', '/schedules', payload),
+  inferSchedule: (payload) => request('POST', '/schedules/infer', payload),
+  runSchedule: (id) => request('POST', `/schedules/${encodeURIComponent(id)}/run`, {}),
+  getSchedule: (id) => request('GET', `/schedules/${encodeURIComponent(id)}`),
+  updateSchedule: (id, payload) => request('PATCH', `/schedules/${encodeURIComponent(id)}`, payload),
+  deleteSchedule: (id) => request('DELETE', `/schedules/${encodeURIComponent(id)}`),
+  workfolkStatus: () => request('GET', '/workfolk/status'),
+  workfolkWorkers: (includeRetired = false) => request('GET', `/workfolk/workers${includeRetired ? '?includeRetired=true' : ''}`),
+  workfolkDispatch: (payload) => request('POST', '/workfolk/dispatch', payload),
+  workfolkJob: (id) => request('GET', `/workfolk/jobs/${encodeURIComponent(id)}`)
 };
 
 /**

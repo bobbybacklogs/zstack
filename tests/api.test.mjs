@@ -92,6 +92,7 @@ async function bootServer(options = {}) {
   const projectsPath = join(dir, 'projects.json');
   const overridesPath = join(dir, 'overrides.json');
   const chatsPath = join(dir, 'chats.json');
+  const schedulesPath = options.schedulesPath ?? join(dir, 'schedules.json');
   const budgetPath = options.budgetPath ?? join(dir, 'budget.json');
   const zstack = options.zstack ?? stubZStack(options);
   const started = await startServer({
@@ -101,7 +102,9 @@ async function bootServer(options = {}) {
     projectsPath,
     overridesPath,
     chatsPath,
+    schedulesPath,
     budgetPath,
+    enableScheduler: options.enableScheduler ?? false,
     apiToken: options.apiToken,
     fetchModelHitchState: options.fetchModelHitchState
   });
@@ -121,6 +124,7 @@ async function bootServer(options = {}) {
     ...started,
     projectsPath,
     historyPath,
+    schedulesPath,
     budgetPath,
     api,
     rawApi,
@@ -767,5 +771,125 @@ describe('HTTP API', () => {
       }
     });
   });
+
+  describe('Schedules HTTP API', () => {
+    it('creates, lists, gets, patches, runs, and deletes schedules', async () => {
+      const s = await bootServer();
+      const repoDir = initGitRepo();
+
+      try {
+        // 1. Initial list is empty
+        const emptyRes = await s.api('/schedules');
+        assert.equal(emptyRes.status, 200);
+        const emptyDoc = await emptyRes.json();
+        assert.equal(emptyDoc.ok, true);
+        assert.deepEqual(emptyDoc.schedules, []);
+
+        // 2. Infer schedule from text
+        const inferRes = await s.api('/schedules/infer', jsonBody({
+          prompt: 'Every morning at 9am check for open PRs and test failures'
+        }));
+        assert.equal(inferRes.status, 200);
+        const inferDoc = await inferRes.json();
+        assert.equal(inferDoc.ok, true);
+        assert.equal(inferDoc.inferred.matched, true);
+        assert.equal(inferDoc.inferred.cron, '0 9 * * *');
+        assert.equal(inferDoc.inferred.cleanedPrompt, 'Check for open PRs and test failures');
+
+        // 3. Create schedule
+        const createRes = await s.api('/schedules', jsonBody({
+          name: 'Morning PR Check',
+          cron: '0 9 * * 1-5',
+          prompt: 'Check for open PRs',
+          workspace: repoDir,
+          policy: 'read-only'
+        }));
+        assert.equal(createRes.status, 201);
+        const createDoc = await createRes.json();
+        assert.equal(createDoc.ok, true);
+        assert.ok(createDoc.schedule.id.startsWith('sched-'));
+        assert.equal(createDoc.schedule.name, 'Morning PR Check');
+        assert.equal(createDoc.schedule.cron, '0 9 * * 1-5');
+        assert.equal(createDoc.schedule.enabled, true);
+        const schedId = createDoc.schedule.id;
+
+        // 4. List now contains created schedule
+        const listRes = await s.api('/schedules');
+        assert.equal(listRes.status, 200);
+        const listDoc = await listRes.json();
+        assert.equal(listDoc.schedules.length, 1);
+        assert.equal(listDoc.schedules[0].id, schedId);
+
+        // 5. Get schedule by ID
+        const getRes = await s.api(`/schedules/${encodeURIComponent(schedId)}`);
+        assert.equal(getRes.status, 200);
+        const getDoc = await getRes.json();
+        assert.equal(getDoc.schedule.id, schedId);
+
+        // 6. Patch schedule
+        const patchRes = await s.api(`/schedules/${encodeURIComponent(schedId)}`, {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            name: 'Updated Morning Check',
+            cron: '0 10 * * 1-5',
+            enabled: false
+          })
+        });
+        assert.equal(patchRes.status, 200);
+        const patchDoc = await patchRes.json();
+        assert.equal(patchDoc.schedule.name, 'Updated Morning Check');
+        assert.equal(patchDoc.schedule.cron, '0 10 * * 1-5');
+        assert.equal(patchDoc.schedule.enabled, false);
+
+        // 7. Manual trigger via POST /api/schedules/:id/run
+        const runRes = await s.api(`/schedules/${encodeURIComponent(schedId)}/run`, {
+          method: 'POST'
+        });
+        assert.equal(runRes.status, 200);
+        const runDoc = await runRes.json();
+        assert.equal(runDoc.ok, true);
+        assert.equal(runDoc.status, 'triggered');
+        assert.ok(runDoc.runId);
+
+        // 8. Delete schedule
+        const delRes = await s.api(`/schedules/${encodeURIComponent(schedId)}`, {
+          method: 'DELETE'
+        });
+        assert.equal(delRes.status, 200);
+        const delDoc = await delRes.json();
+        assert.equal(delDoc.deleted, schedId);
+
+        // 9. Verified deleted
+        const afterDelRes = await s.api(`/schedules/${encodeURIComponent(schedId)}`);
+        assert.equal(afterDelRes.status, 404);
+      } finally {
+        await s.close();
+      }
+    });
+
+    it('validates schedule input and rejects bad cron or missing project', async () => {
+      const s = await bootServer();
+      try {
+        // Bad cron
+        const badCronRes = await s.api('/schedules', jsonBody({
+          cron: 'bad cron string',
+          prompt: 'Do work'
+        }));
+        assert.equal(badCronRes.status, 400);
+
+        // Non-existent project
+        const badProjRes = await s.api('/schedules', jsonBody({
+          cron: '0 9 * * *',
+          prompt: 'Do work',
+          projectId: 'non-existent-proj'
+        }));
+        assert.equal(badProjRes.status, 404);
+      } finally {
+        await s.close();
+      }
+    });
+  });
 });
+
 

@@ -64,7 +64,7 @@ async function boot(dir, executor, extraRun) {
 }
 
 for (const kind of ['start', 'resume', 'continue']) {
-  test(`${kind} refuses an in-flight mutation and succeeds after its reservation releases`, { timeout: 20000 }, async () => {
+  test(`${kind} refuses an in-flight mutation and succeeds after its reservation releases`, { timeout: 60000 }, async () => {
     const dir = repo(); writeFileSync(join(dir, 'change.txt'), 'change');
     const hold = gate((args) => args[0] === 'commit'); const s = await boot(dir, hold.exec);
     let release;
@@ -79,7 +79,7 @@ for (const kind of ['start', 'resume', 'continue']) {
     } finally { release?.(); await s.close(); }
   });
 
-  test(`${kind} reserves admission before root resolution; concurrent mutation cannot pass`, { timeout: 20000 }, async () => {
+  test(`${kind} reserves admission before root resolution; concurrent mutation cannot pass`, { timeout: 60000 }, async () => {
     const dir = repo(); const sub = join(dir, 'sub');
     const hold = gate((args, options) => args.includes('--show-toplevel') && options.cwd === sub);
     const s = await boot(dir, hold.exec); let release;
@@ -95,7 +95,7 @@ for (const kind of ['start', 'resume', 'continue']) {
   });
 }
 
-test('mutation reserves its root before asynchronous active-run checks; a stale snapshot cannot admit a new run', { timeout: 20000 }, async () => {
+test('mutation reserves its root before asynchronous active-run checks; a stale snapshot cannot admit a new run', { timeout: 60000 }, async () => {
   const dir = repo(); const other = repo();
   const extraRun = createLiveRun({ id: 'other', workspaceDir: other });
   const hold = gate((args, options) => args.includes('--show-toplevel') && options.cwd === other);

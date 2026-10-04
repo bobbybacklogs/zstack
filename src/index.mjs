@@ -15,3 +15,4 @@ export * from './projects.mjs';
 export * from './chats.mjs';
 export * from './overrides.mjs';
 export * from './skill.mjs';
+export * from './workfolk.mjs';

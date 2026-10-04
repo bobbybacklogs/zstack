@@ -79,6 +79,23 @@ import {
   newMessageId,
   CHAT_MAX_MESSAGES
 } from './chats.mjs';
+import {
+  readSchedules,
+  createSchedule,
+  updateSchedule,
+  deleteSchedule,
+  findSchedule,
+  inferScheduleFromText,
+  schedulesPath,
+  Scheduler
+} from './schedules.mjs';
+import {
+  getWorkfolkStatus,
+  fetchWorkfolkRoster,
+  dispatchWorkfolkTask,
+  getWorkfolkJobStatus,
+  pollWorkfolkJob
+} from './workfolk.mjs';
 
 /** Where the browser client lives. */
 export const WEB_ROOT = join(ZSTACK_ROOT, 'web');
@@ -263,7 +280,12 @@ const FIXED_ROUTES = Object.freeze({
   '/api/github': ['GET'],
   '/api/github/sync': ['POST'],
   '/api/github/repos': ['PUT'],
-  '/api/github/git': ['POST']
+  '/api/github/git': ['POST'],
+  '/api/schedules': ['GET', 'POST'],
+  '/api/schedules/infer': ['POST'],
+  '/api/workfolk/status': ['GET'],
+  '/api/workfolk/workers': ['GET'],
+  '/api/workfolk/dispatch': ['POST']
 });
 
 function positiveInt(value, fallback) {
@@ -553,6 +575,15 @@ export function createApp(options = {}) {
       return activate();
     } finally { resolvingRunAdmissions--; }
   };
+  const schedulesFile = options.schedulesPath;
+  const scheduler = options.scheduler || new Scheduler({
+    schedulesPath: schedulesFile,
+    admitRun,
+    registry,
+    findProject: (id, p) => findProject(id, p || projectsFile),
+    projectsPath: projectsFile,
+    tickIntervalMs: options.schedulerTickIntervalMs || 30000
+  });
   const startedAt = Date.now();
   const boundHost = options.host || DEFAULT_HOST;
   const apiToken = options.apiToken ?? options.token ?? process.env.ZSTACK_API_TOKEN ?? null;
@@ -2257,10 +2288,211 @@ export function createApp(options = {}) {
       return;
     }
 
+    // --- schedules list and create -----------------------------------------
+    if (path === '/api/schedules') {
+      if (method === 'GET') {
+        const { schedules } = readSchedules(schedulesFile);
+        sendJson(res, 200, { ok: true, schedules });
+        return;
+      }
+      if (method === 'POST') {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          fail(res, err.status || 400, err.message);
+          return;
+        }
+        try {
+          if (body.projectId || body.project) {
+            const pid = (body.projectId || body.project).trim();
+            const proj = findProject(pid, projectsFile);
+            if (!proj) {
+              fail(res, 404, `No project with id "${pid}".`, { problems: [`No project with id "${pid}".`] });
+              return;
+            }
+          }
+          const schedule = createSchedule(body, schedulesFile);
+          sendJson(res, 201, { ok: true, schedule });
+        } catch (err) {
+          fail(res, 400, err.message, { problems: err.problems || [err.message] });
+        }
+        return;
+      }
+    }
+
+    // --- infer schedule from prompt ----------------------------------------
+    if (path === '/api/schedules/infer' && method === 'POST') {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      if (!body.prompt || typeof body.prompt !== 'string') {
+        fail(res, 400, 'Prompt must be a non-empty string.');
+        return;
+      }
+      const inferred = inferScheduleFromText(body.prompt);
+      sendJson(res, 200, { ok: true, inferred });
+      return;
+    }
+
+    // --- trigger single schedule immediately ------------------------------
+    const scheduleRunMatch = path.match(/^\/api\/schedules\/([^/]+)\/run$/);
+    if (scheduleRunMatch) {
+      if (method !== 'POST') {
+        fail(res, 405, `${method} is not allowed for ${path}. Allowed: POST.`);
+        return;
+      }
+      const id = decodeURIComponent(scheduleRunMatch[1]);
+      const sched = findSchedule(id, schedulesFile);
+      if (!sched) {
+        fail(res, 404, `No schedule with id "${id}".`);
+        return;
+      }
+      const outcome = await scheduler.triggerSchedule(sched);
+      if (outcome.ok) {
+        sendJson(res, 200, { ok: true, ...outcome });
+      } else {
+        const status = outcome.status === 'skipped-busy' ? 409 : 500;
+        fail(res, status, outcome.error || 'Failed to trigger schedule.', outcome);
+      }
+      return;
+    }
+
+    // --- single schedule: get, patch, delete -------------------------------
+    const scheduleMatch = path.match(/^\/api\/schedules\/([^/]+)$/);
+    if (scheduleMatch) {
+      const id = decodeURIComponent(scheduleMatch[1]);
+      if (method === 'GET') {
+        const sched = findSchedule(id, schedulesFile);
+        if (!sched) {
+          fail(res, 404, `No schedule with id "${id}".`);
+          return;
+        }
+        sendJson(res, 200, { ok: true, schedule: sched });
+        return;
+      }
+      if (method === 'PATCH') {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          fail(res, err.status || 400, err.message);
+          return;
+        }
+        try {
+          if (body.projectId || body.project) {
+            const pid = (body.projectId || body.project).trim();
+            const proj = findProject(pid, projectsFile);
+            if (!proj) {
+              fail(res, 404, `No project with id "${pid}".`, { problems: [`No project with id "${pid}".`] });
+              return;
+            }
+          }
+          const updated = updateSchedule(id, body, schedulesFile);
+          if (!updated) {
+            fail(res, 404, `No schedule with id "${id}".`);
+            return;
+          }
+          sendJson(res, 200, { ok: true, schedule: updated });
+        } catch (err) {
+          fail(res, 400, err.message, { problems: err.problems || [err.message] });
+        }
+        return;
+      }
+      if (method === 'DELETE') {
+        const deleted = deleteSchedule(id, schedulesFile);
+        if (!deleted) {
+          fail(res, 404, `No schedule with id "${id}".`);
+          return;
+        }
+        sendJson(res, 200, { ok: true, deleted: id });
+        return;
+      }
+      fail(res, 405, `${method} is not allowed for ${path}. Allowed: GET, PATCH, DELETE.`);
+      return;
+    }
+
+    // --- workfolk status ----------------------------------------------------
+    if (path === '/api/workfolk/status' && method === 'GET') {
+      const status = await getWorkfolkStatus();
+      sendJson(res, 200, { ok: true, ...status });
+      return;
+    }
+
+    // --- workfolk workers roster -------------------------------------------
+    if (path === '/api/workfolk/workers' && method === 'GET') {
+      const includeRetired = url.searchParams.get('includeRetired') === 'true';
+      try {
+        const workers = await fetchWorkfolkRoster({ includeRetired });
+        sendJson(res, 200, { ok: true, workers });
+      } catch (err) {
+        fail(res, 502, err.message, { detail: 'Could not fetch workers from Workfolk gateway.' });
+      }
+      return;
+    }
+
+    // --- workfolk task dispatch --------------------------------------------
+    if (path === '/api/workfolk/dispatch' && method === 'POST') {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      const tag = body.worker_tag || body.tag || body.worker;
+      const task = body.task;
+      if (!tag || typeof tag !== 'string' || !tag.trim()) {
+        fail(res, 400, 'worker_tag is required.');
+        return;
+      }
+      if (!task || typeof task !== 'string' || !task.trim()) {
+        fail(res, 400, 'task is required.');
+        return;
+      }
+      try {
+        const dispatchResult = await dispatchWorkfolkTask(tag, task);
+        if (body.wait === true) {
+          const timeoutMs = Number(body.timeoutMs) || 60000;
+          const intervalMs = body.intervalMs ? Number(body.intervalMs) : undefined;
+          const finished = await pollWorkfolkJob(dispatchResult.job_id, { timeoutMs, intervalMs });
+          sendJson(res, 200, { ok: true, ...finished });
+          return;
+        }
+        sendJson(res, 202, { ok: true, ...dispatchResult });
+      } catch (err) {
+        const status = err.status || (err.message.includes('token') ? 401 : 502);
+        fail(res, status, err.message);
+      }
+      return;
+    }
+
+    // --- workfolk job status -----------------------------------------------
+    const workfolkJobMatch = path.match(/^\/api\/workfolk\/jobs\/([^/]+)$/);
+    if (workfolkJobMatch) {
+      if (method !== 'GET') {
+        fail(res, 405, `${method} is not allowed for ${path}. Allowed: GET.`);
+        return;
+      }
+      const jobId = decodeURIComponent(workfolkJobMatch[1]);
+      try {
+        const job = await getWorkfolkJobStatus(jobId);
+        sendJson(res, 200, { ok: true, ...job });
+      } catch (err) {
+        const status = err.status || 502;
+        fail(res, status, err.message);
+      }
+      return;
+    }
+
     fail(res, 404, `No such endpoint: ${method} ${path}`);
   };
 
-  return { handler, registry, zstack, historyPath: historyFile, projectsPath: projectsFile, overridesPath: overridesFile, chatsPath: chatsFile, githubPath: githubFile };
+  return { handler, registry, zstack, scheduler, historyPath: historyFile, projectsPath: projectsFile, overridesPath: overridesFile, chatsPath: chatsFile, schedulesPath: schedulesFile, githubPath: githubFile };
 }
 
 /**
@@ -2274,6 +2506,9 @@ export function startServer(options = {}) {
   const host = options.host || DEFAULT_HOST;
   const port = options.port ?? DEFAULT_PORT;
   const app = createApp(options);
+  if (options.enableScheduler !== false) {
+    app.scheduler.start();
+  }
   const server = createServer((req, res) => {
     app.handler(req, res).catch((err) => {
       if (res.headersSent) {
@@ -2284,7 +2519,10 @@ export function startServer(options = {}) {
     });
   });
 
-  server.on('close', () => app.registry.shutdown());
+  server.on('close', () => {
+    app.scheduler.stop();
+    app.registry.shutdown();
+  });
 
   return new Promise((resolvePromise, rejectPromise) => {
     server.once('error', (err) => {
