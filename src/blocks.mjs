@@ -99,13 +99,15 @@ function propsFrom(record) {
     ['duration', 'Duration', record.durationText],
     ['tokens', 'Tokens', record.tokensText],
     ['turns', 'Turns', record.turns],
+    ['turnBudget', 'Turn budget', record.turnBudgetText],
     ['toolCalls', 'Tool calls', record.toolCalls],
     ['failedTools', 'Failed calls', record.failedTools],
     ['declinedTools', 'Declined calls', record.declinedTools],
     ['policy', 'Policy', record.policy],
     ['workspace', 'Workspace', record.workspace],
     ['files', 'Attached files', record.files?.length ? record.files.join(', ') : null],
-    ['promptChars', 'Prompt length', record.promptChars ? `${record.promptChars} chars` : null]
+    ['promptChars', 'Prompt length', record.promptChars ? `${record.promptChars} chars` : null],
+    ['prUrl', 'Pull request', record.prUrl]
   ];
   return entries
     .filter(([, , value]) => value !== null && value !== undefined && value !== '')
@@ -113,12 +115,74 @@ function propsFrom(record) {
 }
 
 /**
+ * The turn budget as one line.
+ *
+ * A run is driven a turn at a time and continues while it still has work, so
+ * the size the reader picked is a starting point rather than a limit. Printing
+ * "31 of 8" for a run that outgrew its size would be arithmetic the reader has
+ * to interpret; naming what happened is the honest version, and the count is
+ * still there for anyone who wants it.
+ */
+export function turnBudgetText(used, maxTurns, limitReached = false, extensions = 0) {
+  const chosen = Number(maxTurns);
+  if (!Number.isFinite(chosen) || chosen <= 0) return null;
+  const spent = Number(used) || 0;
+  if (Number(extensions) > 0 || spent > chosen) {
+    if (limitReached) return `${spent} turns, stopped at the ceiling`;
+    return `${spent} turns, continued past ${chosen}`;
+  }
+  return `${spent} of ${chosen}${limitReached ? ' (limit reached)' : ''}`;
+}
+
+/**
+ * The continuation state of a run, or null when there is nothing to say.
+ *
+ * `canContinue` is the honest answer to "can I get more of this": it needs a
+ * saved session to resume, which only exists for runs started after zstack
+ * began passing `--save-session`. An old record has a budget and a turn count
+ * but no session, so it reports the budget and offers nothing.
+ */
+function turnBudgetOf(record) {
+  const chosen = Number(record?.maxTurns);
+  // No size recorded means nothing to report. The plain turn count is already
+  // its own property, and a second line repeating it is noise.
+  if (!Number.isFinite(chosen) || chosen <= 0) return null;
+  const used = Number(record?.turns) || 0;
+  const extensions = Number(record?.extensions) || 0;
+  const limitReached = record?.turnLimitReached === true;
+  const sessionId = record?.sessionId ?? null;
+  const hasSession = typeof sessionId === 'string' && sessionId !== '';
+  return {
+    maxTurns: chosen,
+    used,
+    extensions,
+    limitReached,
+    paused: record?.paused === true,
+    sessionId,
+    // Whether the *same* run can be picked up again. True only where the run is
+    // still held in memory: resuming a pause continues the live run, so a
+    // restarted server can offer the session but not the same run.
+    inPlace: false,
+    // A paused run is the case this exists for: it stopped on purpose with its
+    // session saved, so resuming is exactly what the reader wants next. A run
+    // that hit the ceiling can also be continued, which is a different reason
+    // for the same button.
+    canContinue: hasSession && (record?.paused === true || limitReached)
+  };
+}
+
+/**
  * Status and tone for a completed run.
  *
  * `ok: false` is the run's own verdict. A run that finished but changed nothing
  * is still ok, which is why this does not infer failure from an empty diff.
+ *
+ * A paused run is neither: it did not fail, and calling it ok would say a task
+ * that is sitting half-done is finished. It keeps its own status so a list of
+ * runs shows at a glance which one is waiting on you.
  */
 function statusFrom(entry) {
+  if (entry.paused === true) return { status: 'paused', tone: 'paused' };
   if (entry.ok === false) return { status: 'failed', tone: 'error' };
   return { status: 'ok', tone: 'ok' };
 }
@@ -163,6 +227,14 @@ export function projectStoredRun(entry) {
 
   const steps = Array.isArray(entry?.steps) ? entry.steps : [];
   const startStep = steps.find((s) => s && s.kind === 'start') || null;
+
+  // Why the run failed, stated above the progression: a stored run that can only
+  // report its exit code leaves the reader with the one fact they already had.
+  // Live runs carry the same text as a notice written at the end of the run.
+  if (status === 'failed' && typeof entry?.error === 'string' && entry.error.trim() !== '') {
+    blocks.push({ kind: 'notice', tone: 'error', text: entry.error });
+  }
+
   if (agentic && steps.length === 0) {
     blocks.push({ kind: 'notice', tone: 'neutral', text: 'No progression was recorded for this run.' });
   } else if (steps.length > 0) {
@@ -193,7 +265,14 @@ export function projectStoredRun(entry) {
           outcome: step.outcome || 'unknown',
           tone: outcomeTone(step.outcome),
           durationMs: step.durationMs ?? null,
-          durationText: formatDuration(step.durationMs)
+          durationText: formatDuration(step.durationMs),
+          // Stored only for failures, and only when it fits the run's budget.
+          // Gated on the outcome for the same reason as the live path.
+          output: step.outcome !== 'ok' && step.outcome !== 'dry-run'
+            && typeof step.output === 'string' && step.output.trim() !== ''
+            ? step.output
+            : null,
+          outputTruncated: step.outputTruncated === true
         });
         break;
       case 'approval':
@@ -259,14 +338,16 @@ export function projectStoredRun(entry) {
     durationText: formatDuration(entry?.durationMs),
     tokensText: formatTokens(entry?.usage),
     turns: entry?.turns ?? null,
+    turnBudgetText: turnBudgetText(entry?.turns, entry?.maxTurns, entry?.turnLimitReached === true, entry?.extensions),
     toolCalls: entry?.toolCalls ?? null,
     failedTools: entry?.failedTools ?? null,
     declinedTools: entry?.declinedTools ?? null,
-    policy: agentic ? (entry?.applied ? 'apply' : 'read-only') : null,
+    policy: agentic ? (entry?.policy || (entry?.applied ? 'apply' : 'read-only')) : null,
     workspace: entry?.workspace || startStep?.workspace || null,
     projectId: entry?.projectId ?? null,
     files: entry?.files,
-    promptChars: entry?.promptChars
+    promptChars: entry?.promptChars,
+    prUrl: entry?.prUrl || null
   };
 
   return {
@@ -283,8 +364,12 @@ export function projectStoredRun(entry) {
     tone,
     at: entry?.ts || null,
     projectId: record.projectId,
+    workspace: record.workspace,
+    prUrl: record.prUrl,
     props: propsFrom(record),
     blocks,
+    turnBudget: turnBudgetOf(entry),
+    continuationOf: entry?.continuationOf ?? null,
     truncated: !!entry?.stepsTruncated,
     counts: {
       turns: entry?.turns ?? null,
@@ -358,6 +443,19 @@ export function createLiveRun(request = {}) {
     proseTurn: null,
     startBlockIndex: null,
     turns: 0,
+    // A run that reaches its budget is continued rather than stopped, and each
+    // continuation is a fresh harness session whose turn numbers restart at 1.
+    // The offsets are what make the page count turns, tokens, and time across
+    // the whole run instead of showing turn 3 four separate times.
+    turnOffset: 0,
+    tokenOffset: 0,
+    durationOffset: 0,
+    extensions: 0,
+    grantedTurns: request.maxTurns ?? null,
+    // Pause is a request the run honours between turns, and `paused` is the
+    // state it reaches when it does.
+    pauseRequested: false,
+    paused: false,
     toolCalls: 0,
     failed: 0,
     declined: 0,
@@ -378,6 +476,16 @@ export function createLiveRun(request = {}) {
 function push(run, block) {
   run.blocks.push(block);
   return run.blocks.length - 1;
+}
+
+/**
+ * Append a block to a live run from outside this module.
+ *
+ * The registry narrates an extension into the run's own body, and it lives in a
+ * different module, so it needs a way in that is not the private `push`.
+ */
+export function appendLiveBlock(run, block) {
+  return push(run, block);
 }
 
 /**
@@ -402,18 +510,25 @@ export function applyLiveEvent(run, event) {
       run.playbook = event.playbook ?? run.playbook;
       run.status = 'running';
       run.tone = 'running';
-      const index = push(run, {
-        kind: 'callout',
-        tone: 'info',
-        text: `Running ${run.model || 'the configured model'}`,
-        detail: run.workspace ? `in ${run.workspace}` : null
-      });
-      run.startBlockIndex = index;
-      changed.push({ index, block: run.blocks[index] });
+      // Only the first segment announces itself. An extension resumes the same
+      // session, so a second "Running model X" callout would read as a second
+      // run starting when the whole point is that it is one run continuing.
+      if (run.startBlockIndex === null) {
+        const index = push(run, {
+          kind: 'callout',
+          tone: 'info',
+          text: `Running ${run.model || 'the configured model'}`,
+          detail: run.workspace ? `in ${run.workspace}` : null
+        });
+        run.startBlockIndex = index;
+        changed.push({ index, block: run.blocks[index] });
+      }
       break;
     }
     case 'turn': {
-      run.turns = Math.max(run.turns, Number(event.turn) || 0);
+      // Offset by the segments already spent: a resumed session numbers its
+      // turns from 1 again, and the run's own count must not restart with it.
+      run.turns = Math.max(run.turns, run.turnOffset + (Number(event.turn) || 0));
       // A new turn closes the previous turn's prose. Leaving it open would keep
       // the streaming flag set on a block nothing will ever append to again,
       // which renders as a cursor that blinks forever.
@@ -423,9 +538,13 @@ export function applyLiveEvent(run, event) {
       }
       run.proseIndex = null;
       run.proseTurn = null;
+      // Labelled with the run's own turn number, not the segment's. A resumed
+      // session numbers from 1 again, so the raw value printed a second
+      // "Turn 1" halfway down the page and read as the run going backwards.
+      const turnNumber = run.turnOffset + (Number(event.turn) || 0);
       const index = push(run, {
         kind: 'divider',
-        label: `Turn ${event.turn ?? '?'}`,
+        label: `Turn ${event.turn === undefined || event.turn === null ? '?' : turnNumber}`,
         tokens: Number.isFinite(event.tokens) ? event.tokens.toLocaleString('en-US') : null
       });
       changed.push({ index, block: run.blocks[index] });
@@ -468,7 +587,16 @@ export function applyLiveEvent(run, event) {
         durationMs: event.durationMs ?? null,
         durationText: formatDuration(event.durationMs),
         truncated: !!event.truncated,
-        note: event.note ?? null
+        note: event.note ?? null,
+        // The call's own text, which the harness sends only for a failure. It is
+        // why a failed call can say what went wrong instead of only how long it
+        // took to go wrong. Gated on the outcome rather than on the field being
+        // present: a successful call's body is the work itself, and a page that
+        // took it when offered would put every file a run read on screen.
+        output: event.outcome !== 'ok' && event.outcome !== 'dry-run'
+          && typeof event.output === 'string' && event.output.trim() !== ''
+          ? event.output
+          : null
       });
       changed.push({ index, block: run.blocks[index] });
       break;
@@ -486,9 +614,19 @@ export function applyLiveEvent(run, event) {
       break;
     }
     case 'done': {
-      run.turns = event.turns ?? run.turns;
-      run.tokens = event.tokens ?? run.tokens;
-      run.durationMs = event.durationMs ?? run.durationMs;
+      // Same offset rule as a turn event: the segment reports its own turns,
+      // tokens, and duration, and the run reports the sum of every segment.
+      // Overwriting with the segment's numbers would make a twenty-turn run
+      // report the cost of its last turn.
+      if (Number.isFinite(event.turns)) {
+        run.turns = Math.max(run.turns, run.turnOffset + event.turns);
+      }
+      if (Number.isFinite(event.tokens)) {
+        run.tokens = (run.tokenOffset || 0) + event.tokens;
+      }
+      if (Number.isFinite(event.durationMs)) {
+        run.durationMs = (run.durationOffset || 0) + event.durationMs;
+      }
       run.sessionId = event.sessionId ?? null;
       run.doneSeen = true;
       run.endedAt = Date.now();
@@ -529,7 +667,13 @@ export function finishLiveRun(run, outcome = {}) {
   }
 
   run.endedAt = run.endedAt ?? Date.now();
-  if (outcome.cancelled) {
+  if (outcome.paused) {
+    // Paused is not stopped and not finished. The work is intact, the session
+    // is saved, and the run is waiting for someone to say continue — so it gets
+    // its own status rather than borrowing the colour of either ending.
+    run.status = 'paused';
+    run.tone = 'paused';
+  } else if (outcome.cancelled) {
     // Stopping a run is not the run failing. Reporting it as an error would
     // teach the reader to distrust the error colour.
     run.status = 'cancelled';
@@ -562,6 +706,15 @@ export function finishLiveRun(run, outcome = {}) {
       kind: 'notice',
       tone: 'neutral',
       text: 'Stopped on request. The harness process was terminated.'
+    });
+    changed.push({ index, block: run.blocks[index] });
+  } else if (run.status === 'paused') {
+    const index = push(run, {
+      kind: 'notice',
+      tone: 'paused',
+      // Says the two things a reader needs to decide what to do next: the work
+      // survived, and nothing is being spent while it waits.
+      text: `Paused after ${run.turns || 'the current'} turn${run.turns === 1 ? '' : 's'}. The session is saved, so resuming continues from here.`
     });
     changed.push({ index, block: run.blocks[index] });
   }
@@ -605,13 +758,20 @@ export function liveRunToPage(run) {
     durationText: formatDuration(run.endedAt ? run.endedAt - run.startedAt : null),
     tokensText: Number.isFinite(run.tokens) ? run.tokens.toLocaleString('en-US') : null,
     turns: run.turns || null,
+    turnBudgetText: turnBudgetText(
+      run.turns,
+      run.request?.maxTurns,
+      run.turnLimitReached === true,
+      run.extensions
+    ),
     toolCalls: run.toolCalls || null,
     failedTools: run.failed || null,
     declinedTools: run.declined || null,
     policy: run.request?.apply ? 'apply' : run.request?.autoApproveSafe === false ? 'strict' : 'read-only',
     workspace: run.workspace,
     files: run.request?.files,
-    promptChars: run.prompt ? run.prompt.length : null
+    promptChars: run.prompt ? run.prompt.length : null,
+    prUrl: run.prUrl || null
   };
   // The archived twin carries this as a record field; the live page carries
   // it alongside, so a run started under a project names it while running.
@@ -636,11 +796,22 @@ export function liveRunToPage(run) {
     // never the raw request, or a moved live run would report where it started
     // instead of where it now lists.
     projectId: run.projectId ?? null,
+    workspace: run.workspace ?? null,
+    prUrl: run.prUrl || null,
     props: [
       { key: 'prompt', label: 'Prompt', value: run.prompt },
       ...propsFrom(record)
     ],
     blocks: run.blocks.map((b) => ({ ...b })),
+    turnBudget: turnBudgetOf({
+      turns: run.turns,
+      maxTurns: run.request?.maxTurns,
+      turnLimitReached: run.turnLimitReached,
+      sessionId: run.sessionId,
+      extensions: run.extensions,
+      paused: run.paused
+    }),
+    continuationOf: run.request?.continuationOf ?? null,
     truncated: false,
     counts: {
       turns: run.turns,

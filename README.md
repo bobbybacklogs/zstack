@@ -17,6 +17,8 @@ An opinionated Agent Operating System, TypeScript SDK, and CLI for rigorous soft
 - **15 Standard Operating Playbooks**: Structured execution recipes for features, bug fixes, refactoring, performance forensics, and pull requests.
 - **20 Durable Principles**: Non-negotiable engineering rules (laziness protocol, root cause remediation, boundary discipline, context preservation) cited against concrete code changes.
 - **Local UI**: `zstack serve` opens runs as pages in a browser, streams a run in progress, and starts new ones. Same records the CLI writes, so a run started in the UI appears in `zstack history`.
+- **Pinned-model Chat**: a chat page in the UI listing conversations kept on the server. One model from the live catalogue is pinned per chat, free models included, and each turn streams token by token. A chat is plain: no playbook, no tools, no workspace, and it never lands in run history.
+- **Prompt Optimization**: the run composer has an Optimize button that rewrites your raw text into a clearer task prompt grounded in the playbook the request matches, in place and with Undo. It only shapes text: nothing is dispatched until you send.
 - **Dynamic Workload Routing**: Routes tasks to the optimal model based on available providers (OpenCode Zen/Go, OpenAI, Anthropic, Gemini, DeepSeek).
 - **Adversarial Multi-Family Panels**: Concurrently queries models across distinct provider families (`/arena`, `/panel`) to surface architectural blind spots.
 - **Unified SDK & CLI**: Programmatic TypeScript API and terminal binary for direct task execution, prompt classification, and rule synchronization.
@@ -78,6 +80,32 @@ When connected to ModelHitch, `zstack` inspects available providers and assigns 
 | **adversarial panel** | `claude-sonnet-4-6`, `gpt-5.5`, `deepseek-v4-pro` | `openai/gpt-5.6-luna`, `gemini-3.6-flash`, `deepseek-v4-flash` | Parallel review across divergent model families. |
 
 ---
+
+## Local Git work
+
+Start `zstack serve` and open **GitHub repos** to sync your catalogue and set
+each repo's local clone path. Authentication uses `GITHUB_TOKEN` or `GH_TOKEN`
+from the environment, then the server's `.env`, then `gh auth token`. Run
+`gh auth login` first if using the CLI fallback. The fallback result, including
+failure, is cached until the server restarts. Tokens are never sent to the browser.
+
+Cloned repo rows and run pages with a recorded workspace offer:
+
+- **Status** shows the current branch, tracking branch, ahead/behind counts and changes.
+- **Pull** runs `git pull --ff-only --no-rebase`. Divergence is refused.
+- **Merge** takes a local branch or `origin/branch`. Remote branches fetch origin
+  first. A failed merge is aborted so conflicts are not left in the working tree.
+- **Commit entire tree** stages all changes, including untracked files and edits
+  unrelated to the run, then commits with your message. This is not a run-only commit.
+
+Pull and merge require a clean tree, including untracked files. Existing conflicts,
+merges, rebases and cherry-picks must be resolved in the terminal first. Mutations
+are refused while this server has an active run in the same canonical repository.
+Operations from repo rows and run pages serialize per repository root, including
+subdirectory paths. This does not lock out external Git clients or other servers.
+Git must be on PATH and commits need a configured author identity. Git remote
+authentication uses your normal Git credentials, separately from catalogue sync.
+Nothing pushes, forces, or rewrites history.
 
 ## Installation
 
@@ -196,8 +224,44 @@ writes through `node -e fs.writeFileSync(...)` or a shell redirect changes the
 tree with no attributable call, and git is the artifact that does not care how
 the bytes were written.
 
-`--max-turns <n>` bounds the loop (harness default 8) and `--review` runs the
-read-only reviewer over the change afterwards.
+`--max-turns <n>` bounds the loop and `--review` runs the read-only reviewer over
+the change afterwards.
+
+Nobody knows how many turns a task needs, including the model, so zstack picks a
+starting size rather than making you guess one: 25 turns, against the harness's
+own 8. The size is where the run starts, not where it stops.
+
+**A run that reaches its size is continued, not cut off.** Stopping there throws
+away everything the model was holding mid-task, so zstack resumes the harness
+session and the run carries on: one run, one page, one growing body. A run may
+use at most 500 turns in total before zstack stops extending for real. When that
+ceiling is hit, the run page says so and offers to continue from the saved
+session.
+
+**Runs can be paused and resumed.** Pause asks the run to stop at the end of the
+turn in flight, which is the only place it can stop without losing work: the
+harness writes its session when its loop ends, so a pause that killed the process
+would leave nothing to resume from. That is what Stop does, and why Stop cannot
+be undone while Pause can. Resuming continues the same run from where it stopped,
+as often as you like.
+
+```bash
+zstack "Refactor the retry logic" --max-turns 60     # decide the starting size
+zstack "carry on and finish the refactor" --continue # resume a run that stopped
+```
+
+`--continue` resumes the most recent run that saved a session. It is for the runs
+pause cannot save: ones you stopped, or that errored.
+
+`--max-turns` and `--review` imply `--agent`, because a size or a reviewer only
+means something if the loop actually runs. They used to be accepted and ignored
+on a single completion.
+
+In the UI the size is the "How much work" picker: Quick look (8), Standard (25),
+Deep (60), Marathon (200), or a custom number. The label is the question you can
+actually answer. A project can carry its own default, which pre-fills the
+composer. A running run's page offers Pause and Stop side by side, and a paused
+one offers Resume.
 
 ### 4. Adversarial Multi-Family Panel Review
 
@@ -360,12 +424,22 @@ zstack serve --json                 # prints { ok, url } once the socket is boun
 
 What it does:
 
+- Opens on a dashboard: how many runs are going, how many failed today, one
+  row per project with its latest activity, and the newest runs. Every row is
+  a link to the page it summarizes. The full list lives one click down.
 - Lists runs newest first, merging runs still in flight with archived ones.
 - Opens any run as a page: turns, tool calls with outcomes and durations,
   approvals, the model's own words, and the files that changed.
 - Streams a run in progress token by token, patching the page in place.
 - Starts a run with controls for playbook, provider lane, workspace, max turns,
-  and approval policy.
+  and approval policy, plus an Optimize button that rewrites the prompt in the
+  composer into a clearer task prompt (with Undo) before you send it.
+- Chats with one pinned model, kept on the server and listed in the sidebar:
+  pick any model the bridge serves, free ones included, and talk turn by turn
+  with the reply streaming in as it is written. A chat is a plain conversation,
+  so it carries no playbook, no tools, and no workspace, and it never lands in
+  run history. Each conversation is stored at `~/.zstack/chats.json` and can be
+  re-opened from any browser, renamed, re-pinned, or deleted.
 - Shows bridge health, the active lane, and the resolved role-to-model mapping,
   and lets you change the budget tier, source, and lane.
 - Organizes runs into projects: a project is a name plus the directory it owns,

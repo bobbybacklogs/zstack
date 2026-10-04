@@ -13,10 +13,14 @@
  *
  *   run-start  { schema, at, task, model, provider, sessionId, workspace, playbook, approvals }
  *   text       { at, turn, text }
- *   tool       { at, turn, name, args, outcome, durationMs, truncated, bytes, note? }
+ *   tool       { at, turn, name, args, outcome, durationMs, truncated, bytes, note?, output? }
  *   approval   { at, tool, decision, risk?, reason? }
  *   turn       { at, turn, tokens, totalTokens }
  *   done       { at, turns, tokens, tools, durationMs, changes?, sessionId? }
+ *
+ * `tool.output` is the call's own text, present only when the outcome is a
+ * failure (`error`, `timeout`, `truncated`) and capped by the harness. It is what
+ * turns "subagent error · 4ms" into a sentence a reader can act on.
  *
  * The task is piped on stdin rather than passed as an argument: prompts contain
  * quotes, newlines, and Windows-hostile characters, and argv quoting is where a
@@ -251,6 +255,17 @@ export function runHarnessTask(options) {
     review = false,
     autoApproveSafe = false,
     harnessArgs = [],
+    /**
+     * Write the run's session to the harness state directory, and continue one.
+     *
+     * Saving is what makes a turn budget recoverable: a run that stops at its
+     * ceiling can be resumed with a bigger one instead of being thrown away and
+     * started again from the same prompt. zstack turns this on for its own runs
+     * because it is the one starting them on the reader's behalf, and a reader
+     * who did not choose the budget should not lose the work to it.
+     */
+    saveSession = true,
+    resume = null,
     onEvent,
     onStderr,
     timeoutMs = 0,
@@ -273,6 +288,11 @@ export function runHarnessTask(options) {
   const args = [...entry.args, '--json-events', '--plain'];
   if (model) args.push('--model', String(model));
   if (Number.isFinite(maxTurns) && maxTurns > 0) args.push('--max-turns', String(Math.floor(maxTurns)));
+  // Resuming restores the stored history, so the prompt is the *next*
+  // instruction rather than a repeat of the original one. It goes last because
+  // the harness reads a trailing positional as the task.
+  if (resume) args.push('--resume', String(resume));
+  if (saveSession) args.push('--save-session');
   if (review) args.push('--review');
   // Without this the harness declines every mutating call under a non-TTY stdin,
   // which is the safe default and exactly what a read-only analysis wants.
@@ -426,7 +446,12 @@ export function buildProgression(events, options = {}) {
           outcome: event.outcome,
           durationMs: event.durationMs ?? null,
           truncated: !!event.truncated,
-          bytes: event.bytes ?? null
+          bytes: event.bytes ?? null,
+          // A failed call's own text, which is what keeps "subagent error · 4ms"
+          // from being the whole story. Carried here rather than only onto the
+          // live blocks because the record is what a reader re-opens, and the
+          // live page is pruned from memory on a timer.
+          ...(typeof event.output === 'string' && event.output !== '' ? { output: event.output } : {})
         });
         break;
       }
@@ -478,7 +503,7 @@ export function buildProgression(events, options = {}) {
     fileChanges,
     tokens: done?.tokens ?? null,
     durationMs: done?.durationMs ?? null,
-    sessionId: done?.sessionId ?? null,
+    sessionId: done?.sessionId ?? steps.find((s) => s.kind === 'start')?.sessionId ?? null,
     /**
      * Model prose, one entry per turn that produced any, in turn order. Deltas
      * within a turn are already concatenated.
@@ -498,6 +523,33 @@ export function finalText(progression) {
 }
 
 /**
+ * The harness's own explanation of a failed run, or null when it gave none.
+ *
+ * A run can fail before it produces a single event — an expired key, a lane
+ * that is not reachable, a model that rejects the request — and the harness
+ * reports exactly that on stderr, where the human transcript lives. zstack used
+ * to drop it, so the page could only say the process exited non-zero: the one
+ * fact the reader needs was the one thing not carried across.
+ *
+ * The stderr transcript is human prose, so this picks the numbered failure line
+ * (`✖ ...`) the harness writes for the reason, falls back to the first
+ * `Error:`/`Exit` line, and returns null when the transcript says nothing worth
+ * showing. Returning null is deliberate: a caller that has no reason must keep
+ * its existing generic message rather than put a transcript in the UI.
+ */
+export function failureReasonFromStderr(stderr) {
+  const lines = String(stderr ?? '')
+    .split(/\r?\n/)
+    // The transcript is decorated: the renderer indents with a gutter marker and
+    // the harness prefixes its own notes with `[harness]`. Both are stripped so
+    // the line is judged on what it says, not on how it was drawn.
+    .map((line) => line.replace(/^[▌|]\s*/, '').replace(/^\[harness\]\s*/, '').trim())
+    .filter((line) => line.startsWith('✖') || line.startsWith('Error:') || line.startsWith('Exit '));
+  if (lines.length === 0) return null;
+  return lines[0].replace(/^✖\s*/, '').slice(0, 600);
+}
+
+/**
  * Why a run has no closing message, or null when it has one.
  *
  * An empty `content` is ambiguous on its own: the model may have run out of
@@ -507,7 +559,9 @@ export function finalText(progression) {
 export function explainEmptyContent(result) {
   if (result?.content && String(result.content).trim() !== '') return null;
   if (result?.turnLimitReached) {
-    return `The run stopped at the ${result.maxTurns}-turn limit before the model wrote a closing message. Raise --max-turns to let it finish.`;
+    // Continuing beats re-running: the session is saved, so the work resumes
+    // instead of starting over from the same prompt.
+    return `The run stopped at its ${result.maxTurns}-turn limit before the model wrote a closing message. Continue it with \`zstack --continue\`, or raise --max-turns for a fresh run.`;
   }
   if (result?.declinedTools > 0) {
     return `The model produced no closing message, and ${result.declinedTools} call${result.declinedTools === 1 ? ' was' : 's were'} declined. Re-run with --apply if the work needed to write.`;

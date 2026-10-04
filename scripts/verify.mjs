@@ -13,21 +13,29 @@ const EXIT = { OK: 0, FAIL: 1, USAGE: 2 };
 const HERMETIC_FILES = [
   'tests/blocks.test.mjs',
   'tests/budget.test.mjs',
+  'tests/chat.test.mjs',
+  'tests/chats.test.mjs',
   'tests/classify.test.mjs',
   'tests/cli-json.test.mjs',
   'tests/context.test.mjs',
   'tests/grader.test.mjs',
+  'tests/github.test.mjs',
+  'tests/git.test.mjs',
+  'tests/git-races.test.mjs',
   'tests/harness.test.mjs',
   'tests/history.test.mjs',
   'tests/manifest.test.mjs',
+  'tests/optimize.test.mjs',
   'tests/overrides.test.mjs',
   'tests/projects.test.mjs',
   'tests/router.test.mjs',
   'tests/runs.test.mjs',
   'tests/server.test.mjs',
   'tests/shell.test.mjs',
+  'tests/skill.test.mjs',
   'tests/subagent.test.mjs',
-  'tests/triage.test.mjs'
+  'tests/triage.test.mjs',
+  'tests/turns.test.mjs'
 ];
 
 const CONNECTOR_FILE = 'tests/connector.test.mjs';

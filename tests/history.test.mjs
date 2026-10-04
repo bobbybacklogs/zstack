@@ -15,8 +15,12 @@ import {
   recordId,
   needsRerunConfirm,
   resetHistoryWarnings,
-  HISTORY_PREVIEW_CHARS
+  compactSteps,
+  HISTORY_PREVIEW_CHARS,
+  HISTORY_MAX_TOOL_OUTPUT_CHARS,
+  HISTORY_TOOL_OUTPUT_BUDGET_CHARS
 } from '../src/index.mjs';
+import { historyRecordFor } from '../src/runs.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -250,6 +254,129 @@ describe('agentic run history', () => {
     assert.equal(start.model, 'opencode-go/deepseek-v4-pro');
   });
 
+  it('round-trips the resume fields a continuation needs', () => {
+    // The writer builds an explicit field list, so a field the caller passes
+    // and the writer forgets vanishes with no error anywhere. That happened
+    // here: the whole "continue a run that ran out of turns" feature was built
+    // on a session id that never reached the file, so it worked until the
+    // process restarted and then reported every run as uncontinuable. This
+    // asserts through `readHistory`, not on the input, because only the file
+    // proves the field survived.
+    const file = tmpHistory();
+    appendHistory({
+      command: 'agent',
+      promptPreview: 'long task',
+      ok: false,
+      applied: true,
+      policy: 'apply',
+      turns: 25,
+      maxTurns: 25,
+      turnLimitReached: true,
+      sessionId: '20260929-074832-60a5',
+      continuationOf: 'run-previous',
+      extensions: 2
+    }, file);
+
+    const { entries } = readHistory({ path: file });
+    const entry = entries[0];
+    assert.equal(entry.sessionId, '20260929-074832-60a5');
+    assert.equal(entry.maxTurns, 25);
+    assert.equal(entry.turnLimitReached, true);
+    assert.equal(entry.continuationOf, 'run-previous');
+    assert.equal(entry.policy, 'apply');
+    assert.equal(entry.extensions, 2);
+  });
+
+  it('stores the resume fields as null, not undefined, when absent', () => {
+    // A run from before session saving still has to be readable, and the page
+    // distinguishes "no session" from "no field at all": `canContinue` reads
+    // the absence of a sessionId, so the key must exist and be empty rather
+    // than missing.
+    const file = tmpHistory();
+    appendHistory({ command: 'agent', promptPreview: 'old run', ok: true, turns: 4 }, file);
+
+    const { entries } = readHistory({ path: file });
+    const entry = entries[0];
+    assert.equal(entry.sessionId, null);
+    assert.equal(entry.maxTurns, null);
+    assert.equal(entry.turnLimitReached, false);
+    assert.equal(entry.continuationOf, null);
+    assert.equal(entry.extensions, null);
+  });
+
+  it('stores every field the run record produces, so nothing is dropped silently', () => {
+    // The writer builds an explicit field list, which means a field the caller
+    // passes and the writer forgets disappears with no error anywhere. That has
+    // happened three times: a session id that never reached disk (breaking
+    // every "continue this run"), an extension count, and a paused flag that
+    // read back as a finished run.
+    //
+    // So this asserts the general property rather than any one field: whatever
+    // `historyRecordFor` decides a run is, the file holds. A new field is
+    // covered the moment it is added and the failure names it.
+    const file = tmpHistory();
+    const request = {
+      prompt: 'Do the thing',
+      playbook: 'feature',
+      role: 'feature, refactoring',
+      policy: 'apply',
+      apply: true,
+      projectId: 'p-1',
+      maxTurns: 25,
+      continuationOf: 'run-prev'
+    };
+    const live = {
+      id: 'run-9',
+      startedAt: Date.now() - 1000,
+      endedAt: Date.now(),
+      workspace: '/repo',
+      turns: 4,
+      toolCalls: 2,
+      failed: 0,
+      declined: 0,
+      tokens: 900,
+      fileChanges: [],
+      // `narrativeOf` reads the run's own prose blocks, so the fixture needs a
+      // real one: an empty body would leave `narrative` unset for a reason that
+      // has nothing to do with the writer dropping it.
+      blocks: [{ kind: 'prose', text: 'I read the file and changed it.' }],
+      paused: true,
+      extensions: 3,
+      sessionId: 'session-9'
+    };
+    const result = {
+      ok: false,
+      exitCode: 1,
+      turns: 4,
+      maxTurns: 25,
+      turnLimitReached: true,
+      sessionId: 'session-9'
+    };
+    const record = historyRecordFor(request, result, live);
+    appendHistory(record, file);
+
+    const stored = readHistory({ path: file }).entries[0];
+    // `id` and `ts` belong to the writer; everything else the record claims is
+    // the run's own description and has to survive the write.
+    const missing = Object.keys(record).filter((key) => !(key in stored));
+    assert.deepEqual(missing, [], `history dropped: ${missing.join(', ')}`);
+    assert.equal(stored.paused, true);
+    assert.equal(stored.sessionId, 'session-9');
+  });
+
+  it('refuses a nonsense budget field instead of storing it', () => {
+    // The record is read by the page and by the continuation endpoint. A budget
+    // of -3 or 'lots' stored verbatim would surface as a broken page rather
+    // than a rejected write, so the writer keeps only a usable integer.
+    const file = tmpHistory();
+    appendHistory({ command: 'agent', promptPreview: 'odd', ok: true, maxTurns: -3 }, file);
+    appendHistory({ command: 'agent', promptPreview: 'odd', ok: true, maxTurns: 'lots' }, file);
+    appendHistory({ command: 'agent', promptPreview: 'odd', ok: true, maxTurns: 2.5 }, file);
+
+    const { entries } = readHistory({ path: file });
+    for (const entry of entries) assert.equal(entry.maxTurns, null);
+  });
+
   it('caps stored steps and says so', () => {
     const file = tmpHistory();
     const steps = Array.from({ length: 250 }, (_, i) => ({
@@ -276,6 +403,33 @@ describe('agentic run history', () => {
     assert.equal(entries[0].agentic, undefined);
     assert.equal(entries[0].steps, undefined);
     assert.equal(entries[0].fileChanges, undefined);
+  });
+
+  it('keeps a failed call\'s reason, within a budget', () => {
+    const long = 'x'.repeat(HISTORY_MAX_TOOL_OUTPUT_CHARS + 400);
+    const steps = compactSteps([
+      { kind: 'tool', name: 'subagent', outcome: 'error', durationMs: 4, output: 'Error: unknown subagent "scout".' },
+      { kind: 'tool', name: 'read', outcome: 'ok', durationMs: 2, output: 'file body' },
+      { kind: 'tool', name: 'bash', outcome: 'error', durationMs: 9, output: long }
+    ]);
+
+    // The reason travels with the step, which is what makes a re-opened run
+    // readable; a successful call's body does not.
+    assert.equal(steps[0].output, 'Error: unknown subagent "scout".');
+    assert.equal(steps[1].output, undefined);
+    assert.equal(steps[2].output.length, HISTORY_MAX_TOOL_OUTPUT_CHARS);
+    assert.equal(steps[2].outputTruncated, true);
+
+    // A run that failed the same way many times stores the reason a bounded
+    // number of times rather than once per call.
+    const many = compactSteps(
+      Array.from({ length: 60 }, () => ({ kind: 'tool', name: 'bash', outcome: 'error', output: long }))
+    );
+    const stored = many.reduce((sum, step) => sum + (step.output?.length ?? 0), 0);
+    assert.ok(stored <= HISTORY_TOOL_OUTPUT_BUDGET_CHARS, `stored ${stored} characters`);
+    // The budget runs out, the record of the failure does not.
+    assert.equal(many.length, 60);
+    assert.ok(many.every((step) => step.outcome === 'error'));
   });
 
   it('renders steps through the CLI view', async () => {

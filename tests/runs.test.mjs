@@ -13,6 +13,8 @@ import {
 } from '../src/runs.mjs';
 import { readHistory } from '../src/history.mjs';
 import { createLiveRun, applyLiveEvent } from '../src/blocks.mjs';
+import { DEFAULT_MAX_TURNS, SEGMENT_TURNS } from '../src/turns.mjs';
+import { HARNESS_DEFAULT_MAX_TURNS } from '../src/harness.mjs';
 
 function tmpHistory() {
   return join(mkdtempSync(join(tmpdir(), 'zstack-runs-')), 'history.jsonl');
@@ -75,7 +77,7 @@ function stubZStack(script = {}) {
         if (script.kind) err.kind = script.kind;
         throw err;
       }
-      return script.result ?? resultFrom(events);
+      return script.result ?? resultFrom(events, options.workspaceDir ? { workspaceDir: options.workspaceDir } : {});
     }
   };
 }
@@ -110,6 +112,8 @@ describe('start request validation', () => {
     assert.match(validateStartRequest({ prompt: 'x', maxTurns: 0 }).join(' '), /positive integer/);
     assert.match(validateStartRequest({ prompt: 'x', maxTurns: 2.5 }).join(' '), /positive integer/);
     assert.match(validateStartRequest({ prompt: 'x', apply: 'yes' }).join(' '), /must be a boolean/);
+    assert.match(validateStartRequest({ prompt: 'x', autoPr: 'yes' }).join(' '), /must be a boolean/);
+    assert.match(validateStartRequest({ prompt: 'x', pr: 'yes' }).join(' '), /must be a boolean/);
   });
 
   it('folds apply into a policy so there is one representation', () => {
@@ -117,6 +121,9 @@ describe('start request validation', () => {
     assert.equal(normalizeStartRequest({ prompt: 'x', apply: true }).policy, 'apply');
     assert.equal(normalizeStartRequest({ prompt: 'x', apply: false }).policy, 'read-only');
     assert.equal(normalizeStartRequest({ prompt: 'x', policy: 'strict' }).policy, 'strict');
+    assert.equal(normalizeStartRequest({ prompt: 'x', autoPr: true }).autoPr, true);
+    assert.equal(normalizeStartRequest({ prompt: 'x', pr: true }).autoPr, true);
+    assert.equal(normalizeStartRequest({ prompt: 'x' }).autoPr, false);
     // The policy decides what the harness is actually told.
     assert.deepEqual(
       [normalizeStartRequest({ prompt: 'x', policy: 'apply' }).apply,
@@ -231,14 +238,20 @@ describe('run registry', () => {
     const applied = zstack.calls.at(-1);
     assert.equal(applied.apply, true);
     assert.equal(applied.autoApproveSafe, false);
-    assert.equal(applied.maxTurns, 4);
+    // One turn per call, whatever size the reader picked: that granularity is
+    // what lets a pause land at the next boundary. The 4 they chose is the
+    // run's size, not this call's budget.
+    assert.equal(applied.maxTurns, SEGMENT_TURNS);
     assert.equal(applied.lane, 'go');
 
     await settled(registry, registry.start({ prompt: 'b' }).id);
     const readOnly = zstack.calls.at(-1);
     assert.equal(readOnly.apply, false);
     assert.equal(readOnly.autoApproveSafe, true);
-    assert.equal(readOnly.maxTurns, undefined);
+    // Not left to the harness. Its own default is 8 turns, which is too tight
+    // to finish real work, so zstack always sends a number it chose.
+    assert.equal(readOnly.maxTurns, SEGMENT_TURNS);
+    assert.ok(DEFAULT_MAX_TURNS > HARNESS_DEFAULT_MAX_TURNS);
   });
 
   it('reports a missing harness as a failed page, not a lost run', async () => {
@@ -348,6 +361,255 @@ describe('run registry', () => {
     assert.equal(seen.at(-1).type, 'shutdown');
     assert.equal(registry.get(run.id).subscribers.size, 0);
   });
+
+  it('opens a pull request when autoPr is requested and changes exist', async () => {
+    const repoDir = mkdtempSync(join(tmpdir(), 'zstack-pr-test-'));
+    const zstack = stubZStack({ events: happyEvents });
+    let prHead = null;
+    let gitPushed = false;
+    const fakeGitExec = (cmd, args, opts, cb) => {
+      if (cmd === 'git' && args[0] === 'push') {
+        gitPushed = true;
+        cb(null, 'pushed\n', '');
+      } else if (cmd === 'git' && args[0] === 'remote') {
+        cb(null, 'origin\n', '');
+      } else if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === '--is-inside-work-tree') {
+        cb(null, 'true\n', '');
+      } else if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === '--show-toplevel') {
+        cb(null, `${repoDir}\n`, '');
+      } else if (cmd === 'git' && args[0] === 'status' && args.includes('-b')) {
+        cb(null, '## main...origin/main\n', '');
+      } else if (cmd === 'gh' && args[0] === 'pr') {
+        prHead = args[args.indexOf('--head') + 1];
+        cb(null, 'https://github.com/my-org/my-repo/pull/77\n', '');
+      } else {
+        cb(null, 'ok\n', '');
+      }
+    };
+    const registry = new RunRegistry({
+      zstack,
+      historyPath: tmpHistory(),
+      gitExecFile: fakeGitExec
+    });
+    const run = registry.start({
+      prompt: 'Add toggle for PR',
+      policy: 'apply',
+      autoPr: true,
+      workspaceDir: repoDir
+    });
+    await settled(registry, run.id);
+
+    const page = registry.getPage(run.id);
+    assert.equal(run.prError, undefined);
+    assert.equal(page.status, 'ok');
+    assert.equal(run.prUrl, 'https://github.com/my-org/my-repo/pull/77');
+    assert.equal(page.prUrl, 'https://github.com/my-org/my-repo/pull/77');
+    assert.ok(page.blocks.some((b) => b.kind === 'notice' && b.text.includes('Pull request opened: https://github.com/my-org/my-repo/pull/77')));
+    assert.ok(gitPushed);
+    assert.match(prHead, /^zstack\/add-toggle-for-pr/);
+  });
+
+  it('skips auto-PR when no file changes occurred', async () => {
+    const zstack = stubZStack({ events: [] });
+    const registry = new RunRegistry({ zstack, historyPath: tmpHistory() });
+    const run = registry.start({
+      prompt: 'Check something',
+      policy: 'apply',
+      autoPr: true
+    });
+    await settled(registry, run.id);
+
+    const page = registry.getPage(run.id);
+    assert.equal(run.prUrl, undefined);
+    assert.ok(page.blocks.some((b) => b.kind === 'notice' && b.text.includes('Auto-PR skipped: run made no file changes.')));
+  });
+});
+
+describe('turn budgets', () => {
+  /**
+   * A previous run in the shape the registry or history hands one back.
+   *
+   * The defaults describe the case the whole feature exists for: a run that
+   * spent its budget, saved its session, and left a record saying so.
+   */
+  function previousRun(overrides = {}) {
+    return {
+      id: 'run-prev',
+      prompt: 'Add a footer',
+      playbook: 'feature',
+      sessionId: 'session-1',
+      maxTurns: DEFAULT_MAX_TURNS,
+      turns: DEFAULT_MAX_TURNS,
+      turnLimitReached: true,
+      workspace: '/repo',
+      ...overrides
+    };
+  }
+
+  it('continues a saved session as a new run linked to the old one', async () => {
+    const historyPath = tmpHistory();
+    const zstack = stubZStack({
+      events: happyEvents,
+      result: resultFrom(happyEvents, { sessionId: 'session-2' })
+    });
+    const registry = new RunRegistry({ zstack, historyPath });
+
+    const next = registry.continueRun(previousRun(), {});
+    // The earlier run is not modified: it stopped where it stopped, and that is
+    // what happened. The continuation is a new run with its own id that points
+    // back at it, never a second attempt under the same id.
+    assert.notEqual(next.id, 'run-prev');
+    await settled(registry, next.id);
+
+    const call = zstack.calls.at(-1);
+    // `resume` is what makes this a continuation rather than a rerun: the
+    // harness restores the prior history from the session id.
+    assert.equal(call.resume, 'session-1');
+    // Without this the run would have no session of its own, so a run that runs
+    // out twice could not be continued the second time.
+    assert.equal(call.saveSession, true);
+
+    const page = registry.getPage(next.id);
+    assert.equal(page.continuationOf, previousRun().id);
+    assert.equal(page.turnBudget.sessionId, 'session-2');
+
+    // Both facts live on the request the run was started with, which is what
+    // the registry hands to `historyRecordFor` when the run is recorded. Held
+    // here rather than only read back from the file, so a continuation is
+    // still testable as a continuation when history storage changes shape.
+    assert.equal(next.request.continuationOf, 'run-prev');
+    assert.equal(next.request.resume, 'session-1');
+    // And the continuation is recorded at all: a second run that never reached
+    // history would be work the reader cannot see.
+    const entry = readHistory({ path: historyPath }).entries[0];
+    assert.equal(entry.id, next.id);
+    assert.equal(entry.turns, 1);
+  });
+
+  it('gives the continuation a bigger size unless told otherwise', async () => {
+    const zstack = stubZStack({ events: [] });
+    const registry = new RunRegistry({ zstack, historyPath: tmpHistory() });
+
+    // The size lives on the run's own request, not on the harness call: every
+    // call is one turn, so asserting the call's budget would assert nothing
+    // about what the reader asked for.
+    const doubled = registry.continueRun(previousRun(), {});
+    await settled(registry, doubled.id);
+    // Continuing at the size that just ran out would stop in the same place,
+    // which is the failure mode the feature exists to avoid.
+    assert.equal(doubled.request.maxTurns, DEFAULT_MAX_TURNS * 2);
+    // And it resumes the previous session rather than restarting the task.
+    assert.equal(zstack.calls.at(-1).resume, previousRun().sessionId);
+
+    const explicit = registry.continueRun(previousRun(), { maxTurns: 120 });
+    await settled(registry, explicit.id);
+    assert.equal(explicit.request.maxTurns, 120);
+
+    // A preset name is a size too, and resolves to the number the UI offered.
+    const preset = registry.continueRun(previousRun(), { maxTurns: 'deep' });
+    await settled(registry, preset.id);
+    assert.equal(preset.request.maxTurns, 60);
+
+    // A run from before sizes were recorded still gets the default rather than
+    // a doubling of nothing, which would be zero turns.
+    const legacy = registry.continueRun(previousRun({ maxTurns: null }), {});
+    await settled(registry, legacy.id);
+    assert.equal(legacy.request.maxTurns, DEFAULT_MAX_TURNS);
+  });
+
+  it('refuses a run that cannot be resumed instead of rerunning it', () => {
+    const zstack = stubZStack({ events: [] });
+    const registry = new RunRegistry({ zstack, historyPath: tmpHistory() });
+
+    // Rerunning the original task under a "continue" label is a worse lie than
+    // refusing, so a record with no session is a hard stop.
+    assert.throws(
+      () => registry.continueRun(previousRun({ sessionId: null })),
+      (err) => err.kind === 'not-resumable' && /no saved session/.test(err.message)
+    );
+    // A caller holding an id this registry never saw is told so, not handed a
+    // phantom run.
+    assert.throws(() => registry.continueRun(null), (err) => err.kind === 'unknown-run');
+
+    assert.equal(registry.order.length, 0, 'a refused continuation must not leave a run behind');
+    assert.equal(zstack.calls.length, 0);
+  });
+
+  it('rejects an unusable budget rather than substituting the default', () => {
+    const zstack = stubZStack({ events: [] });
+    const registry = new RunRegistry({ zstack, historyPath: tmpHistory() });
+
+    try {
+      registry.continueRun(previousRun(), { maxTurns: 'lots' });
+      assert.fail('should have thrown');
+    } catch (err) {
+      assert.equal(err.kind, 'invalid-request');
+      // The problems array is what the HTTP layer reports verbatim, so a thrown
+      // message without one would reach the browser as a bare 500.
+      assert.ok(Array.isArray(err.problems) && err.problems.length === 1);
+      assert.match(err.problems[0], /positive integer/);
+    }
+
+    // Zero is the other boundary: it is a number, so it looks like a choice,
+    // and the harness would quietly fall back to its own 8 turns.
+    assert.throws(
+      () => registry.continueRun(previousRun(), { maxTurns: 0 }),
+      (err) => err.kind === 'invalid-request' && err.problems.some((p) => /positive integer/.test(p))
+    );
+
+    assert.equal(registry.order.length, 0, 'a run started with a substituted budget would be a lie');
+    assert.equal(zstack.calls.length, 0);
+  });
+
+  it('lands the continuation in the same project under the same policy', async () => {
+    const historyPath = tmpHistory();
+    const zstack = stubZStack({ events: [] });
+    const registry = new RunRegistry({ zstack, historyPath });
+
+    const inProject = registry.continueRun(previousRun({ projectId: 'p-1', policy: 'apply' }), {});
+    await settled(registry, inProject.id);
+    const call = zstack.calls.at(-1);
+    // A write-enabled run continued as read-only would decline its own work and
+    // report the task as unfinished for the wrong reason.
+    assert.equal(call.apply, true);
+    assert.equal(call.autoApproveSafe, false);
+    // The project id and a workspace path are two answers to one question: the
+    // server resolves the directory from the project and faults on both.
+    assert.equal(call.workspaceDir, undefined);
+
+    const entry = readHistory({ path: historyPath }).entries[0];
+    assert.equal(entry.projectId, 'p-1');
+    assert.equal(inProject.request.policy, 'apply');
+
+    // Without a project the workspace is the place, and it must not be lost.
+    await settled(
+      registry,
+      registry.continueRun(previousRun({ policy: 'apply', projectId: null }), {}).id
+    );
+    assert.equal(zstack.calls.at(-1).workspaceDir, '/repo');
+  });
+
+  it('sends an instruction to carry on, never the original prompt again', async () => {
+    const zstack = stubZStack({ events: [] });
+    const registry = new RunRegistry({ zstack, historyPath: tmpHistory() });
+
+    await settled(registry, registry.continueRun(previousRun(), { prompt: 'Finish the footer' }).id);
+    assert.equal(zstack.calls.at(-1).prompt, 'Finish the footer');
+
+    await settled(registry, registry.continueRun(previousRun(), {}).id);
+    const derived = zstack.calls.at(-1).prompt;
+    // The harness has the original prompt in the session it is restoring, so
+    // repeating it would ask the model to start the task over.
+    assert.notEqual(derived, previousRun().prompt);
+    assert.match(derived, /Carry on/);
+    // It says why a second run exists and what the first one spent, so the
+    // record is readable on its own.
+    assert.match(derived, new RegExp(`${DEFAULT_MAX_TURNS} turn budget`));
+
+    // A prompt that is only whitespace is not a prompt, and must not become one.
+    await settled(registry, registry.continueRun(previousRun(), { prompt: '   ' }).id);
+    assert.match(zstack.calls.at(-1).prompt, /Carry on/);
+  });
 });
 
 describe('history record shape', () => {
@@ -380,5 +642,39 @@ describe('history record shape', () => {
     applyLiveEvent(live, { type: 'turn', turn: 2, tokens: 1 });
     applyLiveEvent(live, { type: 'text', turn: 2, text: 'Second part.' });
     assert.equal(narrativeOf(live), 'First part.\n\nSecond part.');
+  });
+
+  it('keeps the budget, the session, and what a run continues', () => {
+    const live = createLiveRun({ id: 'run-11', prompt: 'Carry on' });
+    const request = normalizeStartRequest({
+      prompt: 'Carry on',
+      maxTurns: 'deep',
+      resume: 'session-1',
+      continuationOf: 'run-prev'
+    });
+    const record = historyRecordFor(
+      request,
+      { ok: true, exitCode: 0, maxTurns: 60, sessionId: 'session-2', turnLimitReached: true },
+      live
+    );
+
+    // What a run was allowed is a fact about that run and nothing else records
+    // it, so it is stored rather than recomputed from the preset later.
+    assert.equal(record.maxTurns, 60);
+    assert.equal(record.sessionId, 'session-2');
+    assert.equal(record.continuationOf, 'run-prev');
+    // Without this flag the question "did it stop early?" is unanswerable from
+    // history, and the reader is left guessing whether the work was finished.
+    assert.equal(record.turnLimitReached, true);
+
+    // A run that stopped on its own terms carries no limit flag: the key is
+    // undefined so JSON drops it, and its absence is what "not cut short" means.
+    const plain = historyRecordFor(normalizeStartRequest({ prompt: 'one shot' }), { ok: true }, live);
+    assert.equal(plain.turnLimitReached, undefined);
+    assert.equal(plain.maxTurns, DEFAULT_MAX_TURNS, 'the budget zstack chose is recorded even when the caller named none');
+    // An ordinary run continues nothing and resumed nothing, and saying so
+    // beats a missing field a reader has to interpret.
+    assert.equal(plain.sessionId, null);
+    assert.equal(plain.continuationOf, null);
   });
 });

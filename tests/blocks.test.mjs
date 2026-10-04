@@ -4,6 +4,7 @@ import {
   BLOCK_KINDS,
   titleFromPrompt,
   outcomeTone,
+  turnBudgetText,
   projectStoredRun,
   projectRunSummary,
   createLiveRun,
@@ -98,6 +99,44 @@ describe('block vocabulary', () => {
   });
 });
 
+describe('turn budget lines', () => {
+  it('reads the budget as spent of chosen while the run is inside it', () => {
+    assert.equal(turnBudgetText(3, 25), '3 of 25');
+    // A run that has not reported a turn count yet has spent none of its
+    // budget, not an unreadable number of them.
+    assert.equal(turnBudgetText(undefined, 25), '0 of 25');
+    // A budget that arrived as text still renders as a number.
+    assert.equal(turnBudgetText(9, '25'), '9 of 25');
+  });
+
+  it('describes a run that outgrew the size it was started with', () => {
+    // A run is driven a turn at a time and continues while it has work, so
+    // outgrowing the chosen size is normal. "31 of 8" would be arithmetic the
+    // reader has to interpret, so the line says what happened instead.
+    assert.equal(turnBudgetText(31, 8, false, 23), '31 turns, continued past 8');
+    assert.equal(turnBudgetText(31, 8), '31 turns, continued past 8');
+    // At the hard ceiling the run did not finish and nobody stopped it, which
+    // is a different ending from continuing past the chosen size.
+    assert.equal(turnBudgetText(500, 8, true, 492), '500 turns, stopped at the ceiling');
+  });
+
+  it('names the limit when a run stopped inside its size', () => {
+    assert.equal(turnBudgetText(25, 25), '25 of 25');
+    assert.equal(turnBudgetText(25, 25, true), '25 of 25 (limit reached)');
+    assert.equal(turnBudgetText(24, 25, false), '24 of 25');
+  });
+
+  it('still reports the turns when there is no size to compare against', () => {
+    // A record from before budgets were stored has no size, and "3 of 0" would
+    // invent one out of a missing field. Nothing is printed at all: the plain
+    // turn count already has its own property, and repeating it is noise.
+    assert.equal(turnBudgetText(3, undefined), null);
+    assert.equal(turnBudgetText(3, 0), null);
+    assert.equal(turnBudgetText(3, NaN), null);
+    assert.equal(turnBudgetText(3, 'deep'), null);
+  });
+});
+
 describe('archived runs as pages', () => {
   it('projects a stored agentic run into ordered blocks and properties', () => {
     const page = projectStoredRun(agenticEntry());
@@ -188,6 +227,29 @@ describe('archived runs as pages', () => {
     assert.equal(callout.tone, 'error');
   });
 
+  it('states a stored run\'s failure reason instead of only its exit code', () => {
+    // A run that failed before its first turn has no steps to explain it, so the
+    // recorded reason is the only thing standing between the reader and "exited
+    // with code 1".
+    const page = projectStoredRun(agenticEntry({
+      ok: false,
+      exitCode: 1,
+      steps: [],
+      error: 'Provider "opencode" returned HTTP 401: Missing API key.'
+    }));
+    assertWellFormed(page.blocks);
+    const notice = page.blocks.find((b) => b.kind === 'notice' && b.tone === 'error');
+    assert.ok(notice, 'a stored failure with a reason must show it');
+    assert.match(notice.text, /HTTP 401/);
+
+    // No recorded reason is not a licence to invent one.
+    const bare = projectStoredRun(agenticEntry({ ok: false, exitCode: 1, error: null }));
+    assert.equal(
+      bare.blocks.some((b) => b.kind === 'notice' && b.tone === 'error'),
+      false
+    );
+  });
+
   it('falls back to the start step for the model and workspace', () => {
     const page = projectStoredRun(agenticEntry({ model: null, workspace: null }));
     const props = Object.fromEntries(page.props.map((p) => [p.key, p.value]));
@@ -212,6 +274,79 @@ describe('archived runs as pages', () => {
     assert.equal(card.fileChangeCount, 1);
     // A card carries no body, which is the point of keeping it separate.
     assert.equal(card.blocks, undefined);
+  });
+
+  it('reports a stored run that stopped at the ceiling and can be continued', () => {
+    const page = projectStoredRun(agenticEntry({
+      turns: 500,
+      maxTurns: 25,
+      turnLimitReached: true,
+      sessionId: 'session-1'
+    }));
+
+    // `canContinue` is the honest answer to "can I get more of this": it needs
+    // a session to resume, and a reason to. Here the reason is the ceiling.
+    assert.deepEqual(page.turnBudget, {
+      maxTurns: 25,
+      used: 500,
+      extensions: 0,
+      limitReached: true,
+      paused: false,
+      sessionId: 'session-1',
+      // Never in place for an archived record: resuming a pause continues the
+      // live run, and this projection has no live run behind it.
+      inPlace: false,
+      canContinue: true
+    });
+    // The same fact as a property, because that is what the header renders.
+    const props = Object.fromEntries(page.props.map((p) => [p.key, p.value]));
+    assert.equal(props.turnBudget, '500 turns, stopped at the ceiling');
+  });
+
+  it('reports a paused run as resumable', () => {
+    // The case pause exists for: the run stopped on purpose mid-task with its
+    // session saved, so resuming is the obvious next action.
+    const page = projectStoredRun(agenticEntry({
+      turns: 12,
+      maxTurns: 25,
+      paused: true,
+      sessionId: 'session-2'
+    }));
+    assert.equal(page.status, 'paused');
+    assert.equal(page.tone, 'paused');
+    assert.equal(page.turnBudget.paused, true);
+    assert.equal(page.turnBudget.canContinue, true);
+    assert.equal(page.turnBudget.limitReached, false);
+  });
+
+  it('describes a run that outgrew its chosen size', () => {
+    const page = projectStoredRun(agenticEntry({ turns: 90, maxTurns: 25, extensions: 65 }));
+    const props = Object.fromEntries(page.props.map((p) => [p.key, p.value]));
+    assert.equal(props.turnBudget, '90 turns, continued past 25');
+    assert.equal(page.turnBudget.extensions, 65);
+    assert.equal(page.turnBudget.limitReached, false);
+  });
+
+  it('offers no continuation without both a reason and a session', () => {
+    // Finishing inside the size you picked is not something to continue.
+    const finished = projectStoredRun(agenticEntry({ turns: 4, maxTurns: 25, sessionId: 'session-1' }));
+    assert.equal(finished.turnBudget.limitReached, false);
+    assert.equal(finished.turnBudget.paused, false);
+    assert.equal(finished.turnBudget.canContinue, false);
+
+    // A record whose session was never saved has a budget and a turn count but
+    // nothing to resume, so it reports the budget and offers nothing. Claiming
+    // otherwise would start the task over under a "continue" label.
+    const noSession = projectStoredRun(agenticEntry({ turns: 500, maxTurns: 25, turnLimitReached: true }));
+    assert.equal(noSession.turnBudget.sessionId, null);
+    assert.equal(noSession.turnBudget.canContinue, false);
+
+    const pausedNoSession = projectStoredRun(agenticEntry({ turns: 3, maxTurns: 25, paused: true }));
+    assert.equal(pausedNoSession.turnBudget.canContinue, false);
+
+    // A record from before budgets were stored and with no turns says nothing
+    // at all, rather than a zeroed budget the reader would take for a real one.
+    assert.equal(projectStoredRun(agenticEntry()).turnBudget, null);
   });
 });
 
@@ -250,6 +385,37 @@ describe('live runs as pages', () => {
     const prose = run.blocks.find((b) => b.kind === 'prose');
     // A block nothing will append to again must not keep a streaming cursor.
     assert.equal(prose.streaming, false);
+  });
+
+  it('numbers turns across extensions instead of restarting at 1', () => {
+    // The shape of an extended run: the first segment spends its turn, the run
+    // is extended, and the resumed session numbers its turns from 1 again. Both
+    // the count and the labels have to carry the total forward, or the page
+    // shows a second "Turn 1" and reads as the run going backwards.
+    const run = createLiveRun({ id: 'live-ext', prompt: 'Long task', workspaceDir: '/repo', maxTurns: 25 });
+    for (const event of [
+      start,
+      { type: 'turn', turn: 1, tokens: 100 },
+      { type: 'text', turn: 1, text: 'Starting.' },
+      { type: 'done', turns: 1, sessionId: 'sess-1' }
+    ]) applyLiveEvent(run, event);
+    assert.equal(run.turns, 1);
+
+    // The registry does this between segments.
+    run.turnOffset = run.turns;
+    applyLiveEvent(run, { type: 'run-start', model: 'deepseek-v4-pro', provider: 'opencode-go' });
+    applyLiveEvent(run, { type: 'turn', turn: 1, tokens: 200 });
+    applyLiveEvent(run, { type: 'turn', turn: 2, tokens: 300 });
+    applyLiveEvent(run, { type: 'done', turns: 2, sessionId: 'sess-2' });
+
+    assert.equal(run.turns, 3);
+    const labels = run.blocks.filter((b) => b.kind === 'divider').map((b) => b.label);
+    assert.deepEqual(labels, ['Turn 1', 'Turn 2', 'Turn 3']);
+
+    // The extension does not announce a second run. One run continuing is the
+    // whole point, so the start callout stays singular.
+    const callouts = run.blocks.filter((b) => b.kind === 'callout' && /^Running/.test(b.text));
+    assert.equal(callouts.length, 1);
   });
 
   it('counts a writer as a file change and a successful read as none', () => {
@@ -341,6 +507,40 @@ describe('live runs as pages', () => {
     assert.match(run.blocks.at(-2).text, /harness was not found/);
   });
 
+  it('carries a failed call\'s own words, and drops them for a call that worked', () => {
+    // The harness sends `output` only for a failure. Without it the page can say
+    // a call failed and how fast, which is not enough to do anything about it.
+    const run = runWith([
+      start,
+      { type: 'turn', turn: 1, tokens: 1 },
+      {
+        type: 'tool',
+        turn: 1,
+        name: 'subagent',
+        args: { agent: 'scout' },
+        outcome: 'error',
+        durationMs: 4,
+        output: 'Error: unknown subagent "scout". Available: repo-assessor, shipper.'
+      },
+      {
+        type: 'tool',
+        turn: 1,
+        name: 'read',
+        args: { path: 'a.ts' },
+        outcome: 'ok',
+        durationMs: 2,
+        // A body on a successful call is not carried by the harness, and a stray
+        // one must not reach the page either.
+        output: 'file body'
+      }
+    ]);
+    finishLiveRun(run, { ok: true });
+    const page = liveRunToPage(run);
+    const [failed, ok] = page.blocks.filter((b) => b.kind === 'tool');
+    assert.match(failed.output, /unknown subagent "scout"/);
+    assert.equal(ok.output, null);
+  });
+
   it('renders a live page in the shape the archive uses', () => {
     const run = runWith([
       start,
@@ -379,5 +579,43 @@ describe('live runs as pages', () => {
     assert.equal(props.policy, 'read-only');
     assert.equal(props.model, 'opencode-go/deepseek-v4-pro');
     assert.equal(props.role, 'feature, refactoring');
+  });
+
+  it('offers a continuation on a live page only when there is a reason and a session', () => {
+    // The size the reader picked lives on the request, which is the one
+    // authority for it: the registry records turns taken separately.
+    const run = runWith([start, { type: 'turn', turn: 25, tokens: 10 }], { maxTurns: 25 });
+    run.sessionId = 'session-1';
+    run.turnLimitReached = true;
+    finishLiveRun(run, { ok: true });
+
+    const page = liveRunToPage(run);
+    assert.equal(page.turnBudget.maxTurns, 25);
+    assert.equal(page.turnBudget.used, 25);
+    assert.equal(page.turnBudget.sessionId, 'session-1');
+    assert.equal(page.turnBudget.canContinue, true);
+
+    // Continue means resume, so a run with no saved session cannot be one, even
+    // when it hit the ceiling.
+    run.sessionId = null;
+    assert.equal(liveRunToPage(run).turnBudget.canContinue, false);
+
+    // And a run that finished inside its size has nothing to continue.
+    run.sessionId = 'session-1';
+    run.turnLimitReached = false;
+    assert.equal(liveRunToPage(run).turnBudget.limitReached, false);
+    assert.equal(liveRunToPage(run).turnBudget.canContinue, false);
+
+    // A paused run is resumable without having hit anything.
+    run.paused = true;
+    assert.equal(liveRunToPage(run).turnBudget.canContinue, true);
+    assert.equal(liveRunToPage(run).turnBudget.paused, true);
+    run.paused = false;
+
+    // A run started without a budget reports none, so the page cannot claim a
+    // ceiling that was never sent.
+    const unbudgeted = runWith([start, { type: 'turn', turn: 1, tokens: 5 }]);
+    finishLiveRun(unbudgeted, { ok: true });
+    assert.equal(liveRunToPage(unbudgeted).turnBudget, null);
   });
 });

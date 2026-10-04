@@ -235,6 +235,76 @@ export interface PanelCritique {
   durationMs?: number;
 }
 
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export interface ChatOptions {
+  model: string;
+  messages: ChatMessage[];
+  /**
+   * Forwarded as the gateway's per-conversation session header. Optional: the
+   * gateway derives one from the conversation when absent, but a stable id
+   * keeps provider cache affinity across the turns of one chat.
+   */
+  sessionId?: string;
+  temperature?: number;
+  maxTokens?: number;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  /** Receive each text chunk as it streams. The resolved result is unchanged. */
+  onDelta?: (text: string) => void;
+}
+
+export interface ChatResult {
+  content: string;
+  model: string;
+  usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+  durationMs: number;
+  raw: any;
+}
+
+export interface ModelCatalogue {
+  connected: boolean;
+  models: string[];
+  activeProviders?: string[];
+  error?: string;
+}
+
+export interface OptimizeOptions {
+  prompt: string;
+  playbook?: string;
+  type?: string;
+  role?: string;
+  principles?: string[];
+  model?: string;
+  /** Provider lane override for the rewrite: auto | zen | go | hitch. */
+  lane?: string;
+  temperature?: number;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  /** Injectable chat function, for tests. */
+  chat?: (args: { model?: string; messages: ChatMessage[] }) => Promise<{ content: string; model?: string; usage?: any; durationMs?: number }>;
+}
+
+export interface OptimizeResult {
+  /** The rewritten prompt, cleaned of fences, labels, and wrapping quotes. */
+  prompt: string;
+  /** The text that was rewritten. */
+  original: string;
+  model: string | null;
+  playbook: string;
+  role: string;
+  principles: string[];
+  usage: any;
+  durationMs: number | null;
+}
+
 export interface BridgeHealth {
   ok: boolean;
   message?: string;
@@ -316,6 +386,22 @@ export declare class ZStack {
 
   panel(prompt: string, options?: any): Promise<PanelCritique[]>;
 
+  /** List the models the gateway serves, for a chat pin picker. */
+  models(): Promise<ModelCatalogue>;
+
+  /**
+   * One plain chat completion against a pinned model: no playbook, no tools,
+   * no history. The caller owns the transcript and sends it whole each turn.
+   */
+  chat(options: ChatOptions): Promise<ChatResult>;
+
+  /**
+   * Rewrite a raw request into a task prompt worth running. Classified first so
+   * the rewrite knows the playbook it prepares for; returns text to review, not
+   * a dispatch.
+   */
+  optimizePrompt(prompt: string | OptimizeOptions, options?: Partial<OptimizeOptions>): Promise<OptimizeResult>;
+
   syncRules(options?: { project?: boolean; lane?: string }): Promise<string>;
 
   getBudget(): StoredBudget;
@@ -326,6 +412,8 @@ export declare class ZStack {
   checkUpstream(options?: { token?: string; statePath?: string }): Promise<any>;
 
   update(options?: { apply?: boolean; yes?: boolean; token?: string; statePath?: string }): Promise<any>;
+
+  packageSkill(options: PackageSkillOptions): PackageSkillResult;
 }
 
 export declare function createZStack(options?: ZStackOptions): ZStack;
@@ -525,3 +613,81 @@ export declare function readHistory(options?: any): { entries: any[]; skipped: n
 export declare function lastEntry(pathOverride?: string): any;
 export declare function needsRerunConfirm(entry: any): boolean;
 export declare function resetHistoryWarnings(): void;
+
+export interface ChatRecord {
+  id: string;
+  title: string | null;
+  model: string | null;
+  projectId?: string | null;
+  sessionId?: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  messages: Array<{
+    id: string;
+    role: 'user' | 'assistant';
+    content: string;
+    at: string | null;
+    model?: string | null;
+    tokens?: number | null;
+    durationMs?: number | null;
+    error?: string | null;
+    truncated?: boolean;
+  }>;
+}
+
+export declare const CHAT_MAX_MESSAGE_CHARS: number;
+export declare const CHAT_MAX_MESSAGES: number;
+export declare const CHAT_MAX_CHATS: number;
+export declare function chatsPath(pathOverride?: string): string;
+export declare function readChats(pathOverride?: string): { chats: ChatRecord[]; corrupted: boolean; path: string };
+export declare function findChat(id: string, pathOverride?: string): ChatRecord | null;
+export declare function createChat(input: { model: string; projectId?: string | null }, pathOverride?: string): ChatRecord;
+export declare function updateChat(id: string, patch: { title?: string | null; model?: string; projectId?: string | null }, pathOverride?: string): ChatRecord;
+export declare function deleteChat(id: string, pathOverride?: string): ChatRecord;
+export declare function appendMessage(id: string, message: Partial<ChatRecord['messages'][number]>, pathOverride?: string): ChatRecord;
+export declare function validateChatStart(input?: any): string[];
+export declare function validateChatMessage(text?: any): string[];
+export declare function chatTitle(chat: ChatRecord): string;
+export declare function chatSummary(chat: ChatRecord): { id: string; title: string; model: string | null; projectId?: string | null; messageCount: number; createdAt: string | null; updatedAt: string | null };
+export declare function projectChat(chat: ChatRecord): any;
+export declare function chatHandoffPrompt(chat: ChatRecord, messageId?: string | null): { ok: boolean; prompt?: string; truncated?: boolean; originalLength?: number; messageId?: string; projectId?: string | null; model?: string | null; error?: string };
+
+export declare const OPTIMIZE_MAX_PROMPT_CHARS: number;
+export declare const OPTIMIZE_RULES: string;
+export declare function buildOptimizeSystemPrompt(options?: any): string;
+export declare function extractOptimizedPrompt(text: any): string;
+export declare function validateOptimizeRequest(input?: any): string[];
+export declare function optimizePrompt(options?: any, deps?: any): Promise<{ prompt: string; model: string | null; usage: any; durationMs: number | null }>;
+
+export interface PackageSkillOptions {
+  playbookId: string;
+  outDir?: string | null;
+  dryRun?: boolean;
+  force?: boolean;
+  rootDir?: string;
+  verifyCommand?: string;
+}
+
+export interface PackageSkillResult {
+  ok: boolean;
+  skill: string;
+  targetFile: string;
+  files: string[];
+  principles: string[];
+  content: string;
+  dryRun: boolean;
+}
+
+export declare const DEFAULT_VERIFY_COMMAND: string;
+export declare function formatSkillDoc(options: {
+  playbook: { id: string; title: string; applyWhen: string; requires?: string[]; body: string };
+  principles?: Array<{ id: string; title: string; applyWhen: string; body: string }>;
+  verifyCommand?: string;
+}): string;
+export declare function checkCrossLocationCollision(options: {
+  skillName: string;
+  targetFile: string;
+  rootDir: string;
+  force?: boolean;
+}): void;
+export declare function packageSkill(options: PackageSkillOptions): PackageSkillResult;

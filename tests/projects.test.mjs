@@ -14,6 +14,7 @@ import {
   newProjectId,
   projectsPath
 } from '../src/projects.mjs';
+import { MAX_MAX_TURNS } from '../src/turns.mjs';
 
 function tmpStore() {
   return join(mkdtempSync(join(tmpdir(), 'zstack-proj-')), 'projects.json');
@@ -211,19 +212,29 @@ describe('project defaults', () => {
 
   it('stores defaults on create', () => {
     const project = createProject(
-      { name: 'Site', dir: tmpDir(), defaultPlaybook: 'feature', defaultPolicy: 'apply' },
+      { name: 'Site', dir: tmpDir(), defaultPlaybook: 'feature', defaultPolicy: 'apply', defaultAutoPr: true },
       store,
       known
     );
     assert.equal(project.defaultPlaybook, 'feature');
     assert.equal(project.defaultPolicy, 'apply');
+    assert.equal(project.defaultAutoPr, true);
     assert.equal(findProject(project.id, store).defaultPolicy, 'apply');
+    assert.equal(findProject(project.id, store).defaultAutoPr, true);
   });
 
   it('defaults are null when not given', () => {
     const project = createProject({ name: 'Site', dir: tmpDir() }, store, known);
     assert.equal(project.defaultPlaybook, null);
     assert.equal(project.defaultPolicy, null);
+    assert.equal(project.defaultAutoPr, null);
+  });
+
+  it('refuses a non-boolean defaultAutoPr', () => {
+    assert.throws(
+      () => createProject({ name: 'Site', dir: tmpDir(), defaultAutoPr: 'yes' }, store, known),
+      (err) => err.kind === 'invalid-project' && err.problems.some((p) => p.includes('Default auto-PR must be a boolean.'))
+    );
   });
 
   it('refuses an unknown playbook and an unknown policy, together', () => {
@@ -297,5 +308,99 @@ describe('project defaults', () => {
     );
     assert.equal(record.defaultPlaybook, 'feature');
     assert.equal(record.defaultPolicy, 'strict');
+  });
+
+  it('stores a default turn budget as a number', () => {
+    const project = createProject(
+      { name: 'Site', dir: tmpDir(), defaultMaxTurns: 60 },
+      store,
+      known
+    );
+    assert.equal(project.defaultMaxTurns, 60);
+    // Stored as a number, not the text a form sent, so a run started from this
+    // project does not have to resolve it a second time.
+    const stored = findProject(project.id, store);
+    assert.equal(stored.defaultMaxTurns, 60);
+    assert.equal(typeof stored.defaultMaxTurns, 'number');
+  });
+
+  it('resolves a preset name on write, so the file holds a budget and not a label', () => {
+    const project = createProject(
+      { name: 'Site', dir: tmpDir(), defaultMaxTurns: 'deep' },
+      store,
+      known
+    );
+    assert.equal(project.defaultMaxTurns, 60);
+    // A preset is renamed or retuned eventually; a stored number keeps meaning
+    // what the user chose when they chose it.
+    assert.equal(readProjects(store).projects[0].defaultMaxTurns, 60);
+  });
+
+  it('stores no budget when the form was left blank or the file predates the field', () => {
+    const blank = createProject({ name: 'Site', dir: tmpDir(), defaultMaxTurns: '' }, store, known);
+    assert.equal(blank.defaultMaxTurns, null);
+
+    // An older file never had the field, and "absent" has to read as "no
+    // preference" rather than as a zero the run endpoint would refuse.
+    const dir = tmpDir();
+    writeFileSync(
+      store,
+      JSON.stringify({ version: 1, projects: [{ id: 'p-old', name: 'Old', dir }] }),
+      'utf8'
+    );
+    assert.equal(readProjects(store).projects[0].defaultMaxTurns, null);
+  });
+
+  it('refuses a turn budget that starting a run would reject', () => {
+    try {
+      createProject({ name: 'Site', dir: tmpDir(), defaultMaxTurns: 'lots' }, store, known);
+      assert.fail('should have thrown');
+    } catch (err) {
+      assert.equal(err.kind, 'invalid-project');
+      // The message has to name the field: a form posting several defaults at
+      // once would otherwise report a fault the reader cannot place.
+      assert.ok(err.problems.some((p) => /default turn budget/i.test(p)));
+      assert.ok(err.problems.some((p) => p.includes('positive integer')));
+    }
+
+    // The ceiling is the run endpoint's, so a stored default is never a value
+    // that starting a run from this project would refuse.
+    assert.throws(
+      () => createProject({ name: 'Site', dir: tmpDir(), defaultMaxTurns: MAX_MAX_TURNS + 1 }, store, known),
+      (err) => err.kind === 'invalid-project'
+        && err.problems.some((p) => p.includes(`at most ${MAX_MAX_TURNS}`))
+    );
+    assert.equal(createProject({ name: 'Site', dir: tmpDir(), defaultMaxTurns: MAX_MAX_TURNS }, store, known).defaultMaxTurns, MAX_MAX_TURNS);
+  });
+
+  it('sets and clears the turn budget on update', () => {
+    const created = createProject({ name: 'Site', dir: tmpDir(), defaultMaxTurns: 60 }, store, known);
+
+    const raised = updateProject(created.id, { defaultMaxTurns: 'marathon' }, store, known);
+    assert.equal(raised.defaultMaxTurns, 200);
+    assert.equal(raised.name, 'Site', 'changing the budget must not touch the name');
+
+    // Clearing is how the dialog says "no preference". An empty string and an
+    // explicit null both have to work, or a JSON client is a special case.
+    assert.equal(updateProject(created.id, { defaultMaxTurns: '' }, store, known).defaultMaxTurns, null);
+    assert.equal(updateProject(created.id, { defaultMaxTurns: null }, store, known).defaultMaxTurns, null);
+
+    // An update that never mentions the budget leaves the stored one alone,
+    // because a rename must not silently reset a setting the user chose.
+    updateProject(created.id, { defaultMaxTurns: 120 }, store, known);
+    assert.equal(
+      updateProject(created.id, { name: 'Storefront' }, store, known).defaultMaxTurns,
+      120
+    );
+  });
+
+  it('rejects a bad turn budget on update and keeps the stored one', () => {
+    const created = createProject({ name: 'Site', dir: tmpDir(), defaultMaxTurns: 60 }, store, known);
+    assert.throws(
+      () => updateProject(created.id, { defaultMaxTurns: 'lots' }, store, known),
+      (err) => err.kind === 'invalid-project'
+        && err.problems.some((p) => /default turn budget/i.test(p))
+    );
+    assert.equal(findProject(created.id, store).defaultMaxTurns, 60, 'a refused update must change nothing');
   });
 });

@@ -390,6 +390,24 @@ export function resolveRoleMapping(state, options = {}) {
 }
 
 /**
+ * The chat-completions request body, shared by the streaming and non-streaming
+ * paths so the two can never send different parameters for the same call.
+ *
+ * Some models (gpt-5.*, o1, o3, o4, deepseek-reasoner) reject a custom
+ * temperature, so it is only attached for models that accept one.
+ */
+function buildChatBody({ model, messages, temperature, maxTokens, stream = false }) {
+  const isReasoningModel = /gpt-5|o[1-4]|reasoner/i.test(model);
+  return {
+    model,
+    messages,
+    ...(maxTokens ? { max_tokens: maxTokens } : {}),
+    ...(stream ? { stream: true } : {}),
+    ...(!isReasoningModel && temperature !== undefined ? { temperature } : {})
+  };
+}
+
+/**
  * Execute a completion request directly through ModelHitch.
  * POSTs are attempted exactly once — never auto-retried.
  */
@@ -401,26 +419,18 @@ export async function sendChat({
   baseUrl = DEFAULT_BRIDGE_URL,
   timeoutMs,
   fetchImpl,
-  signal
+  signal,
+  headers
 }) {
   const startTime = Date.now();
 
-  // Some models (gpt-5.*, o1, o3, o4) only support default temperature (1) or reject custom temperature
-  const isReasoningModel = /gpt-5|o[1-4]|reasoner/i.test(model);
-  const body = {
-    model,
-    messages,
-    ...(maxTokens ? { max_tokens: maxTokens } : {})
-  };
-
-  if (!isReasoningModel && temperature !== undefined) {
-    body.temperature = temperature;
-  }
-
   const { data, attempts } = await gatewayFetch(`${baseUrl}/v1/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    // Caller headers (a per-conversation session id) ride alongside the body
+    // type rather than in place of it; the gateway normalizes session handling
+    // across providers, but only when it receives the header.
+    headers: { 'Content-Type': 'application/json', ...(headers || {}) },
+    body: JSON.stringify(buildChatBody({ model, messages, temperature, maxTokens })),
     parse: 'json',
     baseUrl,
     timeoutMs,
@@ -441,6 +451,196 @@ export async function sendChat({
     attempts,
     raw: data
   };
+}
+
+/** The empty usage a stream reports when the provider sent none. */
+const EMPTY_USAGE = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+
+/**
+ * The text a single streaming chunk carries, or '' when it carries none.
+ *
+ * Providers differ: most send `choices[0].delta.content` as a string, some send
+ * it as an array of parts, and a few emit the whole message shape on a
+ * non-streamed frame. Only the text is read; reasoning deltas are not part of
+ * the answer and are dropped.
+ */
+function deltaText(chunk) {
+  const choice = chunk?.choices?.[0];
+  const raw = choice?.delta?.content ?? choice?.message?.content;
+  if (typeof raw === 'string') return raw;
+  if (Array.isArray(raw)) {
+    return raw.map((part) => (typeof part === 'string' ? part : part?.text || '')).join('');
+  }
+  return '';
+}
+
+/**
+ * Stream one completion, feeding text deltas to `onDelta` as they arrive.
+ *
+ * Resolves with the same shape `sendChat` returns once the stream ends. This is
+ * a single POST whose response body is read incrementally; there is no retry,
+ * because a stream that failed halfway cannot be restarted at the same place.
+ *
+ * Not every model honours `stream: true`. When the gateway answers with JSON
+ * instead of `text/event-stream`, the whole reply is parsed and handed over as
+ * one delta, so a caller gets text either way rather than an empty answer.
+ */
+export async function streamChat({
+  model,
+  messages,
+  temperature,
+  maxTokens,
+  baseUrl = DEFAULT_BRIDGE_URL,
+  timeoutMs,
+  fetchImpl,
+  signal,
+  headers,
+  onDelta
+}) {
+  const impl = fetchImpl || fetch;
+  const timeout = resolveGatewayTimeoutMs({ timeoutMs });
+  const startTime = Date.now();
+  const controller = new AbortController();
+  const onExternalAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', onExternalAbort, { once: true });
+  }
+  const timer = setTimeout(() => controller.abort(), timeout);
+  if (timer.unref) timer.unref();
+
+  const cleanup = () => {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onExternalAbort);
+  };
+
+  try {
+    const res = await impl(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(headers || {}) },
+      body: JSON.stringify(buildChatBody({ model, messages, temperature, maxTokens, stream: true })),
+      signal: controller.signal
+    });
+
+    if (!res.ok) {
+      let snippet = '';
+      try {
+        snippet = (await res.text()).slice(0, 300);
+      } catch {
+        snippet = '';
+      }
+      throw new GatewayError({
+        kind: 'http',
+        status: res.status,
+        message: `ModelHitch error (HTTP ${res.status})${snippet ? ': ' + snippet : ''}`,
+        baseUrl,
+        attempts: 1
+      });
+    }
+
+    const contentType = res.headers?.get?.('content-type') || '';
+    if (!/text\/event-stream/i.test(contentType)) {
+      // The provider ignored `stream`. Parse the whole body and hand it over as
+      // one delta so the caller still gets the reply.
+      const data = await res.json();
+      const content = data.choices?.[0]?.message?.content || '';
+      if (content && onDelta) onDelta(content);
+      return {
+        content,
+        model: data.model || model,
+        usage: data.usage || EMPTY_USAGE,
+        durationMs: Date.now() - startTime,
+        attempts: 1,
+        raw: data
+      };
+    }
+
+    let content = '';
+    let usage = null;
+    let modelName = model;
+    let lastChunk = null;
+    const decoder = new TextDecoder();
+    const reader = res.body.getReader();
+    let buffer = '';
+
+    // One SSE frame is a run of `data:` lines ended by a blank line. Frames are
+    // consumed as they close so a delta is delivered the moment it lands rather
+    // than when the next frame arrives.
+    const handleFrame = (frame) => {
+      const dataLines = [];
+      for (const line of frame.split('\n')) {
+        const trimmed = line.replace(/\r$/, '');
+        if (trimmed.startsWith('data:')) dataLines.push(trimmed.slice(5).trimStart());
+      }
+      if (dataLines.length === 0) return false;
+      const payload = dataLines.join('\n');
+      if (payload === '[DONE]') return true;
+      let chunk;
+      try {
+        chunk = JSON.parse(payload);
+      } catch {
+        return false;
+      }
+      lastChunk = chunk;
+      if (typeof chunk.model === 'string' && chunk.model !== '') modelName = chunk.model;
+      if (chunk.usage) usage = chunk.usage;
+      const text = deltaText(chunk);
+      if (text) {
+        content += text;
+        if (onDelta) onDelta(text);
+      }
+      return false;
+    };
+
+    let done = false;
+    for (;;) {
+      const { value, done: finished } = await reader.read();
+      if (finished) break;
+      // CRLF is normalized away so frames split on a plain blank line; a raw CR
+      // never appears inside an SSE data payload.
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let split;
+      while ((split = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, split);
+        buffer = buffer.slice(split + 2);
+        if (handleFrame(frame)) {
+          done = true;
+          break;
+        }
+      }
+      if (done) break;
+    }
+    if (!done && buffer.trim() !== '') handleFrame(buffer);
+
+    // A stream that carried no usage (the common case) reports none rather than
+    // zeros, so a caller can tell "not reported" from "nothing spent".
+    return {
+      content,
+      model: modelName,
+      usage: usage || EMPTY_USAGE,
+      durationMs: Date.now() - startTime,
+      attempts: 1,
+      raw: lastChunk
+    };
+  } catch (err) {
+    if (err instanceof GatewayError) throw err;
+    if (isAbortError(err)) {
+      throw new GatewayError({
+        kind: 'timeout',
+        message: signal?.aborted ? 'Request aborted' : `Request timed out after ${timeout}ms`,
+        baseUrl,
+        attempts: 1
+      });
+    }
+    throw new GatewayError({
+      kind: 'unreachable',
+      message: err?.message || `Cannot reach ModelHitch on ${baseUrl}`,
+      baseUrl,
+      attempts: 1
+    });
+  } finally {
+    cleanup();
+  }
 }
 
 /**

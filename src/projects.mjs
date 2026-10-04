@@ -19,6 +19,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, statSyn
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { maxTurnsProblem, resolveMaxTurns } from './turns.mjs';
 
 export function projectsPath(pathOverride) {
   return (
@@ -76,6 +77,12 @@ export function readProjects(pathOverride) {
         : null,
       defaultPolicy: typeof item.defaultPolicy === 'string' && item.defaultPolicy !== ''
         ? item.defaultPolicy
+        : null,
+      defaultMaxTurns: Number.isInteger(item.defaultMaxTurns) && item.defaultMaxTurns > 0
+        ? item.defaultMaxTurns
+        : null,
+      defaultAutoPr: typeof item.defaultAutoPr === 'boolean'
+        ? item.defaultAutoPr
         : null,
       createdAt: item.createdAt || null,
       updatedAt: item.updatedAt || null
@@ -157,12 +164,32 @@ export function validateProject(input = {}, existing = [], known = {}) {
       problems.push(`Unknown policy "${input.defaultPolicy}". Valid policies: ${known.policies.join(', ')}.`);
     }
   }
+  // A project's turn budget is a starting point, not a ceiling it enforces on
+  // its runs: it pre-fills the composer, and the reader can raise it there.
+  // Validated with the same rules as a run's, so a stored default can never be
+  // a value the run endpoint would refuse.
+  if (input.defaultMaxTurns !== undefined && input.defaultMaxTurns !== null && input.defaultMaxTurns !== '') {
+    const problem = maxTurnsProblem(input.defaultMaxTurns);
+    if (problem) {
+      problems.push(`Default turn budget: ${problem}`);
+    } else if (resolveMaxTurns(input.defaultMaxTurns) === null) {
+      problems.push('Default turn budget must be a positive integer or a preset name.');
+    }
+  }
+  if (input.defaultAutoPr !== undefined && input.defaultAutoPr !== null && input.defaultAutoPr !== '' && typeof input.defaultAutoPr !== 'boolean') {
+    problems.push('Default auto-PR must be a boolean.');
+  }
   return problems;
 }
 
 /** Empty-ish values do not survive: a default is either a value or absent. */
 function cleanDefault(value) {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
+}
+
+/** A stored turn budget, or null. Numbers only: a preset name is resolved on write. */
+function cleanTurns(value) {
+  return resolveMaxTurns(value);
 }
 
 /** The canonical shape of one stored project. */
@@ -178,6 +205,12 @@ export function projectRecord(input, existing = {}) {
     defaultPolicy: input.defaultPolicy !== undefined
       ? cleanDefault(input.defaultPolicy)
       : (existing.defaultPolicy ?? null),
+    defaultMaxTurns: input.defaultMaxTurns !== undefined
+      ? cleanTurns(input.defaultMaxTurns)
+      : (existing.defaultMaxTurns ?? null),
+    defaultAutoPr: input.defaultAutoPr !== undefined
+      ? (typeof input.defaultAutoPr === 'boolean' ? input.defaultAutoPr : null)
+      : (existing.defaultAutoPr ?? null),
     createdAt: existing.createdAt || now,
     updatedAt: now
   };
@@ -218,7 +251,8 @@ export function updateProject(id, input = {}, pathOverride, known = {}) {
     name: input.name !== undefined ? input.name : current.name,
     dir: input.dir !== undefined ? input.dir : current.dir,
     defaultPlaybook: input.defaultPlaybook !== undefined ? input.defaultPlaybook : current.defaultPlaybook,
-    defaultPolicy: input.defaultPolicy !== undefined ? input.defaultPolicy : current.defaultPolicy
+    defaultPolicy: input.defaultPolicy !== undefined ? input.defaultPolicy : current.defaultPolicy,
+    defaultMaxTurns: input.defaultMaxTurns !== undefined ? input.defaultMaxTurns : current.defaultMaxTurns
   };
   const problems = validateProject(merged, projects, known);
   if (problems.length > 0) {

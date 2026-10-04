@@ -7,6 +7,7 @@ import {
   fetchModelHitchState,
   resolveRoleMapping,
   sendChat,
+  streamChat,
   runRole as connectorRunRole,
   runPanel as connectorRunPanel,
   syncCursorRules,
@@ -30,7 +31,16 @@ import {
 import { classifyPromptSemantic, ROUTER_MIN_SCORE } from './router.mjs';
 import { planContext, DEFAULT_CONTEXT_BUDGET_TOKENS } from './context.mjs';
 import { parseDoc } from './manifest.mjs';
-import { runHarnessTask, buildProgression, finalText, resolveHarnessEntry } from './harness.mjs';
+import { validateChatRequest, chatWireMessages, chatTimeoutMs } from './chat.mjs';
+import { optimizePrompt as runOptimizePrompt, validateOptimizeRequest } from './optimize.mjs';
+import {
+  runHarnessTask,
+  buildProgression,
+  finalText,
+  resolveHarnessEntry,
+  failureReasonFromStderr
+} from './harness.mjs';
+import { packageSkill } from './skill.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -394,6 +404,13 @@ export class ZStack {
   }
 
   /**
+   * Package a playbook and its required principles into a SKILL.md document.
+   */
+  packageSkill(options) {
+    return packageSkill({ rootDir: this.rootDir, ...options });
+  }
+
+  /**
    * Classify a user prompt into a matching playbook and relevant principles.
    * Backward compatible: returns the first matching trigger in priority order.
    */
@@ -623,6 +640,10 @@ export class ZStack {
       harnessArgs: options.harnessArgs,
       timeoutMs: options.timeoutMs ?? 0,
       signal: options.signal,
+      // Sessions are saved by default so a run that exhausts its turn budget
+      // can be continued rather than repeated. `resume` continues one.
+      saveSession: options.saveSession !== false,
+      resume: options.resume,
       onEvent: options.onEvent,
       onStderr: options.onStderr
     });
@@ -658,6 +679,13 @@ export class ZStack {
       playbookInjected: useZstackPrompt,
       ok: result.ok,
       exitCode: result.exitCode,
+      /**
+       * The harness's own reason for a failed run, recovered from its stderr
+       * transcript. Empty when the run succeeded or the harness gave no reason:
+       * the caller falls back to its generic "exited non-zero" message rather
+       * than inventing one.
+       */
+      errorText: result.ok ? null : failureReasonFromStderr(result.stderr),
       /** True when the caller aborted the run rather than the model failing. */
       cancelled: !!result.aborted,
       turns: progression.turns,
@@ -674,6 +702,145 @@ export class ZStack {
       sessionId: progression.sessionId,
       malformedEvents: result.malformed,
       harness: { source: result.entry?.source ?? null, schema: result.schema ?? null }
+    };
+  }
+
+  /**
+   * List the models the gateway currently serves, for a chat pin picker.
+   *
+   * The catalogue is what the gateway says it can route; it is not a role
+   * mapping. `null` when the bridge cannot be reached, so a caller can offer
+   * the picker with an explanation instead of an error page.
+   */
+  async models() {
+    try {
+      const state = await fetchModelHitchState(this.baseUrl, { timeoutMs: this.timeoutMs });
+      return {
+        connected: true,
+        activeProviders: state.activeProviders,
+        models: state.models
+          .map((m) => (typeof m?.id === 'string' ? m.id : null))
+          .filter(Boolean)
+          .sort()
+      };
+    } catch (err) {
+      return { connected: false, error: err?.message || String(err), models: [] };
+    }
+  }
+
+  /**
+   * One plain chat completion against a pinned model.
+   *
+   * This is a conversation, not a task: no playbook is injected, no tools are
+   * offered, and nothing is written to history. The caller owns the transcript
+   * and sends it whole on every turn, which is what stateless chat completions
+   * expect. `sessionId` is optional and only forwarded as the gateway's
+   * per-conversation header, so a provider that keys cache affinity on it sees
+   * one conversation rather than a new one per message.
+   *
+   * With `onDelta`, the reply streams: the callback receives each text chunk as
+   * it arrives and the resolved value is the same either way.
+   */
+  async chat(options = {}) {
+    const problems = validateChatRequest(options);
+    if (problems.length > 0) throw new Error(problems.join(' '));
+    const call = {
+      model: options.model,
+      messages: chatWireMessages(options.messages),
+      baseUrl: this.baseUrl,
+      temperature: options.temperature,
+      maxTokens: options.maxTokens,
+      timeoutMs: chatTimeoutMs(options.timeoutMs, this.timeoutMs),
+      signal: options.signal,
+      headers: typeof options.sessionId === 'string' && options.sessionId !== ''
+        ? { 'x-opencode-session': options.sessionId }
+        : undefined
+    };
+    const chatRes = typeof options.onDelta === 'function'
+      ? await streamChat({ ...call, onDelta: options.onDelta })
+      : await sendChat(call);
+    return {
+      content: chatRes.content,
+      model: chatRes.model,
+      usage: chatRes.usage,
+      durationMs: chatRes.durationMs,
+      raw: chatRes.raw
+    };
+  }
+
+  /**
+   * Rewrite a raw request into a task prompt worth running.
+   *
+   * The prompt is classified first, so the rewrite knows which playbook it is
+   * preparing for; the assigned role's model does the rewriting. The result is
+   * text for the reader to review, not a dispatch: nothing is executed here.
+   */
+  async optimizePrompt(promptOrOptions, maybeOptions = {}) {
+    const input = typeof promptOrOptions === 'string'
+      ? { prompt: promptOrOptions, ...maybeOptions }
+      : (promptOrOptions || {});
+    const problems = validateOptimizeRequest(input);
+    if (problems.length > 0) throw new Error(problems.join(' '));
+    const raw = input.prompt.trim();
+
+    const detailed = this.classifyPromptDetailed(raw);
+    let playbookType = input.playbook || input.type || detailed.type;
+    let roleName = input.role || detailed.role;
+    let principles = input.principles || detailed.principles;
+
+    if (!input.playbook && !input.type && detailed.ambiguous && input.semantic !== false) {
+      try {
+        const sem = await classifyPromptSemantic(raw, { baseUrl: this.baseUrl, rootDir: this.rootDir });
+        if (sem && sem.score >= ROUTER_MIN_SCORE) {
+          const rule = PLAYBOOK_TRIGGERS.find((r) => r.type === sem.type);
+          if (rule) {
+            playbookType = rule.type;
+            roleName = rule.role;
+            principles = rule.principles;
+          }
+        }
+      } catch {
+        // Semantic router degrades gracefully; keyword result stands.
+      }
+    }
+
+    let playbookTitle = null;
+    try {
+      playbookTitle = this.listPlaybooks().find((p) => p.id === playbookType)?.title || null;
+    } catch {
+      playbookTitle = null;
+    }
+
+    let targetModel = input.model;
+    if (!targetModel) {
+      try {
+        const state = await fetchModelHitchState(this.baseUrl, { timeoutMs: this.timeoutMs });
+        const mapping = await this.resolveRoleMapping(state, input.lane);
+        targetModel = mapping.models[roleName] || mapping.models['feature, refactoring'];
+      } catch {
+        // The rewrite still runs on the gateway's default model when no
+        // mapping can be resolved; a lane is a preference, not a requirement.
+        targetModel = undefined;
+      }
+    }
+
+    const result = await runOptimizePrompt(
+      { prompt: raw, playbook: playbookType, playbookTitle, principles },
+      {
+        model: targetModel,
+        baseUrl: this.baseUrl,
+        timeoutMs: input.timeoutMs ?? this.timeoutMs,
+        temperature: input.temperature,
+        signal: input.signal,
+        chat: input.chat
+      }
+    );
+    return {
+      ...result,
+      original: raw,
+      playbook: playbookType,
+      role: roleName,
+      principles
     };
   }
 

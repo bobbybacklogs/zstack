@@ -61,6 +61,15 @@ export const HISTORY_MAX_STEPS = 200;
  */
 export const HISTORY_MAX_NARRATIVE_CHARS = 12000;
 
+/**
+ * Characters of a failure reason kept per run.
+ *
+ * The reason is one sentence from the harness, and it is shown as a notice
+ * rather than read as data, so the cap exists only to keep a chatty provider's
+ * error body — a full HTML page from a gateway, say — from being stored whole.
+ */
+export const HISTORY_MAX_ERROR_CHARS = 600;
+
 /** Path-like argument names, in the order a reader most wants to see them. */
 const PATH_KEYS = ['file_path', 'filePath', 'path', 'target', 'filename'];
 
@@ -81,10 +90,23 @@ export function mutationPath(args) {
 }
 
 /**
+ * Characters of a failed tool call's output kept per step, and per run.
+ *
+ * The per-step cap bounds one message; the per-run budget bounds a run that
+ * failed the same way forty times, which otherwise stores the same paragraph
+ * forty times over in a file that is read back in full to render a page. Later
+ * failures keep their outcome and duration and lose only the text, so the list
+ * still shows what happened.
+ */
+export const HISTORY_MAX_TOOL_OUTPUT_CHARS = 1000;
+export const HISTORY_TOOL_OUTPUT_BUDGET_CHARS = 20000;
+
+/**
  * Reduce a run's steps to the compact form stored in history.
  */
 export function compactSteps(steps) {
   if (!Array.isArray(steps)) return [];
+  let outputBudget = HISTORY_TOOL_OUTPUT_BUDGET_CHARS;
   return steps
     .filter((step) => step && typeof step === 'object')
     .slice(0, HISTORY_MAX_STEPS)
@@ -104,6 +126,17 @@ export function compactSteps(steps) {
       if (step.risk) out.risk = step.risk;
       if (step.tokens != null) out.tokens = step.tokens;
       if (step.workspace) out.workspace = step.workspace;
+      // Why a call failed, when the harness said. Kept because a re-opened run
+      // is otherwise a list of calls that all say "error" and nothing more.
+      // Gated on the outcome: a successful call's body is the work itself, and
+      // storing it would put every file a run read into the history file.
+      const failed = step.outcome !== undefined && step.outcome !== 'ok' && step.outcome !== 'dry-run';
+      if (failed && typeof step.output === 'string' && step.output.trim() !== '' && outputBudget > 0) {
+        const kept = step.output.slice(0, Math.min(HISTORY_MAX_TOOL_OUTPUT_CHARS, outputBudget));
+        out.output = kept;
+        outputBudget -= kept.length;
+        if (kept.length < step.output.length) out.outputTruncated = true;
+      }
       return out;
     });
 }
@@ -147,6 +180,12 @@ export function appendHistory(entry, pathOverride) {
     promptPreview: String(entry.promptPreview || '').slice(0, HISTORY_PREVIEW_CHARS),
     files: Array.isArray(entry.files) ? entry.files : [],
     ok: entry.ok !== false,
+    // Why it failed, when the run was able to say. Stored beside `errorKind`
+    // rather than instead of it: the kind is the machine-readable category, and
+    // this is the sentence a reader needs to act on it.
+    error: typeof entry.error === 'string' && entry.error.trim() !== ''
+      ? entry.error.slice(0, HISTORY_MAX_ERROR_CHARS)
+      : null,
     errorKind: entry.errorKind || null,
     exitCode: entry.exitCode ?? (entry.ok === false ? 1 : 0)
   };
@@ -159,9 +198,34 @@ export function appendHistory(entry, pathOverride) {
   if (entry.agentic || entry.command === 'agent') {
     record.agentic = true;
     record.applied = entry.applied === true;
+    record.policy = entry.policy || null;
     record.workspace = entry.workspace || null;
     record.projectId = typeof entry.projectId === 'string' && entry.projectId !== '' ? entry.projectId : null;
     record.turns = entry.turns ?? null;
+    // The turn budget and what became of it. Recorded because the answer to
+    // "this stopped early, can I get more?" has to survive the process that ran
+    // it: an in-memory flag is gone after a restart, and the run is exactly the
+    // thing a reader comes back to later.
+    record.maxTurns = Number.isInteger(entry.maxTurns) && entry.maxTurns > 0 ? entry.maxTurns : null;
+    record.turnLimitReached = entry.turnLimitReached === true;
+    // How many times the budget grew mid-run. Without it a run recorded at 500
+    // turns when the reader asked for 25 is unexplained, and the page cannot
+    // say the extension happened at all.
+    record.extensions = Number.isInteger(entry.extensions) && entry.extensions > 0 ? entry.extensions : null;
+    // The harness session, without which a run cannot be resumed. Null for runs
+    // older than session saving, which is why continuation reports "cannot
+    // continue" rather than failing obscurely.
+    record.sessionId = typeof entry.sessionId === 'string' && entry.sessionId !== '' ? entry.sessionId : null;
+    // Whether the run is waiting on the reader. Recorded because a paused run
+    // has to outlive the process that paused it: the page reads this to decide
+    // whether to offer resuming at all, and without it a paused run reads back
+    // as a finished one.
+    record.paused = entry.paused === true;
+    // Which run this one continues, so the pair stay linked in history and the
+    // page can say the run is a continuation rather than a fresh start.
+    record.continuationOf = typeof entry.continuationOf === 'string' && entry.continuationOf !== ''
+      ? entry.continuationOf
+      : null;
     record.toolCalls = entry.toolCalls ?? null;
     record.failedTools = entry.failedTools ?? null;
     record.declinedTools = entry.declinedTools ?? null;
@@ -172,6 +236,8 @@ export function appendHistory(entry, pathOverride) {
     const steps = compactSteps(entry.steps);
     record.steps = steps;
     record.stepsTruncated = Array.isArray(entry.steps) && entry.steps.length > steps.length;
+    record.autoPr = entry.autoPr === true;
+    record.prUrl = typeof entry.prUrl === 'string' && entry.prUrl.trim() !== '' ? entry.prUrl.trim() : null;
   }
 
   // Recorded outside the agentic branch as well, so a caller that captured the

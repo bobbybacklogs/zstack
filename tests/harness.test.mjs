@@ -25,6 +25,7 @@ import {
   mutationPath,
   finalText,
   explainEmptyContent,
+  failureReasonFromStderr,
   HARNESS_DEFAULT_MAX_TURNS,
   HARNESS_EVENTS_SCHEMA
 } from '../src/harness.mjs';
@@ -344,9 +345,12 @@ test('explainEmptyContent: distinguishes the reasons an answer can be missing', 
   // A real answer needs no explanation.
   assert.equal(explainEmptyContent({ content: 'It has 3 lines.' }), null);
 
-  // Stopped at the budget: the advice is to raise it.
+  // Stopped at the budget: the advice is to continue it, or raise the budget
+  // for a fresh run. Continuing is named first because it resumes the session
+  // rather than repeating the work already done.
   const capped = explainEmptyContent({ content: '', turnLimitReached: true, maxTurns: 3 });
-  assert.match(capped, /stopped at the 3-turn limit/);
+  assert.match(capped, /stopped at its 3-turn limit/);
+  assert.match(capped, /--continue/);
   assert.match(capped, /--max-turns/);
 
   // Nothing said and calls were refused: the advice is --apply.
@@ -360,4 +364,36 @@ test('explainEmptyContent: distinguishes the reasons an answer can be missing', 
 
   // Whitespace is not an answer.
   assert.ok(explainEmptyContent({ content: '   \n ' }));
+});
+
+test('failureReasonFromStderr: recovers the harness\'s reason for a failed run', () => {
+  // The shape a real failure takes: a numbered line in the transcript, indented
+  // behind the renderer's gutter marker. A run that never reached its first turn
+  // produces exactly this and nothing else.
+  const auth = [
+    '',
+    '  MODELHITCH \u00b7 harness',
+    '  opencode/claude-sonnet-4-6  \u00b7  playbook feature +3 principles',
+    '',
+    '\u258c \u2716 Provider "opencode" returned HTTP 401: {"type":"error","error":{"type":"AuthError","message":"Missing API key."}}',
+    '',
+    '\u2500\u2500 run complete \u2500\u2500',
+    '  turns       0'
+  ].join('\n');
+  assert.match(failureReasonFromStderr(auth), /HTTP 401/);
+  assert.match(failureReasonFromStderr(auth), /Missing API key/);
+
+  // The reason is the first one, not the last thing the transcript happened to
+  // print: a tool failure followed by a summary must still report the cause.
+  const twoFailures = '\u258c \u2716 Read (no path) error\n\u258c \u2716 Subagent error\n';
+  assert.match(failureReasonFromStderr(twoFailures), /Read \(no path\)/);
+
+  // A transcript with no reason yields null, so the caller keeps its own generic
+  // message instead of printing the harness's banner as the explanation.
+  assert.equal(failureReasonFromStderr('  MODELHITCH \u00b7 harness\n  run complete\n'), null);
+  assert.equal(failureReasonFromStderr(''), null);
+  assert.equal(failureReasonFromStderr(undefined), null);
+
+  // A bare `Error:` line is the harness's other spelling for a failed run.
+  assert.match(failureReasonFromStderr('[harness] Error: no config at C:\\x\n'), /no config/);
 });

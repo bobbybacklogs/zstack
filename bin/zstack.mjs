@@ -11,6 +11,9 @@ import { triageFailure } from '../src/triage.mjs';
 import { runContextOffload, formatOffloadReport } from '../src/subagent.mjs';
 import { formatEventLine, createProgressRenderer, explainEmptyContent, resolveHarnessEntry, harnessEntryExists, observeGitStatus } from '../src/harness.mjs';
 import { startServer, DEFAULT_PORT, DEFAULT_HOST, isLoopback } from '../src/serve.mjs';
+import { DEFAULT_MAX_TURNS, continuationBudget, runWithExtensions } from '../src/turns.mjs';
+import { commitAndPushBranch } from '../src/git.mjs';
+import { createPullRequest } from '../src/github.mjs';
 
 /** Structured exit codes: 0 success, 1 failure, 2 usage, 3 gateway, 4 partial. */
 export const EXIT = { OK: 0, FAIL: 1, USAGE: 2, GATEWAY: 3, PARTIAL: 4 };
@@ -23,7 +26,7 @@ export function exitForKind(kind) {
 
 const KNOWN_COMMANDS = new Set([
   'task', 'prompt', 'run', 'panel', 'arena', 'interrogate', 'budget', 'grade',
-  'triage', 'explore', 'history', 'shell', 'repl', 'serve',
+  'triage', 'explore', 'history', 'shell', 'repl', 'serve', 'skill',
   'status', 'sync', 'update', 'playbooks', 'principles', 'about', 'version', 'help'
 ]);
 
@@ -34,7 +37,7 @@ const z = new ZStack();
 // --playbook, --timeout, --paths, --max-files, --limit, --last, --rerun, --live,
 // --agent, --max-turns, --review)
 function parseArgs(args) {
-  const flags = { files: [], project: false, apply: false, check: false, confirm: false, yes: false, json: false, noPrune: false, live: true, last: false, rerun: false, agent: false, review: false };
+  const flags = { files: [], project: false, apply: false, check: false, confirm: false, yes: false, json: false, noPrune: false, live: true, last: false, rerun: false, agent: false, review: false, autoPr: false, dryRun: false, force: false };
   const positional = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -42,15 +45,31 @@ function parseArgs(args) {
       flags.project = true;
     } else if (arg === '--agent') {
       flags.agent = true;
+    } else if (arg === '--pr' || arg === '--auto-pr') {
+      flags.autoPr = true;
+      flags.agent = true;
     } else if (arg === '--review') {
       flags.review = true;
+      // Same reasoning as the budget: a reviewer that reviews nothing is a
+      // flag that lies about what it did.
+      flags.agent = true;
     } else if (arg === '--max-turns' && i + 1 < args.length) {
       const n = Number(args[++i]);
       if (!Number.isInteger(n) || n <= 0) {
         flags.maxTurnsError = args[i];
       } else {
         flags.maxTurns = n;
+        // A budget only means something if the loop runs. Accepting the flag on
+        // a single completion turned it into a silent no-op, which is the same
+        // trap `--project --apply` used to be.
+        flags.agent = true;
       }
+    } else if (arg === '--continue') {
+      // Resumes the most recent run that saved a session. A boolean rather
+      // than an optional value: the prompt is positional, so `--continue <id>`
+      // would have to guess whether the next word is an id or the task.
+      flags.continue = true;
+      flags.agent = true;
     } else if (arg === '--confirm' || arg === '--yes') {
       flags.confirm = true;
       flags.yes = true;
@@ -132,6 +151,12 @@ function parseArgs(args) {
       flags.host = args[++i];
     } else if (arg === '--open') {
       flags.open = true;
+    } else if (arg === '--out' && i + 1 < args.length) {
+      flags.out = args[++i];
+    } else if (arg === '--dry-run') {
+      flags.dryRun = true;
+    } else if (arg === '--force') {
+      flags.force = true;
     } else {
       positional.push(arg);
     }
@@ -223,6 +248,8 @@ Usage:
   zstack history [--limit N] [--steps] [--json]    Show recent runs (--last --rerun repeats)
   zstack serve [--port N] [--host H] [--open]      Local UI: browse runs, watch one live, start one
   zstack shell | repl                              Start an interactive session with sticky context
+  zstack skill <playbook-id> [--out <dir>] [--dry-run] [--force]
+                                                   Package a playbook into a SKILL.md
   zstack status [--json]                           Show ModelHitch health and active role mappings
   zstack sync [--project]                          Sync Cursor rules (~/.cursor/rules/zstack-models.mdc)
   zstack update [--apply]                          Check upstream pstack repository for updates
@@ -270,8 +297,13 @@ Options:
   --agent                    Run the agentic tool loop (single completion without it)
   --apply, -y                Agent: approve mutating calls so files can change
                              (also: zstack update, record upstream sync checkpoint)
-  --max-turns <n>            Agent: model turns before the loop stops (harness default 8)
+  --max-turns <n>            Agent: model turns before the loop stops
+                             (default 25; the harness alone would use 8)
+  --continue                 Agent: resume the most recent run that saved a session,
+                             with a doubled budget. The task prompt is the next
+                             instruction, not a repeat of the original.
   --review                   Agent: run the read-only reviewer over the change afterwards
+  --pr, --auto-pr            Agent: open a GitHub pull request on completion if changes are made
   --confirm, --yes, -y       Confirm and apply budget mapping without interactive prompt
   --json                     Emit a single JSON document on stdout (diagnostics to stderr)
   --timeout <ms>             Per-request gateway timeout (default 30000, env MODELHITCH_TIMEOUT)
@@ -291,6 +323,9 @@ Options:
   --playbook <id>          Bypass guided selection with an explicit playbook
   --project                Agent: run in the current directory reading/writing real files
   --check                  Check upstream without prompting for update
+  --out <dir>              Skill: target directory for packaged SKILL.md
+  --dry-run                Skill: print generated SKILL.md to stdout without writing
+  --force                  Skill: overwrite existing target and bypass cross-location collisions
   --about, -a              Show architecture and design overview
   --version, -v            Show package version
 
@@ -355,6 +390,54 @@ async function handlePrinciples(args) {
   console.log(`\nTotal: ${list.length} principles in principles/\n`);
 }
 
+async function handleSkill(args) {
+  const { flags, positional } = parseArgs(args);
+  const playbookId = positional[0];
+  if (!playbookId) {
+    fail('Error: skill requires a playbook id. Usage: zstack skill <playbook-id> [--out <dir>] [--dry-run] [--force]', EXIT.USAGE, flags);
+  }
+
+  try {
+    const res = z.packageSkill({
+      playbookId,
+      outDir: flags.out,
+      dryRun: flags.dryRun,
+      force: flags.force
+    });
+
+    if (flags.dryRun) {
+      if (flags.json) {
+        emitJson({ ok: true, dryRun: true, skill: res.skill, principles: res.principles, content: res.content });
+      } else {
+        process.stdout.write(res.content);
+      }
+      return;
+    }
+
+    if (flags.json) {
+      emitJson({
+        ok: true,
+        skill: res.skill,
+        file: res.targetFile,
+        files: res.files,
+        principles: res.principles,
+        dryRun: false
+      });
+      return;
+    }
+
+    console.log(`\n[✓] Packaged skill [${res.skill}] -> ${res.targetFile}`);
+    console.log(`    Principles resolved (${res.principles.length}): ${res.principles.join(', ')}`);
+    console.log('    Files written:');
+    for (const f of res.files) {
+      console.log(`      ~ ${f}`);
+    }
+    console.log('');
+  } catch (err) {
+    failWith(err, flags, EXIT.FAIL, '[!] Skill packaging failed');
+  }
+}
+
 async function handleSync(args) {
   const { flags } = parseArgs(args);
   try {
@@ -390,7 +473,7 @@ function taskOptions(prompt, playbook, flags) {
  * like it had run when nothing had been touched.
  */
 function isAgentic(flags) {
-  return !!(flags.agent || flags.apply || flags.project);
+  return !!(flags.agent || flags.apply || flags.project || flags.autoPr);
 }
 
 function agentOptions(prompt, playbook, flags) {
@@ -560,10 +643,40 @@ async function resolveGuidedPlaybook(prompt, flags, asker) {
  * printed as it happens and recorded in run history. `--json` emits the same
  * steps as structured records rather than lines.
  */
+/**
+ * The most recent run that saved a harness session, or null.
+ *
+ * `--continue` needs a session id, and the honest source is history: the run
+ * may have finished in an earlier process. Newest first, because "continue"
+ * means the thing you were just doing.
+ */
+function lastResumableRun() {
+  try {
+    const { entries } = readHistory({ limit: 100 });
+    return entries.find((e) => typeof e.sessionId === 'string' && e.sessionId !== '') || null;
+  } catch {
+    return null;
+  }
+}
+
 async function runAgentPrompt(prompt, playbookId, classification, flags) {
   const mode = flags.apply ? 'apply' : 'read-only';
+  const resuming = flags.continue ? lastResumableRun() : null;
+  if (flags.continue && !resuming) {
+    const err = new Error(
+      'Nothing to continue: no recorded run has a saved session. Sessions are written from now on, so this works for runs started after the upgrade.'
+    );
+    if (flags.json) emitJson({ ok: false, error: err.message });
+    else console.error(`[!] ${err.message}`);
+    process.exitCode = 1;
+    return null;
+  }
+  const budget = flags.maxTurns ?? (resuming ? continuationBudget(resuming.maxTurns) : DEFAULT_MAX_TURNS);
   if (!flags.json) {
-    console.log(`[>] Agentic run (${mode}${flags.maxTurns ? `, max ${flags.maxTurns} turns` : ''}) in ${flags.project ? process.cwd() : 'the zstack workspace'}`);
+    console.log(`[>] Agentic run (${mode}, max ${budget} turns) in ${flags.project ? process.cwd() : 'the zstack workspace'}`);
+    if (resuming) {
+      console.log(`    Continuing run ${resuming.id}, which used ${resuming.turns ?? 'its'} turns before stopping.`);
+    }
     if (!flags.apply) {
       console.log('    Mutating tool calls will be declined. Pass --apply to let the agent change files.');
     }
@@ -576,20 +689,75 @@ async function runAgentPrompt(prompt, playbookId, classification, flags) {
   const renderer = createProgressRenderer({
     write: (line) => console.log(line)
   });
+  const onEvent = (event) => {
+    steps.push(event);
+    if (flags.json) {
+      // One record per line on stderr, keeping stdout parseable.
+      console.error(JSON.stringify({ zstack: 'step', ...event }));
+      return;
+    }
+    renderer.push(event);
+  };
   try {
-    const res = await z.agent({
-      ...agentOptions(prompt, playbookId, flags),
-      onEvent: (event) => {
-        steps.push(event);
-        if (flags.json) {
-          // One record per line on stderr, keeping stdout parseable.
-          console.error(JSON.stringify({ zstack: 'step', ...event }));
-          return;
+    // A run that reaches its budget is extended rather than stopped, here as
+    // well as in the browser: a task cut off mid-work costs the same wherever
+    // it was started, and the reader chose a size of job rather than a place to
+    // be interrupted.
+    const outcome = await runWithExtensions({
+      maxTurns: budget,
+      resume: resuming?.sessionId ?? null,
+      call: ({ maxTurns, resume }) => z.agent({
+        ...agentOptions(prompt, playbookId, flags),
+        maxTurns,
+        resume,
+        onEvent
+      }),
+      onExtend: ({ to, grant }) => {
+        if (!flags.json) {
+          console.log(`[>] Out of turns. Extending this run with ${grant} more (${to} total).`);
+        } else {
+          console.error(JSON.stringify({ zstack: 'extended', maxTurns: to, granted: grant }));
         }
-        renderer.push(event);
       }
     });
+    const res = outcome.result;
     if (!flags.json) renderer.flush();
+
+    let prUrl = null;
+    if (flags.autoPr && res.ok && flags.apply) {
+      const hasChanges = (res.fileChanges && res.fileChanges.length > 0) || (res.changes && res.changes.length > 0);
+      if (hasChanges) {
+        try {
+          const workspaceDir = res.workspaceDir || process.cwd();
+          const branchSlug = (prompt || 'feature')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .slice(0, 24)
+            .replace(/^-+|-+$/g, '') || 'feature';
+          const branchName = `zstack/${branchSlug}-${Date.now().toString(36)}`;
+          await commitAndPushBranch(workspaceDir, {
+            branch: branchName,
+            message: `zstack: ${prompt.slice(0, 50)}`
+          });
+          const prDoc = await createPullRequest({
+            dir: workspaceDir,
+            title: `zstack: ${prompt.slice(0, 50)}`,
+            body: `## Summary\n${prompt}\n\n## Changes\n${(res.fileChanges || []).map((f) => `- \`${f.path || f}\``).join('\n')}`,
+            head: branchName
+          });
+          prUrl = prDoc.url;
+          if (!flags.json) {
+            console.log(`[✓] Pull request opened: ${prUrl}`);
+          }
+        } catch (err) {
+          if (!flags.json) {
+            console.warn(`[!] Auto-PR failed: ${err.message}`);
+          }
+        }
+      } else if (!flags.json) {
+        console.log('[!] Auto-PR skipped: no file changes were made.');
+      }
+    }
 
     recordRun({
       command: 'agent',
@@ -604,7 +772,21 @@ async function runAgentPrompt(prompt, playbookId, classification, flags) {
       files: flags.files || [],
       ok: res.ok,
       applied: res.applied,
-      turns: res.turns,
+      policy: flags.apply ? 'apply' : 'read-only',
+      autoPr: !!flags.autoPr,
+      prUrl,
+      // Cumulative across every segment, not the last one's count. Reporting
+      // the final segment's turns would describe a 175-turn run as its last 100.
+      turns: outcome.used,
+      // The budget, whether it ran out, and the session that can continue it.
+      // Without these in history, `--continue` would have nothing to resume and
+      // a run that stopped early would be indistinguishable from one that
+      // finished.
+      maxTurns: outcome.granted,
+      turnLimitReached: res.turnLimitReached || undefined,
+      extensions: outcome.extensions.length || undefined,
+      sessionId: res.sessionId ?? null,
+      continuationOf: resuming?.id ?? null,
       toolCalls: res.toolCalls,
       failedTools: res.failedTools,
       declinedTools: res.declinedTools,
@@ -624,8 +806,13 @@ async function runAgentPrompt(prompt, playbookId, classification, flags) {
         principles: res.principles,
         classification: res.classification,
         applied: res.applied,
+        autoPr: !!flags.autoPr,
+        prUrl: prUrl ?? undefined,
         workspace: res.workspaceDir,
-        turns: res.turns,
+        turns: outcome.used,
+        maxTurns: outcome.granted,
+        extensions: outcome.extensions.length,
+        turnLimitReached: res.turnLimitReached,
         toolCalls: res.toolCalls,
         failedTools: res.failedTools,
         declinedTools: res.declinedTools,
@@ -642,7 +829,9 @@ async function runAgentPrompt(prompt, playbookId, classification, flags) {
       return res;
     }
 
-    reportProgression(res, Date.now() - started, mode);
+    // The summary counts the whole run, including the segments an extension
+    // added, so the numbers printed match the record that was just written.
+    reportProgression({ ...res, turns: outcome.used, maxTurns: outcome.granted }, Date.now() - started, mode);
     if (res.content) {
       console.log(`\n${res.content}`);
     } else {
@@ -1643,6 +1832,9 @@ async function main() {
       break;
     case 'serve':
       await handleServe(rawArgs);
+      break;
+    case 'skill':
+      await handleSkill(rawArgs);
       break;
     case 'update':
     case '--update': {

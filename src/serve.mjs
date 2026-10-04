@@ -15,6 +15,7 @@
  */
 
 import { createServer } from 'node:http';
+import { statSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { ZStack } from './sdk.mjs';
@@ -36,8 +37,37 @@ import {
   patchRunOverride,
   hideRun,
   applyOverride,
+  getOverride,
   overridesPath
 } from './overrides.mjs';
+import {
+  readGitHubStore,
+  writeGitHubStore,
+  readGitHubToken,
+  ghAuthToken,
+  fetchGitHubRepos,
+  mergeRepos,
+  githubPath,
+  defaultBaseDir
+} from './github.mjs';
+import { gitOp, canonicalGitRoot } from './git.mjs';
+import { DEFAULT_MAX_TURNS, MAX_MAX_TURNS, TURN_PRESETS } from './turns.mjs';
+import { validateChatRequest, chatWireMessages } from './chat.mjs';
+import { validateOptimizeRequest } from './optimize.mjs';
+import {
+  readChats,
+  findChat,
+  createChat,
+  updateChat,
+  deleteChat,
+  appendMessage,
+  validateChatMessage,
+  chatSummary,
+  projectChat,
+  chatsPath,
+  newMessageId,
+  CHAT_MAX_MESSAGES
+} from './chats.mjs';
 
 /** Where the browser client lives. */
 export const WEB_ROOT = join(ZSTACK_ROOT, 'web');
@@ -61,6 +91,9 @@ const MIME_TYPES = {
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
   '.ico': 'image/x-icon',
   '.woff2': 'font/woff2'
 };
@@ -184,9 +217,19 @@ const FIXED_ROUTES = Object.freeze({
   '/api/health': ['GET'],
   '/api/runs': ['GET', 'POST'],
   '/api/projects': ['GET', 'POST'],
+  '/api/dashboard': ['GET'],
   '/api/config': ['GET'],
   '/api/budget': ['PUT'],
-  '/api/status': ['GET']
+  '/api/status': ['GET'],
+  '/api/chat': ['POST'],
+  '/api/models': ['GET'],
+  '/api/chats': ['GET', 'POST'],
+  '/api/classify': ['POST'],
+  '/api/optimize': ['POST'],
+  '/api/github': ['GET'],
+  '/api/github/sync': ['POST'],
+  '/api/github/repos': ['PUT'],
+  '/api/github/git': ['POST']
 });
 
 function positiveInt(value, fallback) {
@@ -210,6 +253,40 @@ function knownProjectVocabulary(zstack) {
     playbooks = [];
   }
   return { playbooks, policies: Object.keys(POLICIES) };
+}
+
+/**
+ * Attach each cloned repo to a project, creating one where none matches.
+ *
+ * A project is the grouping runs hang off, so an imported repo becomes one
+ * (name = repo name, dir = its local clone). A repo whose clone is not on
+ * disk links to nothing: a project must point at a real directory, and a
+ * placeholder that faults on first use is a trap. A name that already exists
+ * as a project links to it rather than faulting the whole sync.
+ */
+function linkRepoProjects(repos, projectsFile, zstack) {
+  const known = knownProjectVocabulary(zstack);
+  const { projects } = readProjects(projectsFile);
+  let created = 0;
+  const linked = repos.map((repo) => {
+    if (!repo.cloned) return { ...repo, projectId: null };
+    const dir = resolve(repo.localPath);
+    const match = projects.find(
+      (p) => resolve(p.dir) === dir || p.name.toLowerCase() === repo.name.toLowerCase()
+    );
+    if (match) return { ...repo, projectId: match.id };
+    try {
+      const project = createProject({ name: repo.name, dir }, projectsFile, known);
+      projects.push(project);
+      created += 1;
+      return { ...repo, projectId: project.id };
+    } catch {
+      // A clash the sync cannot resolve (a name collision with a different
+      // directory): the repo stays pickable, it just groups no runs.
+      return { ...repo, projectId: null };
+    }
+  });
+  return { repos: linked, created };
 }
 
 /**
@@ -252,7 +329,16 @@ export function resolveStaticPath(urlPath) {
   const root = resolve(WEB_ROOT);
   // The authoritative check. Segment inspection alone loses to an encoding that
   // decodes to a separator after the fact.
-  if (full !== root && !full.startsWith(root + sep)) return null;
+  if (full !== root && !full.startsWith(root + sep)) {
+    if (segments[0] === 'assets') {
+      const assetsRoot = resolve(join(ZSTACK_ROOT, 'assets'));
+      const assetFull = resolve(join(assetsRoot, ...segments.slice(1)));
+      if (assetFull === assetsRoot || assetFull.startsWith(assetsRoot + sep)) {
+        return assetFull;
+      }
+    }
+    return null;
+  }
   return full;
 }
 
@@ -315,13 +401,13 @@ function streamRun(req, res, registry, id) {
   };
 
   const backlog = registry.replay(id, since) || [];
-  let terminal = false;
-  for (const entry of backlog) {
-    write(entry);
-    if (entry.type === 'end') terminal = true;
-  }
+  for (const entry of backlog) write(entry);
 
-  if (terminal || run.settled) {
+  // Terminal only when the run is settled now, not because the transcript
+  // contains an `end`. A resumed run's log holds the end of the leg it paused
+  // at, so treating that as terminal closed the stream before the resumed turns
+  // arrived: the page froze on "paused" while the run was working.
+  if (run.settled) {
     res.end();
     return;
   }
@@ -355,6 +441,14 @@ export function createApp(options = {}) {
   const historyFile = options.historyPath;
   const projectsFile = options.projectsPath;
   const overridesFile = options.overridesPath;
+  const chatsFile = options.chatsPath;
+  const githubFile = options.githubPath;
+  // Injectable so the sync endpoints are testable without the network.
+  const githubFetch = options.githubFetch || fetch;
+  const ghExecFile = options.ghExecFile;
+  // Chats with a turn in flight. One writer per conversation keeps two replies
+  // from interleaving into the same transcript out of order.
+  const busyChats = new Set();
   const registry = options.registry || new RunRegistry({
     zstack,
     historyPath: historyFile,
@@ -363,8 +457,29 @@ export function createApp(options = {}) {
     projectNameFor: (id) => findProject(id, projectsFile)?.name ?? null,
     // Live pages and cards show a custom title without a re-read, same story:
     // the server owns the overrides file and hands the registry a lookup.
-    overrideFor: (id) => readOverrides(overridesFile).overrides[id] || null
+    overrideFor: (id) => readOverrides(overridesFile).overrides[id] || null,
+    gitExecFile: options.gitExecFile,
+    githubFetch: options.githubFetch
   });
+  const gitOptions = { execFileImpl: options.gitExecFile };
+  // Run admission reserves synchronously, before root resolution can yield.
+  // Unresolved admissions conservatively block mutations in every repository.
+  // Once a mutation owns a root, admissions to that root cannot activate a run.
+  const workspaceMutations = new Map();
+  let resolvingRunAdmissions = 0;
+  const admitRun = async (workspace, activate) => {
+    resolvingRunAdmissions++;
+    try {
+      let root;
+      try { root = await canonicalGitRoot(workspace || process.cwd(), gitOptions); }
+      catch { /* Non-Git workspaces still use the registry's normal validation. */ }
+      if (root && workspaceMutations.has(root)) {
+        throw Object.assign(new Error('A Git mutation is in flight in this repository. Wait before starting or resuming a run.'), { kind: 'git-workspace-busy' });
+      }
+      // No await between checking the reservation and activating the registry.
+      return activate();
+    } finally { resolvingRunAdmissions--; }
+  };
   const startedAt = Date.now();
   const boundHost = options.host || DEFAULT_HOST;
 
@@ -407,7 +522,11 @@ export function createApp(options = {}) {
    */
   const pageForRun = async (id, projectsById) => {
     const livePage = registry.getPage(id);
-    if (livePage) return withProjectName(livePage, projectsById);
+    if (livePage) {
+      const page = withProjectName(livePage, projectsById);
+      if (page.turnBudget) page.turnBudget.inPlace = registry.canResume(id);
+      return page;
+    }
     let entry = null;
     try {
       entry = findHistoryEntry(id, historyFile);
@@ -415,7 +534,77 @@ export function createApp(options = {}) {
       return null;
     }
     if (!entry) return null;
-    return withProjectName(projectStoredRun(withOverride(entry)), projectsById);
+    return withProjectName(archivedPageFor(entry, id), projectsById);
+  };
+
+  /**
+   * An archived record as a page, with its resume claims checked against what
+   * this process can actually do.
+   *
+   * Resuming pause happens in memory: the registry holds the run, and a restart
+   * takes that away while leaving a history record that still says "paused,
+   * session saved". Left alone the page would offer a Resume button whose
+   * endpoint answers 404 — a control that lies. So a paused run is only
+   * resumable in place when this process is the one holding it, and otherwise
+   * the page says so and offers the continuation that does work from history.
+   */
+  const archivedPageFor = (entry, id) => {
+    const page = projectStoredRun(withOverride(entry));
+    if (page.turnBudget && page.turnBudget.paused) {
+      const inPlace = registry.canResume(id);
+      page.turnBudget.inPlace = inPlace;
+      page.turnBudget.staleAfterRestart = !inPlace;
+    } else if (page.turnBudget) {
+      page.turnBudget.inPlace = false;
+    }
+    return page;
+  };
+
+  /**
+   * What the registry needs to continue a run, from either place a run lives.
+   *
+   * A retained live run is preferred, matching the page endpoint. Falling back
+   * to history is what makes continuation work after a restart: the session id
+   * was written to the record when the run finished, so a run that hit its
+   * limit yesterday can still be picked up today.
+   */
+  const continuationSourceFor = (id) => {
+    const live = registry.get(id);
+    if (live) {
+      return {
+        id: live.id,
+        sessionId: live.sessionId ?? null,
+        maxTurns: live.maxTurns ?? live.request?.maxTurns ?? null,
+        playbook: live.playbook,
+        role: live.request?.role,
+        model: live.model,
+        policy: live.request?.policy,
+        projectId: live.projectId ?? live.request?.projectId ?? null,
+        workspace: live.workspace,
+        turnLimitReached: live.turnLimitReached === true
+      };
+    }
+    const entry = findHistoryEntry(id, historyFile);
+    if (!entry) return null;
+    const override = getOverride(id, overridesFile);
+    return {
+      id,
+      sessionId: entry.sessionId ?? null,
+      maxTurns: entry.maxTurns ?? null,
+      playbook: entry.playbook,
+      role: entry.role,
+      // A completion run records its model on the start step rather than the
+      // record, so the continuation has something to resume on either way.
+      model: entry.model ?? null,
+      // Older records predate the stored policy; `applied` is the one bit they
+      // do carry, and continuing a write-enabled run as read-only would report
+      // the follow-up work as declined for no visible reason.
+      policy: entry.policy ?? (entry.applied === true ? 'apply' : null),
+      // The override wins, so continuing a run that was moved carries the move.
+      projectId: override && 'projectId' in override ? override.projectId : (entry.projectId ?? null),
+      workspace: entry.workspace ?? null,
+      turnLimitReached: entry.turnLimitReached === true
+    };
   };
 
   const handler = async (req, res) => {
@@ -481,9 +670,21 @@ export function createApp(options = {}) {
       const limit = positiveInt(url.searchParams.get('limit'), HISTORY_DEFAULT_LIMIT);
       // The tail read, not a full scan: this is the endpoint the UI hits on
       // every navigation, and history has no index to scan cheaply.
+      //
+      // Deduped by id because a run can now be recorded more than once: pausing
+      // writes a record, and resuming and finishing writes another for the same
+      // run. History is append-only so the newest wins, and without this the
+      // list would show the same run twice — once paused and once finished.
+      const seenIds = new Set();
       const archived = readHistoryTail(limit, historyFile)
         .map(withOverride)
         .filter((entry) => entry && !entry.hidden)
+        .filter((entry) => {
+          const id = entry.id;
+          if (seenIds.has(id)) return false;
+          seenIds.add(id);
+          return true;
+        })
         .map(projectRunSummary);
       const archivedIds = new Set(archived.map((e) => e.id));
       // A live run is not in history until it finishes, so without this the run
@@ -512,6 +713,87 @@ export function createApp(options = {}) {
         // load-more affordance instead of a count it does not have.
         hasMore: archived.length >= limit,
         liveCount: live.filter((r) => r.live).length
+      });
+      return;
+    }
+
+    // --- dashboard --------------------------------------------------------
+    // One read for the main view: status counts, per-project activity, and
+    // the newest runs. The client could assemble this from /api/runs plus
+    // one request per project, but that is N+1 requests on every navigation
+    // to the page the operator sees most. The window is bounded (newest 200
+    // records scanned, newest 8 runs returned), so the cost is one pass with
+    // constant memory — the same shape as the project page's scan.
+    if (path === '/api/dashboard' && method === 'GET') {
+      const projects = readProjects(projectsFile).projects;
+      const projectsById = new Map(projects.map((p) => [p.id, p]));
+      const hiddenIds = new Set(Object.entries(readOverrides(overridesFile).overrides)
+        .filter(([, item]) => item && item.hidden === true)
+        .map(([id]) => id));
+      const scannedSeen = new Set();
+      const scanned = readHistory({ limit: 200, path: historyFile }).entries
+        .map(withOverride)
+        .filter((entry) => entry && !entry.hidden)
+        // Same dedupe as the list: a paused run is recorded again when it
+        // resumes, and counting both would report one run as two.
+        .filter((entry) => {
+          if (scannedSeen.has(entry.id)) return false;
+          scannedSeen.add(entry.id);
+          return true;
+        });
+      const scannedIds = new Set(scanned.map((e) => e.id));
+      const live = registry.listLive()
+        .filter((r) => !scannedIds.has(r.id) && !hiddenIds.has(r.id));
+
+      let running = 0;
+      let failed24h = 0;
+      const since = Date.now() - 24 * 60 * 60 * 1000;
+      const perProject = new Map();
+      const cards = [];
+      for (const card of [...live, ...scanned.map(projectRunSummary)]) {
+        const annotated = withProjectName(card, projectsById);
+        if (annotated.live || annotated.status === 'running' || annotated.status === 'starting') {
+          running++;
+        }
+        const at = annotated.at ? Date.parse(annotated.at) : NaN;
+        if (!Number.isNaN(at) && at >= since) {
+          if (annotated.status === 'failed') failed24h++;
+        }
+        if (cards.length < 8) cards.push(annotated);
+        const pid = annotated.projectId || null;
+        if (!perProject.has(pid)) {
+          perProject.set(pid, {
+            projectId: pid,
+            projectName: pid ? projectsById.get(pid)?.name ?? null : null,
+            runs: 0,
+            lastAt: null
+          });
+        }
+        const bucket = perProject.get(pid);
+        bucket.runs++;
+        if (annotated.at && (!bucket.lastAt || annotated.at > bucket.lastAt)) {
+          bucket.lastAt = annotated.at;
+        }
+      }
+      // A project with no runs in the window still gets a row: the dashboard
+      // answers "what is active" and "what exists", and a quiet project is
+      // an answer to the first, not an absence from the second.
+      for (const p of projects) {
+        if (!perProject.has(p.id)) {
+          perProject.set(p.id, { projectId: p.id, projectName: p.name, runs: 0, lastAt: null });
+        }
+      }
+      sendJson(res, 200, {
+        ok: true,
+        running,
+        failed24h,
+        windowRuns: scanned.length + live.length,
+        projects: [...perProject.values()].sort((a, b) =>
+          String(b.lastAt || '').localeCompare(String(a.lastAt || ''))
+        ),
+        recent: cards
+          .sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))
+          .slice(0, 8)
       });
       return;
     }
@@ -547,10 +829,10 @@ export function createApp(options = {}) {
           }
           request.workspaceDir = project.dir;
         }
-        const run = registry.start(request);
+        const run = await admitRun(request.workspaceDir, () => registry.start(request));
         sendJson(res, 202, { ok: true, id: run.id, page: registry.getPage(run.id) });
       } catch (err) {
-        fail(res, err.kind === 'invalid-request' ? 400 : 500, err.message, {
+        fail(res, err.kind === 'git-workspace-busy' ? 409 : err.kind === 'invalid-request' ? 400 : 500, err.message, {
           problems: err.problems
         });
       }
@@ -670,6 +952,216 @@ export function createApp(options = {}) {
       return;
     }
 
+    // --- github ------------------------------------------------------------
+    if (path === '/api/github' && method === 'GET') {
+      const store = readGitHubStore(githubFile);
+      sendJson(res, 200, {
+        ok: true,
+        // Whether a token exists — from the environment, a .env file, or an
+        // authenticated gh CLI — never the token itself.
+        configured: readGitHubToken() !== null || (await ghAuthToken({ execFileImpl: ghExecFile })) !== null,
+        login: store.login,
+        syncedAt: store.syncedAt,
+        baseDir: store.baseDir,
+        repos: store.repos,
+        corrupted: store.corrupted || undefined,
+        path: store.path
+      });
+      return;
+    }
+
+    if (path === '/api/github/sync' && method === 'POST') {
+      // A PAT from the environment or .env first; an authenticated gh CLI
+      // answers for a machine that never set either.
+      const token = readGitHubToken() || (await ghAuthToken({ execFileImpl: ghExecFile }));
+      if (!token) {
+        fail(res, 400, 'No GitHub token. Set GITHUB_TOKEN in .env or the environment, or log in with the gh CLI, then sync again.', {
+          problems: ['No GitHub token. Set GITHUB_TOKEN in .env or the environment, or log in with the gh CLI, then sync again.']
+        });
+        return;
+      }
+      let fetched;
+      try {
+        fetched = await fetchGitHubRepos({ token, fetchImpl: githubFetch });
+      } catch (err) {
+        fail(res, 502, err.message, { problems: [err.message] });
+        return;
+      }
+      // The merge runs before the project linking so the paths the linking
+      // sees are the merged ones: an edited localPath survives the re-sync
+      // and its project points where the reader chose.
+      const store = readGitHubStore(githubFile);
+      const merged = mergeRepos(store.repos, fetched.repos, store.baseDir);
+      const { repos, created } = linkRepoProjects(merged, projectsFile, zstack);
+      const doc = {
+        login: fetched.login || store.login,
+        syncedAt: new Date().toISOString(),
+        baseDir: store.baseDir || defaultBaseDir(),
+        repos
+      };
+      writeGitHubStore(githubFile, doc);
+      sendJson(res, 200, { ok: true, ...doc, projectsCreated: created });
+      return;
+    }
+
+    if (path === '/api/github/repos' && method === 'PUT') {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      const problems = [];
+      if (typeof body?.fullName !== 'string' || body.fullName.trim() === '') {
+        problems.push('A repo needs its full name (owner/name).');
+      }
+      if (typeof body?.localPath !== 'string' || body.localPath.trim() === '') {
+        problems.push('A repo needs a local path.');
+      } else {
+        try {
+          if (!statSync(resolve(body.localPath.trim())).isDirectory()) {
+            problems.push(`"${body.localPath.trim()}" is not a directory.`);
+          }
+        } catch {
+          problems.push(`"${body.localPath.trim()}" does not exist or cannot be read.`);
+        }
+      }
+      if (problems.length > 0) {
+        fail(res, 400, problems.join(' '), { problems });
+        return;
+      }
+      const store = readGitHubStore(githubFile);
+      const repo = store.repos.find((r) => r.fullName === body.fullName.trim());
+      if (!repo) {
+        fail(res, 404, `No synced repo named "${body.fullName.trim()}". Sync first.`);
+        return;
+      }
+      const updated = {
+        ...repo,
+        localPath: resolve(body.localPath.trim()),
+        cloned: true
+      };
+      // The picked path decides the project dir, exactly as the sync does.
+      const { repos: linked } = linkRepoProjects(
+        store.repos.map((r) => (r.fullName === repo.fullName ? updated : r)),
+        projectsFile,
+        zstack
+      );
+      const next = {
+        login: store.login,
+        syncedAt: store.syncedAt,
+        baseDir: store.baseDir,
+        repos: linked
+      };
+      writeGitHubStore(githubFile, next);
+      sendJson(res, 200, {
+        ok: true,
+        repo: linked.find((r) => r.fullName === repo.fullName)
+      });
+      return;
+    }
+
+    // --- github git work ---------------------------------------------------
+    /**
+     * One git operation on one repo's local clone, or on the workspace a run
+     * executed in. The directory always comes from the server's own records
+     * (the synced repo or the run page), never from the client, so a request
+     * cannot point the server at an arbitrary directory.
+     */
+    const runGitOp = async (dir, body) => {
+      let reservedRoot;
+      const reservation = Symbol('git mutation');
+      try {
+        return { ok: true, ...(await gitOp(dir, body, {
+          ...gitOptions,
+          beforeMutation: async (root) => {
+            if (resolvingRunAdmissions) throw Object.assign(new Error('A run is being admitted. Retry the Git mutation after admission finishes.'), { kind: 'git-active-run' });
+            workspaceMutations.set(root, reservation);
+            reservedRoot = root;
+            for (const card of registry.listLive()) {
+              if (!card.live) continue;
+              const run = registry.get(card.id);
+              const workspace = run?.workspace || run?.request?.workspaceDir || process.cwd();
+              let activeRoot;
+              try { activeRoot = await canonicalGitRoot(workspace, gitOptions); } catch { continue; }
+              if (activeRoot === root) throw Object.assign(new Error('Git mutations are refused while a run is active in this repository. Stop or finish the run first.'), { kind: 'git-active-run' });
+            }
+          }
+        })) };
+      } catch (err) {
+        const status =
+          err.kind === 'git-invalid' ? 400
+          : err.kind === 'git-unavailable' ? 502
+          : err.kind === 'git-timeout' ? 504
+          : 409;
+        fail(res, status, err.message, {
+          problems: [err.message, ...(err.output ? [err.output] : [])]
+        });
+        return null;
+      } finally {
+        if (reservedRoot && workspaceMutations.get(reservedRoot) === reservation) workspaceMutations.delete(reservedRoot);
+      }
+    };
+
+    if (path === '/api/github/git' && method === 'POST') {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      const store = readGitHubStore(githubFile);
+      const repo = store.repos.find((r) => r.fullName === String(body?.fullName || '').trim());
+      if (!repo) {
+        fail(res, 404, `No synced repo named "${String(body?.fullName || '')}". Sync first.`);
+        return;
+      }
+      if (!repo.cloned) {
+        fail(res, 400, `"${repo.fullName}" is not cloned locally, so there is no working tree to work in.`, {
+          problems: [`"${repo.fullName}" is not cloned locally, so there is no working tree to work in.`]
+        });
+        return;
+      }
+      const doc = await runGitOp(repo.localPath, body);
+      if (doc) sendJson(res, 200, { ...doc, fullName: repo.fullName });
+      return;
+    }
+
+    const runGitMatch = path.match(/^\/api\/runs\/([^/]+)\/git$/);
+    if (runGitMatch) {
+      let id;
+      try { id = decodeURIComponent(runGitMatch[1]); }
+      catch { fail(res, 400, 'Run id contains invalid percent encoding.'); return; }
+      if (method !== 'POST') {
+        fail(res, 405, `${method} is not allowed for ${path}. Allowed: POST.`);
+        return;
+      }
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      const projectsById = new Map(
+        readProjects(projectsFile).projects.map((p) => [p.id, p])
+      );
+      const page = await pageForRun(id, projectsById);
+      if (!page) {
+        fail(res, 404, `No run with id ${id}.`);
+        return;
+      }
+      if (!page.workspace) {
+        fail(res, 400, 'This run recorded no workspace directory, so there is nothing to work in.');
+        return;
+      }
+      const doc = await runGitOp(page.workspace, body);
+      if (doc) sendJson(res, 200, { ...doc, runId: id });
+      return;
+    }
+
     // --- one run ----------------------------------------------------------
     const runMatch = path.match(/^\/api\/runs\/([^/]+)$/);
     if (runMatch) {
@@ -735,6 +1227,54 @@ export function createApp(options = {}) {
       return;
     }
 
+    // --- continue a run ---------------------------------------------------
+    // The answer to "it stopped early, now what". A run that spent its turn
+    // budget is resumed from the session it saved, with a bigger budget, as a
+    // new run: the original stays exactly as it happened.
+    const continueMatch = path.match(/^\/api\/runs\/([^/]+)\/continue$/);
+    if (continueMatch) {
+      if (method !== 'POST') {
+        fail(res, 405, `${method} is not allowed for ${path}.`);
+        return;
+      }
+      const id = decodeURIComponent(continueMatch[1]);
+      let body = {};
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      const previous = continuationSourceFor(id);
+      if (!previous) {
+        fail(res, 404, `No run with id ${id}.`);
+        return;
+      }
+      try {
+        // continueRun uses the default cwd for project-backed continuations;
+        // otherwise it forwards the recorded workspace to start().
+        const workspace = previous.projectId ? process.cwd() : previous.workspace;
+        const live = await admitRun(workspace, () => registry.continueRun(previous, body));
+        sendJson(res, 202, {
+          ok: true,
+          id: live.id,
+          continuedFrom: id,
+          page: registry.getPage(live.id)
+        });
+      } catch (err) {
+        // 409 for a run that exists but cannot be resumed: it is not a missing
+        // resource and not a bad request, and the reader needs to know the
+        // difference between "no such run" and "that one cannot continue".
+        const status = err.kind === 'unknown-run'
+          ? 404
+          : err.kind === 'not-resumable' || err.kind === 'git-workspace-busy'
+            ? 409
+            : 400;
+        fail(res, status, err.message, err.problems ? { problems: err.problems } : {});
+      }
+      return;
+    }
+
     // --- cancel a run -----------------------------------------------------
     const cancelMatch = path.match(/^\/api\/runs\/([^/]+)\/cancel$/);
     if (cancelMatch) {
@@ -750,6 +1290,56 @@ export function createApp(options = {}) {
       }
       const cancelled = registry.cancel(id);
       sendJson(res, 200, { ok: true, cancelled, id });
+      return;
+    }
+
+    // --- pause a run ------------------------------------------------------
+    // A pause is a request the run honours at its next turn boundary, not an
+    // action taken here. Nothing is killed, so the harness finishes the turn it
+    // is in and saves its session — which is the only reason resuming is
+    // possible at all.
+    const pauseMatch = path.match(/^\/api\/runs\/([^/]+)\/pause$/);
+    if (pauseMatch) {
+      if (method !== 'POST') {
+        fail(res, 405, `${method} is not allowed for ${path}.`);
+        return;
+      }
+      const id = decodeURIComponent(pauseMatch[1]);
+      const requested = registry.pause(id);
+      if (!requested) {
+        // 409 rather than 404: the run exists, it just has no loop left to
+        // interrupt. A control that claimed to pause a finished run would lie.
+        fail(res, 409, `No run with id ${id} is running in this process, so there is nothing to pause.`);
+        return;
+      }
+      const page = registry.getPage(id);
+      sendJson(res, 202, { ok: true, pausing: id, page });
+      return;
+    }
+
+    // --- resume a paused run ----------------------------------------------
+    const resumeMatch = path.match(/^\/api\/runs\/([^/]+)\/resume$/);
+    if (resumeMatch) {
+      if (method !== 'POST') {
+        fail(res, 405, `${method} is not allowed for ${path}.`);
+        return;
+      }
+      const id = decodeURIComponent(resumeMatch[1]);
+      try {
+        const run = registry.get(id);
+        const live = await admitRun(run?.workspace || run?.request?.workspaceDir, () => registry.resume(id));
+        sendJson(res, 202, { ok: true, id: live.id, page: registry.getPage(live.id) });
+      } catch (err) {
+        // 404 for a run this process never saw; 409 for one that exists in a
+        // state that cannot be resumed, which is a different answer and the
+        // reader needs to be able to tell them apart. 400 for the rest.
+        const status = err.kind === 'unknown-run'
+          ? 404
+          : err.kind === 'not-resumable' || err.kind === 'not-paused' || err.kind === 'git-workspace-busy'
+            ? 409
+            : 400;
+        fail(res, status, err.message);
+      }
       return;
     }
 
@@ -781,6 +1371,12 @@ export function createApp(options = {}) {
       const stored = zstack.getBudget();
       sendJson(res, 200, {
         ok: true,
+        // The turn budgets the composer offers and the run endpoint accepts.
+        // Served rather than hard-coded in the client so the two cannot drift
+        // apart: a preset the UI shows is one the server will honour.
+        turnPresets: TURN_PRESETS.map((p) => ({ ...p })),
+        defaultMaxTurns: DEFAULT_MAX_TURNS,
+        maxMaxTurns: MAX_MAX_TURNS,
         lanes: Object.entries(LANES).map(([id, lane]) => ({
           id,
           name: lane.name ?? id,
@@ -852,10 +1448,426 @@ export function createApp(options = {}) {
       return;
     }
 
+    // --- chat models ------------------------------------------------------
+    // The catalogue the pin picker offers. A down bridge is a state the page
+    // must render, not an error: it answers 200 with `connected: false` so the
+    // picker can say why it is empty instead of the page failing to load.
+    if (path === '/api/models') {
+      try {
+        const listing = typeof zstack.models === 'function' ? await zstack.models() : null;
+        if (!listing || listing.connected === false) {
+          sendJson(res, 200, {
+            ok: true,
+            connected: false,
+            error: listing?.error || 'This server has no model catalogue.',
+            models: []
+          });
+          return;
+        }
+        sendJson(res, 200, {
+          ok: true,
+          connected: true,
+          activeProviders: listing.activeProviders || [],
+          models: listing.models || []
+        });
+      } catch (err) {
+        sendJson(res, 200, { ok: true, connected: false, error: err?.message || String(err), models: [] });
+      }
+      return;
+    }
+
+    // --- one chat turn ----------------------------------------------------
+    // The narrowest endpoint here: one completion against a pinned model, with
+    // no tools, workspace, playbook, or record. It exists because the browser
+    // cannot POST the gateway directly (cross-origin), so this proxies one
+    // turn. A reader who disconnects aborts the upstream call rather than
+    // leaving a model generating for a page nobody is looking at.
+    if (path === '/api/chat' && method === 'POST') {
+      if (typeof zstack.chat !== 'function') {
+        fail(res, 503, 'This server has no chat capability.');
+        return;
+      }
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      const problems = validateChatRequest(body);
+      if (problems.length > 0) {
+        fail(res, 400, problems.join(' '), { problems });
+        return;
+      }
+      const controller = new AbortController();
+      res.on('close', () => {
+        if (!res.writableEnded) controller.abort();
+      });
+      try {
+        const reply = await zstack.chat({
+          model: String(body.model).trim(),
+          messages: body.messages,
+          sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
+          signal: controller.signal
+        });
+        sendJson(res, 200, {
+          ok: true,
+          content: reply.content,
+          model: reply.model,
+          usage: reply.usage,
+          durationMs: reply.durationMs
+        });
+      } catch (err) {
+        // The socket is already closing when this fires, so there is nobody to
+        // tell; returning quietly is the honest answer, not an error response.
+        if (controller.signal.aborted) return;
+        const kind = err?.kind || null;
+        const status = kind === 'timeout'
+          ? 504
+          : kind === 'unreachable' || kind === 'http' || kind === 'parse'
+            ? 502
+            : 500;
+        fail(res, status, err?.message || String(err), kind ? { kind } : {});
+      }
+      return;
+    }
+
+    // --- classify a prompt -----------------------------------------------
+    // Matches a prompt against playbooks using keyword scoring and semantic
+    // routing if ambiguous. If the bridge is unreachable, falls back to keyword
+    // scoring with a warning.
+    if (path === '/api/classify' && method === 'POST') {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      const raw = typeof body?.prompt === 'string' ? body.prompt.trim() : '';
+      if (!raw) {
+        fail(res, 400, 'A prompt is required to classify.');
+        return;
+      }
+      const detailed = typeof zstack.classifyPromptDetailed === 'function'
+        ? zstack.classifyPromptDetailed(raw)
+        : (typeof zstack.classifyPrompt === 'function' ? zstack.classifyPrompt(raw) : { type: 'feature', principles: [], role: 'feature, refactoring' });
+      let playbook = detailed.type;
+      let principles = detailed.principles || [];
+      let role = detailed.role || null;
+      let semanticScore = null;
+      let warning = null;
+
+      if (detailed.ambiguous) {
+        try {
+          const { classifyPromptSemantic, ROUTER_MIN_SCORE } = await import('./router.mjs');
+          const sem = await classifyPromptSemantic(raw, { baseUrl: zstack.baseUrl, rootDir: zstack.rootDir });
+          if (sem && sem.score >= ROUTER_MIN_SCORE) {
+            semanticScore = sem.score;
+            const { PLAYBOOK_TRIGGERS } = await import('./sdk.mjs');
+            const rule = PLAYBOOK_TRIGGERS.find((r) => r.type === sem.type);
+            if (rule) {
+              playbook = rule.type;
+              role = rule.role;
+              principles = rule.principles;
+            }
+          }
+        } catch {
+          warning = 'The bridge is unreachable; fell back to keyword scoring for playbook.';
+        }
+      }
+      sendJson(res, 200, {
+        ok: true,
+        playbook,
+        role,
+        principles,
+        ambiguous: detailed.ambiguous,
+        confidence: detailed.confidence,
+        candidates: detailed.candidates,
+        semanticScore,
+        warning
+      });
+      return;
+    }
+
+    // --- optimize a prompt ------------------------------------------------
+    // One model call that rewrites a raw request into a task prompt. Nothing
+    // runs and nothing is stored: the text goes back to the composer to review.
+    if (path === '/api/optimize' && method === 'POST') {
+      if (typeof zstack.optimizePrompt !== 'function') {
+        fail(res, 503, 'This server cannot optimize prompts.');
+        return;
+      }
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      const problems = validateOptimizeRequest(body);
+      if (problems.length > 0) {
+        fail(res, 400, problems.join(' '), { problems });
+        return;
+      }
+      const controller = new AbortController();
+      res.on('close', () => {
+        if (!res.writableEnded) controller.abort();
+      });
+      try {
+        const result = await zstack.optimizePrompt({
+          prompt: String(body.prompt).trim(),
+          playbook: typeof body.playbook === 'string' && body.playbook !== '' ? body.playbook : undefined,
+          lane: typeof body.lane === 'string' && body.lane !== '' ? body.lane : undefined,
+          signal: controller.signal
+        });
+        sendJson(res, 200, {
+          ok: true,
+          prompt: result.prompt,
+          original: result.original ?? String(body.prompt).trim(),
+          model: result.model,
+          playbook: result.playbook ?? null,
+          principles: result.principles ?? [],
+          durationMs: result.durationMs ?? null
+        });
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        const kind = err?.kind || null;
+        if (kind === 'unreachable' && typeof zstack.classifyPromptDetailed === 'function') {
+          const detailed = zstack.classifyPromptDetailed(String(body.prompt).trim());
+          sendJson(res, 200, {
+            ok: true,
+            prompt: String(body.prompt).trim(),
+            original: String(body.prompt).trim(),
+            model: null,
+            playbook: detailed.type,
+            principles: detailed.principles,
+            warning: 'The bridge is unreachable; prompt optimization skipped and playbook matched by keyword scoring.',
+            unreachable: true
+          });
+          return;
+        }
+        const status = kind === 'timeout'
+          ? 504
+          : kind === 'unreachable' || kind === 'http' || kind === 'parse'
+            ? 502
+            : 500;
+        fail(res, status, err?.message || String(err), kind ? { kind } : {});
+      }
+      return;
+    }
+
+    // --- chats ------------------------------------------------------------
+    // A chat is a persisted conversation, not a run: no workspace, no playbook,
+    // no tool loop, no history record. It lives on the server so it survives a
+    // browser, and so the reply a turn streams is stored even if the reader
+    // navigates away before it finishes.
+    if (path === '/api/chats' && method === 'GET') {
+      const { chats, corrupted, path: file } = readChats(chatsFile);
+      const summaries = chats
+        .map(chatSummary)
+        .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+      sendJson(res, 200, {
+        ok: true,
+        chats: summaries,
+        path: file,
+        corrupted: corrupted || undefined
+      });
+      return;
+    }
+
+    if (path === '/api/chats' && method === 'POST') {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      try {
+        const record = createChat(body, chatsFile);
+        sendJson(res, 201, { ok: true, id: record.id, chat: projectChat(record) });
+      } catch (err) {
+        fail(res, err.kind === 'invalid-chat' ? 400 : 500, err.message, { problems: err.problems });
+      }
+      return;
+    }
+
+    // --- one chat turn, streamed ------------------------------------------
+    // The reply is written back to the chat as it settles, so persistence and
+    // the live stream are the same event rather than two that can disagree.
+    // Only one turn per chat is allowed at a time; its deltas are SSE frames.
+    const chatMessageMatch = path.match(/^\/api\/chats\/([^/]+)\/messages$/);
+    if (chatMessageMatch) {
+      if (method !== 'POST') {
+        fail(res, 405, `${method} is not allowed for ${path}.`);
+        return;
+      }
+      const id = decodeURIComponent(chatMessageMatch[1]);
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      const problems = validateChatMessage(body.text);
+      if (problems.length > 0) {
+        fail(res, 400, problems.join(' '), { problems });
+        return;
+      }
+      const chat = findChat(id, chatsFile);
+      if (!chat) {
+        fail(res, 404, `No chat with id ${id}.`);
+        return;
+      }
+      if (!chat.model) {
+        fail(res, 400, 'Pin a model before sending a message.', {
+          problems: ['Pin a model before sending a message.']
+        });
+        return;
+      }
+      if (busyChats.has(id)) {
+        fail(res, 409, 'This chat already has a turn in flight. Wait for it to finish.');
+        return;
+      }
+      // The turn writes two messages. Refuse before starting when there is not
+      // room for both, or the reply would be lost after the model spent tokens.
+      if (chat.messages.length + 2 > CHAT_MAX_MESSAGES) {
+        fail(res, 400, `This chat is full at ${CHAT_MAX_MESSAGES} messages. Start a new one.`, {
+          problems: [`This chat is full at ${CHAT_MAX_MESSAGES} messages.`]
+        });
+        return;
+      }
+      let stored;
+      try {
+        stored = appendMessage(id, { id: newMessageId(), role: 'user', content: String(body.text).trim() }, chatsFile);
+      } catch (err) {
+        fail(res, err.kind === 'invalid-chat' ? 400 : 500, err.message, { problems: err.problems });
+        return;
+      }
+      busyChats.add(id);
+      const controller = new AbortController();
+      res.on('close', () => {
+        if (!res.writableEnded) controller.abort();
+      });
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-store',
+        connection: 'keep-alive',
+        'x-accel-buffering': 'no'
+      });
+      const frame = (event, data) => {
+        if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      };
+      const userMessage = stored.messages[stored.messages.length - 1];
+      const assistantId = newMessageId();
+      // The transcript sent to the model drops any empty body, which a stopped
+      // turn can leave behind: an empty assistant turn is not a message.
+      const history = chatWireMessages(stored.messages.filter((m) => m.content.trim() !== ''));
+      frame('start', {
+        chatId: id,
+        model: chat.model,
+        userMessage,
+        assistant: { id: assistantId, role: 'assistant', at: new Date().toISOString() }
+      });
+      let content = '';
+      try {
+        const result = await zstack.chat({
+          model: chat.model,
+          messages: history,
+          sessionId: chat.sessionId,
+          signal: controller.signal,
+          onDelta: (text) => {
+            content += text;
+            frame('delta', { text });
+          }
+        });
+        const saved = appendMessage(id, {
+          id: assistantId,
+          role: 'assistant',
+          content: result.content || content,
+          model: result.model,
+          tokens: result.usage?.total_tokens,
+          durationMs: result.durationMs
+        }, chatsFile);
+        frame('done', { message: saved.messages[saved.messages.length - 1] });
+      } catch (err) {
+        // The reply is persisted even when it failed, with whatever streamed
+        // before the failure, so a reload shows what actually happened. A
+        // reader who already disconnected gets no frame; there is nobody there.
+        try {
+          appendMessage(id, {
+            id: assistantId,
+            role: 'assistant',
+            content,
+            error: err?.message || String(err)
+          }, chatsFile);
+        } catch {
+          // A full chat at the last boundary loses the partial reply; the live
+          // reader is still told why it stopped.
+        }
+        if (!controller.signal.aborted) {
+          frame('error', { error: err?.message || String(err), kind: err?.kind || null });
+        }
+      } finally {
+        busyChats.delete(id);
+        if (!res.writableEnded) res.end();
+      }
+      return;
+    }
+
+    // --- one chat ---------------------------------------------------------
+    const chatMatch = path.match(/^\/api\/chats\/([^/]+)$/);
+    if (chatMatch) {
+      const id = decodeURIComponent(chatMatch[1]);
+      if (method === 'GET') {
+        const chat = findChat(id, chatsFile);
+        if (!chat) {
+          fail(res, 404, `No chat with id ${id}.`);
+          return;
+        }
+        sendJson(res, 200, { ok: true, chat: projectChat(chat) });
+        return;
+      }
+      if (method === 'PATCH') {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          fail(res, err.status || 400, err.message);
+          return;
+        }
+        try {
+          const record = updateChat(id, body, chatsFile);
+          sendJson(res, 200, { ok: true, chat: projectChat(record) });
+        } catch (err) {
+          if (err.kind === 'unknown-chat') fail(res, 404, err.message);
+          else fail(res, err.kind === 'invalid-chat' ? 400 : 500, err.message, { problems: err.problems });
+        }
+        return;
+      }
+      if (method === 'DELETE') {
+        if (busyChats.has(id)) {
+          fail(res, 409, 'This chat has a turn in flight. Stop it before deleting.');
+          return;
+        }
+        try {
+          deleteChat(id, chatsFile);
+          sendJson(res, 200, { ok: true, deleted: id });
+        } catch (err) {
+          fail(res, err.kind === 'unknown-chat' ? 404 : 500, err.message);
+        }
+        return;
+      }
+      fail(res, 405, `${method} is not allowed for ${path}. Allowed: GET, PATCH, DELETE.`);
+      return;
+    }
+
     fail(res, 404, `No such endpoint: ${method} ${path}`);
   };
 
-  return { handler, registry, zstack, historyPath: historyFile, projectsPath: projectsFile, overridesPath: overridesFile };
+  return { handler, registry, zstack, historyPath: historyFile, projectsPath: projectsFile, overridesPath: overridesFile, chatsPath: chatsFile, githubPath: githubFile };
 }
 
 /**

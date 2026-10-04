@@ -15,6 +15,7 @@ import {
 } from '../src/serve.mjs';
 import { appendHistory } from '../src/history.mjs';
 import { RunRegistry } from '../src/runs.mjs';
+import { MAX_TOTAL_TURNS, SEGMENT_TURNS, DEFAULT_MAX_TURNS } from '../src/turns.mjs';
 
 function tmpHistory() {
   return join(mkdtempSync(join(tmpdir(), 'zstack-srv-')), 'history.jsonl');
@@ -63,6 +64,19 @@ function stubZStack(script = {}) {
     ],
     async agent(options) {
       calls.push(options);
+      // Which call this is, so a stub can model the shape a real run has: some
+      // turns that call tools, then a turn that answers. The turn-by-turn loop
+      // reads the tool count to tell work from an answer, so a stub that always
+      // reported tools would loop forever, and one that never did would never
+      // continue.
+      const callNumber = calls.length;
+      // A number, including Infinity for "this run never answers" — which is how
+      // a test drives the loop to the ceiling on purpose.
+      const withTools = typeof script.callsWithTools === 'number' ? script.callsWithTools : 1;
+      const didWork = callNumber <= withTools;
+      // A gate the test controls, so it can hold a turn open and send a pause
+      // request while one is genuinely in flight.
+      if (script.beforeCall) await script.beforeCall(callNumber);
       if (script.beforeEvents) await script.beforeEvents(options);
       for (const event of events) {
         if (options.signal?.aborted) break;
@@ -74,11 +88,17 @@ function stubZStack(script = {}) {
         throw err;
       }
       const workspaceDir = script.workspaceDir === null ? undefined : (script.workspaceDir ?? '/repo');
+      // A distinct session per call, the way the harness works: each resumed
+      // turn saves its own session, and the next turn resumes that one. A stub
+      // reusing one id would hide a loop that resumed the wrong thing.
+      const sessionId = script.sessionId ? `${script.sessionId}-${callNumber}` : null;
       return {
         ok: true,
         exitCode: 0,
         turns: 1,
-        toolCalls: 1,
+        // One turn per call, so this is the segment's own tool count. Zero means
+        // the model answered, which is what ends the loop.
+        toolCalls: didWork ? 1 : 0,
         failedTools: 0,
         declinedTools: 0,
         durationMs: 800,
@@ -89,7 +109,15 @@ function stubZStack(script = {}) {
         usage: { total_tokens: 300 },
         narrative: 'All done.',
         steps: [{ kind: 'start', turn: 0, model: 'opencode/deepseek-v4-pro', workspace: workspaceDir ?? null }],
-        fileChanges: []
+        fileChanges: [],
+        // Echoed the way the real SDK does, so a test of the turn budget is
+        // testing zstack's handling rather than the stub's imagination.
+        sessionId,
+        maxTurns: options.maxTurns ?? null,
+        // What the real harness reports at a one-turn budget: the turn count
+        // always equals the budget, so this flag is true either way and cannot
+        // be what tells work from an answer.
+        turnLimitReached: true
       };
     }
   };
@@ -273,6 +301,477 @@ describe('static path safety', () => {
     assert.equal(isLoopback('192.168.1.5'), false);
     assert.equal(DEFAULT_HOST, '127.0.0.1');
     assert.equal(DEFAULT_PORT, 4141);
+  });
+});
+
+describe('dashboard', () => {
+  function tmpDir() {
+    return mkdtempSync(join(tmpdir(), 'zstack-dashdir-'));
+  }
+
+  it('answers an empty history with zeros and empty lists', async () => {
+    const s = await bootTracked();
+    const doc = await (await s.api('/dashboard')).json();
+    assert.equal(doc.ok, true);
+    assert.equal(doc.running, 0);
+    assert.equal(doc.failed24h, 0);
+    assert.equal(doc.windowRuns, 0);
+    assert.deepEqual(doc.projects, []);
+    assert.deepEqual(doc.recent, []);
+    await s.close();
+  });
+
+  it('counts running, recent failures, and per-project activity', async () => {
+    const s = await bootTracked({ script: { events: runEvents, workspaceDir: null } });
+    const site = await (await s.api('/projects', json({ name: 'Site', dir: tmpDir() }))).json();
+    const shop = await (await s.api('/projects', json({ name: 'Shop', dir: tmpDir() }))).json();
+    const first = await (await s.api('/runs', json({ prompt: 'site work', projectId: site.project.id }))).json();
+    const second = await (await s.api('/runs', json({ prompt: 'shop work', projectId: shop.project.id }))).json();
+    await new Promise((r) => setTimeout(r, 80));
+
+    const doc = await (await s.api('/dashboard')).json();
+    assert.equal(doc.ok, true);
+    assert.equal(doc.windowRuns, 2);
+    // Both runs finished through the stub harness, so nothing is running and
+    // nothing failed: the counts are shaped by status, not by count alone.
+    assert.equal(doc.running, 0);
+    assert.equal(doc.failed24h, 0);
+    assert.equal(doc.recent.length, 2);
+    const byId = new Map(doc.projects.map((p) => [p.projectId, p]));
+    assert.equal(byId.get(site.project.id).runs, 1);
+    assert.equal(byId.get(site.project.id).projectName, 'Site');
+    assert.equal(byId.get(shop.project.id).runs, 1);
+    assert.ok(doc.recent.some((r) => r.id === first.id));
+    assert.ok(doc.recent.some((r) => r.id === second.id));
+    await s.close();
+  });
+
+  it('keeps a quiet project visible and skips hidden runs', async () => {
+    const s = await bootTracked({ script: { events: runEvents, workspaceDir: null } });
+    const quiet = await (await s.api('/projects', json({ name: 'Quiet', dir: tmpDir() }))).json();
+    const busy = await (await s.api('/projects', json({ name: 'Busy', dir: tmpDir() }))).json();
+    const started = await (await s.api('/runs', json({ prompt: 'busy work', projectId: busy.project.id }))).json();
+    await new Promise((r) => setTimeout(r, 80));
+    await s.api(`/runs/${started.id}`, { method: 'DELETE' });
+
+    const doc = await (await s.api('/dashboard')).json();
+    const byId = new Map(doc.projects.map((p) => [p.projectId, p]));
+    // Quiet has no runs in the window but still gets a row; the hidden run
+    // counts nowhere, in neither its project bucket nor the recent list.
+    assert.equal(byId.get(quiet.project.id).runs, 0);
+    assert.equal(byId.get(quiet.project.id).lastAt, null);
+    assert.ok(!doc.recent.some((r) => r.id === started.id));
+    assert.equal(doc.windowRuns, 0);
+    await s.close();
+  });
+
+  it('reflects a rename and a move without a re-read', async () => {
+    const s = await bootTracked({ script: { events: runEvents, workspaceDir: null } });
+    const first = await (await s.api('/projects', json({ name: 'One', dir: tmpDir() }))).json();
+    const second = await (await s.api('/projects', json({ name: 'Two', dir: tmpDir() }))).json();
+    const started = await (await s.api('/runs', json({ prompt: 'movable work', projectId: first.project.id }))).json();
+    await new Promise((r) => setTimeout(r, 80));
+    const patch = (body) => s.api(`/runs/${started.id}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+    });
+    await patch({ title: 'Renamed work', projectId: second.project.id });
+
+    const doc = await (await s.api('/dashboard')).json();
+    const recent = doc.recent.find((r) => r.id === started.id);
+    assert.equal(recent.title, 'Renamed work');
+    assert.equal(recent.projectId, second.project.id);
+    assert.equal(recent.projectName, 'Two');
+    const byId = new Map(doc.projects.map((p) => [p.projectId, p]));
+    assert.equal(byId.get(second.project.id).runs, 1);
+    assert.equal(byId.get(first.project.id)?.runs || 0, 0);
+    await s.close();
+  });
+});
+
+describe('turn budgets', () => {
+  it('serves the presets the composer offers and the validator accepts', async () => {
+    const s = await bootTracked();
+    const doc = await (await s.api('/config')).json();
+    const ids = doc.turnPresets.map((p) => p.id);
+    assert.deepEqual(ids, ['quick', 'standard', 'deep', 'marathon']);
+    // Served rather than hard-coded in the client, so a preset the UI shows is
+    // one the server will honour. A drift between them is a control that lies.
+    for (const preset of doc.turnPresets) {
+      const res = await s.api('/runs', json({ prompt: 'x', maxTurns: preset.id }));
+      assert.equal(res.status, 202, `${preset.id} should be accepted`);
+    }
+    assert.equal(doc.defaultMaxTurns, 25);
+    assert.ok(doc.maxMaxTurns >= 200);
+    await s.close();
+  });
+
+  it('defaults the size rather than leaving it to the harness', async () => {
+    const s = await bootTracked({ script: { events: runEvents, workspaceDir: null, sessionId: 'sess-def' } });
+    const started = await (await s.api('/runs', json({ prompt: 'no size given' }))).json();
+    await new Promise((r) => setTimeout(r, 120));
+    // The harness alone would run 8 turns per call. zstack sends one, because a
+    // call is one turn, and keeps the reader's chosen size on the run so the
+    // page can report it.
+    assert.equal(s.zstack.calls[0].maxTurns, SEGMENT_TURNS);
+    assert.ok(DEFAULT_MAX_TURNS > 1);
+    const doc = await (await s.api(`/runs/${started.id}`)).json();
+    assert.equal(doc.page.turnBudget.maxTurns, DEFAULT_MAX_TURNS);
+    await s.close();
+  });
+
+  it('drives one turn per call, whatever size the reader picked', async () => {
+    const s = await bootTracked({
+      script: { events: runEvents, workspaceDir: null, sessionId: 'sess-one', callsWithTools: 2 }
+    });
+    const started = await (await s.api('/runs', json({ prompt: 'some work', maxTurns: 60 }))).json();
+    await new Promise((r) => setTimeout(r, 150));
+
+    // Three calls: two turns that called tools, then the turn that answered.
+    assert.equal(s.zstack.calls.length, 3);
+    // One turn per call is what makes a pause land at the next boundary. A
+    // larger call budget would put the boundary most of a budget away.
+    for (const call of s.zstack.calls) assert.equal(call.maxTurns, SEGMENT_TURNS);
+    // The first call starts fresh; every later one resumes the session the
+    // previous turn saved, which is what keeps the history intact.
+    assert.ok(!s.zstack.calls[0].resume);
+    assert.equal(s.zstack.calls[1].resume, 'sess-one-1');
+    assert.equal(s.zstack.calls[2].resume, 'sess-one-2');
+
+    const doc = await (await s.api(`/runs/${started.id}`)).json();
+    assert.equal(doc.page.counts.turns, 3);
+    // The size the reader picked is still reported, and the run outgrew it.
+    assert.equal(doc.page.turnBudget.maxTurns, 60);
+    assert.equal(doc.page.turnBudget.used, 3);
+    assert.equal(doc.page.turnBudget.limitReached, false);
+    await s.close();
+  });
+
+  it('stops as soon as a turn answers, rather than continuing a finished run', async () => {
+    // A turn that asks for no tools is the model's answer. At a one-turn budget
+    // the harness still reports "limit reached" (1 >= 1), so a loop trusting
+    // that flag would extend a plain answered question until the ceiling.
+    const s = await bootTracked({
+      script: { events: runEvents, workspaceDir: null, sessionId: 'sess-answer', callsWithTools: 0 }
+    });
+    const started = await (await s.api('/runs', json({ prompt: 'just answer me', maxTurns: 25 }))).json();
+    await new Promise((r) => setTimeout(r, 120));
+
+    assert.equal(s.zstack.calls.length, 1);
+    const doc = await (await s.api(`/runs/${started.id}`)).json();
+    assert.equal(doc.page.turnBudget.used, 1);
+    assert.equal(doc.page.turnBudget.limitReached, false);
+    await s.close();
+  });
+
+  it('stops at the ceiling and says so, rather than running forever', async () => {
+    // A task the model never finishes. Continuing has to end somewhere, or a
+    // loop that does not converge spends a budget nobody agreed to.
+    const s = await bootTracked({
+      script: { events: runEvents, workspaceDir: null, sessionId: 'sess-endless', callsWithTools: Infinity }
+    });
+    const started = await (await s.api('/runs', json({ prompt: 'endless task', maxTurns: 25 }))).json();
+    await new Promise((r) => setTimeout(r, 400));
+
+    assert.equal(s.zstack.calls.length, MAX_TOTAL_TURNS);
+    const doc = await (await s.api(`/runs/${started.id}`)).json();
+    assert.equal(doc.page.turnBudget.limitReached, true);
+    // The ceiling is reported distinctly from the size the reader chose.
+    const props = Object.fromEntries(doc.page.props.map((p) => [p.key, p.value]));
+    assert.match(props.turnBudget, /stopped at the ceiling/);
+    await s.close();
+  });
+
+  it('does not continue a run whose turn asked for no tools', async () => {
+    const s = await bootTracked({
+      script: { events: runEvents, workspaceDir: null, sessionId: 'sess-none', callsWithTools: 0 }
+    });
+    await s.api('/runs', json({ prompt: 'quick task', maxTurns: 25 }));
+    await new Promise((r) => setTimeout(r, 120));
+    // One call that answered. Continuing it would ask the model for another turn
+    // it has already told us it does not need.
+    assert.equal(s.zstack.calls.length, 1);
+    await s.close();
+  });
+});
+
+describe('pause and resume', () => {
+  /**
+   * A run the test can hold open.
+   *
+   * The first turn blocks until `release()` is called, so the test can send a
+   * pause request while a turn is genuinely in flight — which is the situation
+   * the feature exists for. Later turns run freely, bounded by `callsWithTools`
+   * so the loop finishes instead of running to the ceiling.
+   */
+  function gatedScript(callsWithTools = 2) {
+    let release;
+    let held = false;
+    const gate = new Promise((resolve) => { release = resolve; });
+    return {
+      options: {
+        script: {
+          events: runEvents,
+          workspaceDir: null,
+          sessionId: 'sess-pause',
+          callsWithTools,
+          beforeCall: async (callNumber) => {
+            if (callNumber !== 1) return;
+            held = true;
+            await gate;
+          }
+        }
+      },
+      release: () => release(),
+      heldTheFirstTurn: () => held
+    };
+  }
+
+  it('pauses at a turn boundary with the session saved', async () => {
+    const gated = gatedScript();
+    const s = await bootTracked(gated.options);
+    const started = await (await s.api('/runs', json({ prompt: 'long task', maxTurns: 25 }))).json();
+    const res = await s.api(`/runs/${started.id}/pause`, json({}));
+    // 202: the request was accepted, and the run has yet to honour it. A pause
+    // cannot be instant without killing the turn in flight, which is what stop
+    // does and what loses the session.
+    assert.equal(res.status, 202);
+    gated.release();
+    await new Promise((r) => setTimeout(r, 200));
+
+    const doc = await (await s.api(`/runs/${started.id}`)).json();
+    assert.equal(doc.page.status, 'paused');
+    assert.equal(doc.page.tone, 'paused');
+    assert.equal(doc.page.turnBudget.paused, true);
+    assert.equal(doc.page.turnBudget.canContinue, true);
+    // The session exists, which is the whole difference between this and stop.
+    assert.match(doc.page.turnBudget.sessionId, /^sess-pause-/);
+    // Exactly one turn ran: the boundary came immediately, not a budget later.
+    assert.equal(s.zstack.calls.length, 1);
+    await s.close();
+  });
+
+  it('resumes the same run, keeping its id and its body', async () => {
+    const gated = gatedScript();
+    const s = await bootTracked(gated.options);
+    const started = await (await s.api('/runs', json({ prompt: 'long task', maxTurns: 25 }))).json();
+    await s.api(`/runs/${started.id}/pause`, json({}));
+    gated.release();
+    await new Promise((r) => setTimeout(r, 200));
+    const pausedBlocks = (await (await s.api(`/runs/${started.id}`)).json()).page.blocks.length;
+
+    const res = await s.api(`/runs/${started.id}/resume`, json({}));
+    assert.equal(res.status, 202);
+    const doc = await res.json();
+    // The same run: no second id, because the reader asked to continue this
+    // piece of work rather than to start a new one.
+    assert.equal(doc.id, started.id);
+    await new Promise((r) => setTimeout(r, 150));
+
+    const after = await (await s.api(`/runs/${started.id}`)).json();
+    assert.equal(after.page.id, started.id);
+    // The body grew rather than being replaced, so the work already done is
+    // still on the page.
+    assert.ok(after.page.blocks.length > pausedBlocks);
+    // Three turns: the one that ran before the pause, plus the two the resumed
+    // leg took. A run reports its whole life, not its latest leg.
+    assert.equal(after.page.counts.turns, 3);
+    await s.close();
+  });
+
+  it('resumes by replaying the session, not by re-running the prompt', async () => {
+    const gated = gatedScript();
+    const s = await bootTracked(gated.options);
+    const started = await (await s.api('/runs', json({ prompt: 'long task', maxTurns: 25 }))).json();
+    await s.api(`/runs/${started.id}/pause`, json({}));
+    gated.release();
+    await new Promise((r) => setTimeout(r, 200));
+    const callsBefore = s.zstack.calls.length;
+
+    await s.api(`/runs/${started.id}/resume`, json({}));
+    await new Promise((r) => setTimeout(r, 150));
+    // The resumed turn gets the session the paused turn saved. Without this the
+    // model would be handed the original prompt again and repeat the work.
+    assert.equal(s.zstack.calls[callsBefore].resume, 'sess-pause-1');
+    await s.close();
+  });
+
+  it('refuses to pause a run that has no loop left', async () => {
+    const s = await bootTracked({ script: { events: runEvents, workspaceDir: null, sessionId: 'sess-done' } });
+    const started = await (await s.api('/runs', json({ prompt: 'quick task' }))).json();
+    await new Promise((r) => setTimeout(r, 120));
+
+    const res = await s.api(`/runs/${started.id}/pause`, json({}));
+    // 409: the run exists, it simply cannot be paused. Claiming otherwise would
+    // be a control that lies about what it did.
+    assert.equal(res.status, 409);
+    assert.match((await res.json()).error, /nothing to pause/);
+    assert.equal((await s.api('/runs/r-nope/pause', json({}))).status, 409);
+    await s.close();
+  });
+
+  it('refuses to resume a run that is not paused', async () => {
+    const s = await bootTracked({ script: { events: runEvents, workspaceDir: null, sessionId: 'sess-x' } });
+    const started = await (await s.api('/runs', json({ prompt: 'quick task' }))).json();
+    await new Promise((r) => setTimeout(r, 120));
+
+    const res = await s.api(`/runs/${started.id}/resume`, json({}));
+    assert.equal(res.status, 409);
+    assert.match((await res.json()).error, /not paused/);
+    // An id this process never saw is a different answer: 404.
+    assert.equal((await s.api('/runs/r-nope/resume', json({}))).status, 404);
+    await s.close();
+  });
+
+  it('lets a stop beat a pause', async () => {
+    // Both requests in flight. Stop is the stronger intent, and a run that
+    // reported itself paused after being stopped would be resumable in the UI
+    // while having nothing to resume from.
+    const gated = gatedScript();
+    const s = await bootTracked(gated.options);
+    const started = await (await s.api('/runs', json({ prompt: 'long task', maxTurns: 25 }))).json();
+    await s.api(`/runs/${started.id}/pause`, json({}));
+    await s.api(`/runs/${started.id}/cancel`, json({}));
+    gated.release();
+    await new Promise((r) => setTimeout(r, 200));
+
+    const doc = await (await s.api(`/runs/${started.id}`)).json();
+    assert.equal(doc.page.status, 'cancelled');
+    assert.notEqual(doc.page.turnBudget.paused, true);
+    await s.close();
+  });
+
+  it('lists a paused run once, not once per record it wrote', async () => {
+    // Pausing writes a history record and so does finishing, for the same run.
+    // History is append-only so the newest wins, and a list that showed both
+    // would report one paused run as two.
+    const gated = gatedScript();
+    const s = await bootTracked(gated.options);
+    const started = await (await s.api('/runs', json({ prompt: 'long task', maxTurns: 25 }))).json();
+    await s.api(`/runs/${started.id}/pause`, json({}));
+    gated.release();
+    await new Promise((r) => setTimeout(r, 200));
+    await s.api(`/runs/${started.id}/resume`, json({}));
+    await new Promise((r) => setTimeout(r, 150));
+
+    const list = await (await s.api('/runs?limit=40')).json();
+    const matches = list.runs.filter((r) => r.id === started.id);
+    assert.equal(matches.length, 1);
+    await s.close();
+  });
+});
+
+describe('continuations', () => {
+  it('records the size and the session, so an archived run stays continuable', async () => {
+    // A second server on the same history file, on purpose. The server that ran
+    // the task still holds it in memory, and its page is projected from that
+    // live record — which would pass this test even if the fields never reached
+    // disk. A restart is the case that matters here: an operator comes back
+    // tomorrow and wants to finish the run that hit the ceiling. Only a server
+    // that has never seen the run reads it the way that operator's would.
+    const historyPath = tmpHistory();
+    const first = await bootTracked({
+      historyPath,
+      script: { events: runEvents, workspaceDir: null, sessionId: 'sess-archived', callsWithTools: Infinity }
+    });
+    const started = await (await first.api('/runs', json({ prompt: 'endless', maxTurns: 25 }))).json();
+    await new Promise((r) => setTimeout(r, 400));
+    await first.close();
+
+    const second = await bootTracked({ historyPath });
+    const doc = await (await second.api(`/runs/${started.id}`)).json();
+    assert.equal(doc.page.turnBudget.limitReached, true);
+    assert.equal(doc.page.turnBudget.sessionId, `sess-archived-${MAX_TOTAL_TURNS}`);
+    assert.equal(doc.page.turnBudget.canContinue, true);
+
+    // And the continuation works off that archived record, not just the page:
+    // this endpoint reads history when no run is in memory.
+    const res = await second.api(`/runs/${started.id}/continue`, json({}));
+    assert.equal(res.status, 202);
+    await second.close();
+  });
+
+  it('continues a run that hit the ceiling by resuming its session', async () => {
+    const s = await bootTracked({
+      script: { events: runEvents, workspaceDir: null, sessionId: 'sess-1', callsWithTools: Infinity }
+    });
+    const first = await (await s.api('/runs', json({ prompt: 'endless', maxTurns: 25 }))).json();
+    await new Promise((r) => setTimeout(r, 400));
+    const callsBefore = s.zstack.calls.length;
+
+    const res = await s.api(`/runs/${first.id}/continue`, json({}));
+    assert.equal(res.status, 202);
+    const doc = await res.json();
+    assert.equal(doc.continuedFrom, first.id);
+    assert.notEqual(doc.id, first.id);
+    await new Promise((r) => setTimeout(r, 150));
+
+    assert.equal(s.zstack.calls[callsBefore].resume, `sess-1-${MAX_TOTAL_TURNS}`);
+    assert.equal(doc.page.continuationOf, first.id);
+    await s.close();
+  });
+
+  it('refuses a continuation for a run with no saved session', async () => {
+    const s = await bootTracked({ script: { events: runEvents, workspaceDir: null } });
+    const started = await (await s.api('/runs', json({ prompt: 'old style run' }))).json();
+    await new Promise((r) => setTimeout(r, 120));
+
+    const res = await s.api(`/runs/${started.id}/continue`, json({}));
+    // 409, not 404: the run exists and the caller named it correctly, so
+    // "cannot be resumed" is a different answer from "no such run" and the
+    // reader needs to be able to tell them apart.
+    assert.equal(res.status, 409);
+    assert.match((await res.json()).error, /cannot be continued/);
+    await s.close();
+  });
+
+  it('reports an unknown run and a nonsense size distinctly', async () => {
+    const s = await bootTracked({ script: { events: runEvents, workspaceDir: null, sessionId: 'sess-x' } });
+    assert.equal((await s.api('/runs/r-nope/continue', json({}))).status, 404);
+
+    const started = await (await s.api('/runs', json({ prompt: 'task' }))).json();
+    await new Promise((r) => setTimeout(r, 120));
+    const bad = await s.api(`/runs/${started.id}/continue`, json({ maxTurns: 'lots' }));
+    assert.equal(bad.status, 400);
+    assert.match((await bad.json()).error, /maxTurns/);
+    await s.close();
+  });
+
+  it('takes a preset name as a continuation size', async () => {
+    const s = await bootTracked({
+      script: { events: runEvents, workspaceDir: null, sessionId: 'sess-2', callsWithTools: Infinity }
+    });
+    const first = await (await s.api('/runs', json({ prompt: 'endless' }))).json();
+    await new Promise((r) => setTimeout(r, 400));
+    const callsBefore = s.zstack.calls.length;
+
+    const res = await s.api(`/runs/${first.id}/continue`, json({ maxTurns: 'deep' }));
+    const doc = await res.json();
+    await new Promise((r) => setTimeout(r, 80));
+    // The size lives on the run's request: every call is one turn, so asserting
+    // a call budget here would assert nothing about what the reader asked for.
+    assert.equal(doc.page.turnBudget.maxTurns, 60);
+    assert.ok(s.zstack.calls.length > callsBefore);
+    await s.close();
+  });
+
+  it('carries a project default into a run started under it', async () => {
+    const s = await bootTracked({ script: { events: runEvents, workspaceDir: null, sessionId: 'sess-proj' } });
+    const dir = mkdtempSync(join(tmpdir(), 'zstack-budgetproj-'));
+    const created = await (await s.api('/projects', json({ name: 'Long haul', dir, defaultMaxTurns: 60 }))).json();
+    assert.equal(created.project.defaultMaxTurns, 60);
+
+    // The default prefills the composer in the browser, and the run the browser
+    // sends carries it. The server does not impose it, so a reader who picks a
+    // different size gets theirs.
+    const started = await (await s.api('/runs', json({
+      prompt: 'project work',
+      projectId: created.project.id,
+      maxTurns: 8
+    }))).json();
+    await new Promise((r) => setTimeout(r, 120));
+    const doc = await (await s.api(`/runs/${started.id}`)).json();
+    assert.equal(doc.page.turnBudget.maxTurns, 8);
+    await s.close();
   });
 });
 
@@ -607,6 +1106,130 @@ describe('run event stream', () => {
     assert.ok(blocks.length >= 3);
     const kinds = blocks.flatMap((f) => f.data.items.map((i) => i.block.kind));
     assert.ok(kinds.includes('tool') && kinds.includes('summary'));
+    await s.close();
+  });
+
+  it('carries the size the reader picked, not the turns taken, in every status', async () => {
+    // The stream had its own copy of the budget arithmetic, and it reported the
+    // turns taken as the size — so a run on turn 7 of a 25-turn size printed
+    // "7 of 7", which reads as a run at its limit. Asserted on the wire because
+    // that is where the wrong number was produced.
+    const s = await bootTracked({
+      script: { events: runEvents, workspaceDir: null, sessionId: 'sess-status', callsWithTools: 1 }
+    });
+    const started = await (await s.api('/runs', json({ prompt: 'work', maxTurns: 25 }))).json();
+    await new Promise((r) => setTimeout(r, 150));
+
+    const { frames } = await readSse(`${s.url}api/runs/${started.id}/events`);
+    const statuses = frames.filter((f) => f.event === 'status').map((f) => f.data);
+    assert.ok(statuses.length > 0);
+    for (const status of statuses) {
+      assert.equal(status.turnBudget.maxTurns, 25);
+    }
+    // And the last one knows how far the run actually got.
+    assert.equal(statuses.at(-1).counts.turns, 2);
+    await s.close();
+  });
+
+  it('says a paused run can be resumed, since that is the point of pausing', async () => {
+    const gated = {
+      script: {
+        events: runEvents,
+        workspaceDir: null,
+        sessionId: 'sess-pausestream',
+        callsWithTools: 5,
+        beforeCall: async (n) => {
+          if (n !== 1) return;
+          await new Promise((r) => setTimeout(r, 60));
+        }
+      }
+    };
+    const s = await bootTracked(gated);
+    const started = await (await s.api('/runs', json({ prompt: 'pausable', maxTurns: 25 }))).json();
+    await s.api(`/runs/${started.id}/pause`, json({}));
+    // Two more turns so the pause is honoured after the in-flight one.
+    await new Promise((r) => setTimeout(r, 250));
+
+    const { frames } = await readSse(`${s.url}api/runs/${started.id}/events`);
+    const statuses = frames.filter((f) => f.event === 'status').map((f) => f.data);
+    const last = statuses.at(-1);
+    assert.equal(last.status, 'paused');
+    assert.equal(last.turnBudget.paused, true);
+    // Without this the page hid the Resume button on the one run that needed it.
+    assert.equal(last.turnBudget.canContinue, true);
+    // And the button it shows has to be the real one: the client treats each
+    // status as the current truth, so a payload without this flipped the
+    // control to the restart fallback mid-pause.
+    assert.equal(last.turnBudget.inPlace, true);
+    assert.match(last.turnBudget.sessionId, /^sess-pausestream-/);
+    await s.close();
+  });
+
+  it('keeps streaming a resumed run past the end of the leg it paused at', async () => {
+    // The transcript of a resumed run contains the `end` of the leg it paused
+    // at. Treating any `end` as terminal closed the stream right there, so a
+    // viewer got the paused state and then nothing: the run looked frozen while
+    // it was working. Held open on purpose, so "the stream is still open" is
+    // something the test can actually observe.
+    let releaseFirst;
+    let releaseResumed;
+    const firstGate = new Promise((r) => { releaseFirst = r; });
+    const resumedGate = new Promise((r) => { releaseResumed = r; });
+    const s = await bootTracked({
+      script: {
+        events: runEvents,
+        workspaceDir: null,
+        sessionId: 'sess-pastend',
+        callsWithTools: 6,
+        beforeCall: async (n) => {
+          if (n === 1) await firstGate;
+          if (n === 2) await resumedGate;
+        }
+      }
+    });
+    const started = await (await s.api('/runs', json({ prompt: 'pausable', maxTurns: 25 }))).json();
+    await s.api(`/runs/${started.id}/pause`, json({}));
+    for (let i = 0; i < 100; i++) {
+      const doc = await (await s.api(`/runs/${started.id}`)).json();
+      if (doc.page.status === 'paused') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    releaseFirst();
+    await s.api(`/runs/${started.id}/resume`, json({}));
+    // The resumed leg is now parked inside its first harness call, so the run is
+    // live and its transcript already holds the pause's `end`.
+    await new Promise((r) => setTimeout(r, 60));
+
+    const controller = new AbortController();
+    const res = await fetch(`${s.url}api/runs/${started.id}/events`, { signal: controller.signal });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const frames = [];
+    let closed = false;
+    const pump = (async () => {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) { closed = true; return; }
+        buffer += decoder.decode(value, { stream: true });
+        let split;
+        while ((split = buffer.indexOf('\n\n')) !== -1) {
+          const raw = buffer.slice(0, split);
+          buffer = buffer.slice(split + 2);
+          if (raw.startsWith(':')) continue;
+          frames.push({ event: /event: (.+)/.exec(raw)?.[1], data: JSON.parse(/data: (.+)/.exec(raw)[1]) });
+        }
+      }
+    })();
+
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(closed, false, 'a live run must not have its stream closed by a past `end`');
+    const running = frames.filter((f) => f.event === 'status' && f.data.status === 'running');
+    assert.ok(running.length >= 1, 'the resumed leg must report itself');
+
+    controller.abort();
+    await pump.catch(() => {});
+    releaseResumed();
     await s.close();
   });
 
