@@ -88,7 +88,7 @@ function stubZStack(options = {}) {
 
 async function bootServer(options = {}) {
   const dir = createTempDir('zstack-srv-');
-  const historyPath = join(dir, 'history.jsonl');
+  const historyPath = options.historyPath ?? join(dir, 'history.jsonl');
   const projectsPath = join(dir, 'projects.json');
   const overridesPath = join(dir, 'overrides.json');
   const chatsPath = join(dir, 'chats.json');
@@ -104,6 +104,7 @@ async function bootServer(options = {}) {
     chatsPath,
     schedulesPath,
     budgetPath,
+    idempotencyPath: options.idempotencyPath,
     enableScheduler: options.enableScheduler ?? false,
     apiToken: options.apiToken,
     fetchModelHitchState: options.fetchModelHitchState
@@ -141,6 +142,74 @@ function jsonBody(payload, extra = {}) {
     ...extra
   };
 }
+
+describe('durable run idempotency', () => {
+  it('concurrent retries start one run and preserve requester through restart', async () => {
+    const dir = createTempDir('zstack-admission-');
+    const historyPath = join(dir, 'history.jsonl');
+    const idempotencyPath = join(dir, 'keys');
+    let release;
+    const gate = new Promise((resolveGate) => { release = resolveGate; });
+    const zstack = stubZStack({ beforeCall: () => gate });
+    const first = await bootServer({ zstack, historyPath, idempotencyPath });
+    const request = { prompt: 'Inspect this API', requester: 'workfolk:job-test', idempotencyKey: 'job-test' };
+    let id;
+    try {
+      const replies = await Promise.all(Array.from({ length: 6 }, () => first.api('/runs', jsonBody(request))));
+      assert.equal(replies.filter((r) => r.status === 201).length, 1);
+      assert.equal(replies.filter((r) => r.status === 200).length, 5);
+      const bodies = await Promise.all(replies.map((r) => r.json()));
+      id = bodies[0].id;
+      assert.ok(bodies.every((b) => b.id === id));
+      assert.equal(zstack.calls.length, 1);
+      assert.equal(bodies[0].page.requester, request.requester);
+      assert.equal((await first.api('/runs', jsonBody({ ...request, prompt: 'Changed task' }))).status, 409);
+      release();
+      for (let tries = 0; tries < 100 && !first.registry.get(id).persisted; tries++) await new Promise((r) => setTimeout(r, 10));
+      assert.equal(first.registry.get(id).persisted, true);
+    } finally { release(); await first.close(); }
+    const restartedSdk = stubZStack();
+    const restarted = await bootServer({ zstack: restartedSdk, historyPath, idempotencyPath });
+    try {
+      const replay = await restarted.api('/runs', jsonBody(request));
+      assert.equal(replay.status, 200);
+      const doc = await replay.json();
+      assert.equal(doc.id, id);
+      assert.equal(doc.page.requester, request.requester);
+      assert.equal(doc.page.idempotencyKey, request.idempotencyKey);
+      assert.equal(restartedSdk.calls.length, 0);
+      assert.equal((await restarted.api('/runs', jsonBody({ ...request, policy: 'apply' }))).status, 409);
+    } finally { await restarted.close(); }
+  });
+
+  it('never repeats an accepted run whose history was lost in a crash', async () => {
+    const { reserveRunAdmission, requestFingerprint } = await import('../src/idempotency.mjs');
+    const { normalizeStartRequest } = await import('../src/runs.mjs');
+    const dir = createTempDir('zstack-interrupted-');
+    const request = { prompt: 'Inspect this API', idempotencyKey: 'interrupted-job', policy: 'read-only' };
+    reserveRunAdmission(request.idempotencyKey, {
+      id: 'accepted-before-crash',
+      fingerprint: requestFingerprint({ ...normalizeStartRequest(request), workspaceDir: process.cwd() })
+    }, dir);
+    const server = await bootServer({ idempotencyPath: dir });
+    try {
+      const reply = await server.api('/runs', jsonBody(request));
+      assert.equal(reply.status, 409);
+      assert.equal((await reply.json()).id, 'accepted-before-crash');
+      assert.equal(server.zstack.calls.length, 0);
+    } finally { await server.close(); }
+  });
+
+  it('rejects malformed admission metadata before starting a run', async () => {
+    const server = await bootServer();
+    try {
+      for (const idempotencyKey of ['', 12, 'a'.repeat(257)]) {
+        assert.equal((await server.api('/runs', jsonBody({ prompt: 'Task', idempotencyKey }))).status, 400);
+      }
+      assert.equal(server.zstack.calls.length, 0);
+    } finally { await server.close(); }
+  });
+});
 
 describe('HTTP API', () => {
   it('GET /api/health returns ok and bridge status', async () => {
@@ -891,5 +960,4 @@ describe('HTTP API', () => {
     });
   });
 });
-
 

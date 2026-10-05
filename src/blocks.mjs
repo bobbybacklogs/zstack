@@ -183,6 +183,7 @@ function turnBudgetOf(record) {
  */
 function statusFrom(entry) {
   if (entry.paused === true) return { status: 'paused', tone: 'paused' };
+  if (entry.errorKind === 'cancelled') return { status: 'cancelled', tone: 'neutral' };
   if (entry.ok === false) return { status: 'failed', tone: 'error' };
   return { status: 'ok', tone: 'ok' };
 }

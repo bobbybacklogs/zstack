@@ -32,9 +32,10 @@ import {
   DEFAULT_BUDGET_FILE
 } from './budget.mjs';
 import { fetchModelHitchState, GatewayError } from './connector.mjs';
-import { readHistoryTail, readHistory, findHistoryEntry, historyPath, HISTORY_DEFAULT_LIMIT } from './history.mjs';
+import { readHistoryTail, readHistory, findHistoryEntry, historyPath, newRunId, HISTORY_DEFAULT_LIMIT } from './history.mjs';
 import { projectStoredRun, projectRunSummary } from './blocks.mjs';
-import { RunRegistry, POLICIES, isKnownPolicy } from './runs.mjs';
+import { RunRegistry, POLICIES, isKnownPolicy, normalizeStartRequest } from './runs.mjs';
+import { idempotencyPath, requestFingerprint, readRunAdmission, reserveRunAdmission, releaseRunAdmission } from './idempotency.mjs';
 import {
   readProjects,
   createProject,
@@ -499,6 +500,8 @@ export function createApp(options = {}) {
     zstack.budgetPath = budgetFile;
   }
   const historyFile = options.historyPath;
+  const admissionsDirectory = idempotencyPath(options.idempotencyPath, historyFile);
+  const pendingAdmissions = new Map();
   const projectsFile = options.projectsPath;
   const overridesFile = options.overridesPath;
   const chatsFile = options.chatsPath;
@@ -603,6 +606,8 @@ export function createApp(options = {}) {
    */
   const annotateRunPage = (page, liveRun, entry) => {
     if (!page) return page;
+    page.requester = liveRun?.request?.requester ?? entry?.requester ?? null;
+    page.idempotencyKey = liveRun?.request?.idempotencyKey ?? entry?.idempotencyKey ?? null;
     if (page.turns === undefined) {
       page.turns = page.counts?.turns ?? liveRun?.turns ?? entry?.turns ?? 0;
     }
@@ -953,6 +958,12 @@ export function createApp(options = {}) {
 
       const problems = [];
 
+      for (const field of ['requester', 'idempotencyKey']) {
+        if (body?.[field] !== undefined && (typeof body[field] !== 'string' || !body[field].trim() || body[field].length > 256)) {
+          problems.push(`${field} must be a non-empty string of at most 256 characters.`);
+        }
+      }
+
       // Prompt check: empty or whitespace-only is 400
       const prompt = typeof body?.prompt === 'string' ? body.prompt.trim() : '';
       if (!prompt) {
@@ -1078,12 +1089,51 @@ export function createApp(options = {}) {
         maxTurns: body.maxTurns !== undefined ? body.maxTurns : undefined,
         projectId: targetProjectId,
         workspaceDir: resolvedWorkspace,
+        requester: body.requester?.trim(),
+        idempotencyKey: body.idempotencyKey?.trim(),
         autoPr: body.autoPr === true || body.pr === true
       };
 
       try {
-        const run = await admitRun(request.workspaceDir, () => registry.start(request));
-        sendJson(res, 201, { ok: true, id: run.id, page: registry.getPage(run.id) });
+        const key = request.idempotencyKey;
+        const fingerprint = requestFingerprint({ ...normalizeStartRequest(request), workspaceDir: request.workspaceDir || process.cwd() });
+        const replay = async (record) => {
+          if (record.fingerprint !== fingerprint) {
+            fail(res, 409, 'This idempotencyKey was already used for a different run request.');
+            return;
+          }
+          const page = await pageForRun(record.id, new Map(readProjects(projectsFile).projects.map((p) => [p.id, p])));
+          if (!page) {
+            fail(res, 409, 'The previously accepted run is no longer available. Refusing to repeat execution.', { id: record.id });
+            return;
+          }
+          sendJson(res, 200, { ok: true, id: record.id, replayed: true, page });
+        };
+        if (key && pendingAdmissions.has(key)) await pendingAdmissions.get(key);
+        const previous = key ? readRunAdmission(key, admissionsDirectory) : null;
+        if (previous) { await replay(previous); return; }
+        let releasePending;
+        if (key) pendingAdmissions.set(key, new Promise((resolvePending) => { releasePending = resolvePending; }));
+        let outcome;
+        try {
+          outcome = await admitRun(request.workspaceDir, () => {
+            const existing = key ? readRunAdmission(key, admissionsDirectory) : null;
+            if (existing) return { previous: existing };
+            const id = newRunId();
+            if (key && !reserveRunAdmission(key, { id, fingerprint, requester: request.requester ?? null }, admissionsDirectory)) {
+              return { previous: readRunAdmission(key, admissionsDirectory) };
+            }
+            try { return { run: registry.start(request, { id }) }; }
+            catch (error) { if (key) releaseRunAdmission(key, admissionsDirectory); throw error; }
+          });
+        } finally {
+          if (key) { pendingAdmissions.delete(key); releasePending(); }
+        }
+        if (outcome.previous) { await replay(outcome.previous); return; }
+        const run = outcome.run;
+        const page = registry.getPage(run.id);
+        annotateRunPage(page, run, null);
+        sendJson(res, 201, { ok: true, id: run.id, page });
       } catch (err) {
         const status = (err.kind === 'git-workspace-busy' || err.kind === 'git-repo-busy' || err.kind === 'git-active-run')
           ? 409
