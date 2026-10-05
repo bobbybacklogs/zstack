@@ -114,6 +114,8 @@ export function normalizeStartRequest(body = {}) {
   const turns = resolveMaxTurns(body.maxTurns);
   return {
     prompt: String(body.prompt ?? '').trim(),
+    requester: typeof body.requester === 'string' ? body.requester.trim() || null : null,
+    idempotencyKey: typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim() || null : null,
     playbook: body.playbook || undefined,
     role: body.role || undefined,
     model: body.model || undefined,
@@ -166,6 +168,8 @@ export function narrativeOf(live) {
 export function historyRecordFor(request, result, live) {
   return {
     id: live.id,
+    requester: request.requester ?? null,
+    idempotencyKey: request.idempotencyKey ?? null,
     command: 'agent',
     playbook: result.playbook ?? live.playbook,
     role: result.role ?? request.role,
@@ -415,7 +419,7 @@ export class RunRegistry {
    * folded into the run rather than thrown past this point, because a rejected
    * promise would leave the browser with no page to show.
    */
-  start(body = {}) {
+  start(body = {}, admission = {}) {
     const problems = validateStartRequest(body);
     if (problems.length > 0) {
       const err = new Error(problems.join(' '));
@@ -425,7 +429,7 @@ export class RunRegistry {
     }
 
     const request = normalizeStartRequest(body);
-    const id = newRunId();
+    const id = admission.id || newRunId();
     // The live object is built with its request attached, because the
     // projection reads the project, policy, and workspace from it. Passing
     // only the prompt left those fields empty on every live page.

@@ -54,6 +54,13 @@ function agenticEntry(overrides = {}) {
   };
 }
 
+it('archived cancellation keeps its terminal status on page and card', () => {
+  const entry = agenticEntry({ ok: false, errorKind: 'cancelled', exitCode: null });
+  assert.equal(projectStoredRun(entry).status, 'cancelled');
+  assert.equal(projectStoredRun(entry).tone, 'neutral');
+  assert.equal(projectRunSummary(entry).status, 'cancelled');
+});
+
 /**
  * Every block must declare a kind this module publishes and carry the fields
  * that kind implies. This is the guard that keeps the tagged union honest: a

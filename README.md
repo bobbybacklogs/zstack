@@ -655,6 +655,8 @@ Starts an agent run. Returns `201 Created` with the run ID so callers can poll o
 - `policy` (*string, optional*): Execution policy (`read-only`, `apply`, `strict`). Defaults to `read-only`.
 - `maxTurns` (*number or string preset, optional*): Turn budget preset (`quick`, `standard`, `deep`, `marathon`) or integer.
 - `workspace` (*string, optional*): Workspace path when not specifying a project.
+- `requester` (*string, optional*): Caller identity, retained on run pages and history (for example `workfolk:job_<id>`).
+- `idempotencyKey` (*string, optional*): Retry key, up to 256 characters. The first accepted request reserves the key on disk before execution. Identical retries return the same run ID with `200 OK` and `replayed: true`, including after a server restart. A different normalized request using that key returns `409 Conflict`. If an interrupted server never persisted the accepted run in history, retries return `409` with its original ID rather than starting duplicate work. Keys are stored beside history by default; `ZSTACK_IDEMPOTENCY_PATH` or the server's `idempotencyPath` option can isolate the index.
 
 **Response (`201 Created`):**
 ```json

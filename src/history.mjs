@@ -201,6 +201,8 @@ export function appendHistory(entry, pathOverride) {
     record.policy = entry.policy || null;
     record.workspace = entry.workspace || null;
     record.projectId = typeof entry.projectId === 'string' && entry.projectId !== '' ? entry.projectId : null;
+    record.requester = typeof entry.requester === 'string' ? entry.requester : null;
+    record.idempotencyKey = typeof entry.idempotencyKey === 'string' ? entry.idempotencyKey : null;
     record.turns = entry.turns ?? null;
     // The turn budget and what became of it. Recorded because the answer to
     // "this stopped early, can I get more?" has to survive the process that ran
