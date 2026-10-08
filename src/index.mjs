@@ -2,6 +2,7 @@ export * from './connector.mjs';
 export * from './sdk.mjs';
 export * from './upstream.mjs';
 export * from './budget.mjs';
+export * from './hf.mjs';
 export * from './router.mjs';
 export * from './context.mjs';
 export * from './chat.mjs';

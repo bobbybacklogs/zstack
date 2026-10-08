@@ -42,6 +42,7 @@ Total: 85 passed, 0 failed
 | Classification, confidence rules, semantic router + embedding cache, cosine | `classify`, `router` |
 | Gateway failure hardening: timeout, retry, Retry-After, parse errors, POST-once | `connector` (`gateway failure hardening` suite only) |
 | Context budget, budget tiers/persistence | `context`, `budget` |
+| Provider lanes, the HuggingFace filter and lane resolution, routine dialog lane choices | `budget`, `hf`, `web-lanes` (`cli-json` drives `zstack hf` against a loopback stub gateway) |
 | Grading, triage (heuristic + injected live contract), offload subagent, history, shell | `grader`, `triage`, `subagent`, `history`, `shell` |
 
 ### Env-gated (optional, excluded from `npm run verify`)

@@ -16,7 +16,8 @@
  */
 
 import { ZStack } from './sdk.mjs';
-import { appendHistory, newRunId } from './history.mjs';
+import { buildProgression } from './harness.mjs';
+import { appendHistory, newRunId, checkpointHistory, removeHistoryCheckpoint, recoverHistory, compactSteps, HISTORY_MAX_STEPS } from './history.mjs';
 import { continuationBudget, DEFAULT_MAX_TURNS, maxTurnsProblem, resolveMaxTurns, runWithExtensions } from './turns.mjs';
 import {
   createLiveRun,
@@ -27,6 +28,7 @@ import {
 } from './blocks.mjs';
 import { commitAndPushBranch } from './git.mjs';
 import { createPullRequest } from './github.mjs';
+import { isKnownLane, normalizeLane, LANES } from './budget.mjs';
 
 /** How long a finished run stays queryable in memory after it ends. */
 const RETAIN_FINISHED_MS = 10 * 60 * 1000;
@@ -73,8 +75,13 @@ export function validateStartRequest(body = {}) {
   const problems = [];
   const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
   if (prompt === '') problems.push('A run needs a prompt.');
-  if (body.lane !== undefined && !['auto', 'zen', 'go', 'hitch'].includes(body.lane)) {
-    problems.push(`Unknown lane "${body.lane}". Valid lanes: auto, zen, go, hitch.`);
+  // Lane ids come from `LANES`, never a literal list here: a hardcoded copy is
+  // how a new lane gets silently rejected with a 400 on one code path while
+  // another path accepts it. This also accepts the documented aliases, which
+  // the literal list used to turn away (`opencode-go`, `huggingface`).
+  if (body.lane !== undefined && !isKnownLane(body.lane)) {
+    const valid = Object.keys(LANES).join(', ');
+    problems.push(`Unknown lane "${body.lane}". Valid lanes: ${valid}.`);
   }
   if (body.policy !== undefined && !isKnownPolicy(body.policy)) {
     problems.push(`Unknown policy "${body.policy}". Valid policies: ${Object.keys(POLICIES).join(', ')}.`);
@@ -119,7 +126,9 @@ export function normalizeStartRequest(body = {}) {
     playbook: body.playbook || undefined,
     role: body.role || undefined,
     model: body.model || undefined,
-    lane: body.lane || undefined,
+    // Normalized here so a run records `hf`, not whichever alias the caller
+    // used, and the record agrees with what the budget file stores.
+    lane: body.lane ? normalizeLane(body.lane) : undefined,
     workspaceDir: body.workspaceDir || undefined,
     // Kept verbatim rather than resolved here: the registry does not own the
     // projects file, so it records the id and lets the server resolve the
@@ -219,17 +228,28 @@ export function historyRecordFor(request, result, live) {
     declinedTools: result.declinedTools ?? live.declined,
     changes: result.changes ?? [],
     fileChanges: result.fileChanges ?? live.fileChanges,
-    steps: result.steps ?? [],
+    steps: result.steps?.length ? result.steps : (live.historySteps ?? []),
     narrative: result.narrative || narrativeOf(live),
     autoPr: !!request.autoPr,
     prUrl: result.prUrl ?? live.prUrl ?? null
   };
 }
 
+/** Collect bounded progression even when the harness never returns a result. */
+export function collectHistoryEvent(live, event) {
+  if (event.type === 'done' && event.sessionId) live.sessionId = event.sessionId;
+  const steps = buildProgression([{ ...event,
+    turn: event.turn == null ? event.turn : event.turn + (live.turnOffset || 0) }]).steps;
+  if (live.historySteps.length <= HISTORY_MAX_STEPS) {
+    live.historySteps.push(...compactSteps(steps.filter((s) => s.kind !== 'start' || live.historySteps.length === 0)));
+  }
+}
+
 export class RunRegistry {
   constructor(options = {}) {
     this.zstack = options.zstack || new ZStack();
     this.historyPath = options.historyPath;
+    recoverHistory(this.historyPath);
     // Name lookup for live pages. Injected rather than imported because the
     // registry does not own the projects file: the server hands it a function
     // of project id to name, or nothing, in which case live pages carry the
@@ -245,6 +265,7 @@ export class RunRegistry {
     this.maxRetained = options.maxRetained ?? MAX_RETAINED;
     this.runs = new Map();
     this.order = [];
+    this.closed = false;
   }
 
   /** Cards for the runs this process is running or just finished. */
@@ -420,6 +441,7 @@ export class RunRegistry {
    * promise would leave the browser with no page to show.
    */
   start(body = {}, admission = {}) {
+    if (this.closed) throw new Error('The run registry is shutting down.');
     const problems = validateStartRequest(body);
     if (problems.length > 0) {
       const err = new Error(problems.join(' '));
@@ -436,6 +458,7 @@ export class RunRegistry {
     const live = createLiveRun({ id, prompt: request.prompt, ...request });
     live.request = request;
     live.log = [];
+    live.historySteps = [];
     live.seq = 0;
     live.subscribers = new Set();
     live.settled = false;
@@ -449,6 +472,7 @@ export class RunRegistry {
     this.#prune();
 
     this.#annotateProject(live);
+    this.#checkpoint(live);
     this.#emit(live, { type: 'open', page: liveRunToPage(live) });
     this.#execute(live, request).catch(() => {
       // `#execute` handles its own failures; this only keeps a bug in that
@@ -503,6 +527,8 @@ export class RunRegistry {
           signal: live.controller.signal,
           onEvent: (event) => {
             const changed = applyLiveEvent(live, event);
+            collectHistoryEvent(live, event);
+            this.#checkpoint(live);
             if (changed.length > 0) this.#emit(live, { type: 'blocks', items: changed });
             this.#emitStatus(live);
           }
@@ -714,10 +740,18 @@ export class RunRegistry {
    */
   #persist(live, request, result) {
     try {
-      return appendHistory(historyRecordFor(request, result, live), this.historyPath);
+      const saved = appendHistory(historyRecordFor(request, result, live), this.historyPath);
+      if (saved) removeHistoryCheckpoint(live.id, this.historyPath);
+      return saved;
     } catch {
       return false;
     }
+  }
+
+  #checkpoint(live) {
+    return checkpointHistory({ ...historyRecordFor(live.request, {}, live),
+      ok: false, durationMs: Date.now() - live.startedAt, exitCode: null, errorKind: 'interrupted',
+      error: 'The run stopped before finishing; this is its saved progress.' }, this.historyPath);
   }
 
   /**
@@ -767,6 +801,7 @@ export class RunRegistry {
    * running one is already going.
    */
   resume(id) {
+    if (this.closed) throw new Error('The run registry is shutting down.');
     const run = this.runs.get(id);
     if (!run) {
       const err = new Error(`No run with id ${id} is running in this process.`);
@@ -837,6 +872,7 @@ export class RunRegistry {
 
   /** Release every subscriber so a shutdown does not hang on open streams. */
   shutdown() {
+    this.closed = true;
     for (const run of this.runs.values()) {
       for (const listener of run.subscribers) {
         try {
@@ -846,7 +882,14 @@ export class RunRegistry {
         }
       }
       run.subscribers.clear();
-      if (!run.settled) run.controller.abort();
+      if (!run.settled) {
+        // Shutdown may exit before the aborted SDK promise settles.
+        run.persisted = this.#persist(run, run.request, {
+          ok: false, errorKind: 'interrupted',
+          errorText: 'The zstack server shut down before this run finished.'
+        });
+        run.controller.abort();
+      }
     }
   }
 }

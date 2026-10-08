@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, appendFileSync, openSync, closeSync, readSync, fstatSync } from 'node:fs';
+import { existsSync, mkdirSync, appendFileSync, openSync, closeSync, readSync, fstatSync, writeFileSync, renameSync, unlinkSync, readdirSync, readFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -135,7 +135,7 @@ export function compactSteps(steps) {
         const kept = step.output.slice(0, Math.min(HISTORY_MAX_TOOL_OUTPUT_CHARS, outputBudget));
         out.output = kept;
         outputBudget -= kept.length;
-        if (kept.length < step.output.length) out.outputTruncated = true;
+        if (step.outputTruncated || kept.length < step.output.length) out.outputTruncated = true;
       }
       return out;
     });
@@ -165,7 +165,7 @@ export function resetHistoryWarnings() {
  * Append one JSON line per invocation. Best-effort: an unwritable history
  * warns once to stderr and never fails the underlying task.
  */
-export function appendHistory(entry, pathOverride) {
+function storedRecord(entry) {
   const record = {
     id: entry.id || newRunId(),
     ts: new Date().toISOString(),
@@ -237,7 +237,7 @@ export function appendHistory(entry, pathOverride) {
       : [];
     const steps = compactSteps(entry.steps);
     record.steps = steps;
-    record.stepsTruncated = Array.isArray(entry.steps) && entry.steps.length > steps.length;
+    record.stepsTruncated = entry.stepsTruncated === true || (Array.isArray(entry.steps) && entry.steps.length > steps.length);
     record.autoPr = entry.autoPr === true;
     record.prUrl = typeof entry.prUrl === 'string' && entry.prUrl.trim() !== '' ? entry.prUrl.trim() : null;
   }
@@ -249,9 +249,14 @@ export function appendHistory(entry, pathOverride) {
     record.narrative = text.length > HISTORY_MAX_NARRATIVE_CHARS
       ? text.slice(0, HISTORY_MAX_NARRATIVE_CHARS)
       : text;
-    record.narrativeTruncated = text.length > HISTORY_MAX_NARRATIVE_CHARS;
+    record.narrativeTruncated = entry.narrativeTruncated === true || text.length > HISTORY_MAX_NARRATIVE_CHARS;
   }
 
+  return record;
+}
+
+export function appendHistory(entry, pathOverride) {
+  const record = storedRecord(entry);
   try {
     const file = historyPath(pathOverride);
     mkdirSync(dirname(file), { recursive: true });
@@ -260,6 +265,70 @@ export function appendHistory(entry, pathOverride) {
   } catch (err) {
     warnOnce(`[history] cannot write run history: ${err?.message || err}`);
     return false;
+  }
+}
+
+/** One replaceable checkpoint per active run, separate from the append-only archive. */
+function checkpointPath(id, pathOverride) {
+  return join(historyPath(pathOverride) + '.active', createHash('sha256').update(id).digest('hex') + '.json');
+}
+
+export function checkpointHistory(entry, pathOverride) {
+  const file = checkpointPath(entry.id, pathOverride);
+  const temporary = `${file}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(temporary, JSON.stringify({ pid: process.pid, record: storedRecord(entry) }), 'utf8');
+    renameSync(temporary, file);
+    return true;
+  } catch (err) {
+    try { unlinkSync(temporary); } catch {}
+    warnOnce(`[history] cannot checkpoint run history: ${err?.message || err}`);
+    return false;
+  }
+}
+
+export function removeHistoryCheckpoint(id, pathOverride) {
+  try { unlinkSync(checkpointPath(id, pathOverride)); } catch {}
+}
+
+/** Recover only dead owners: another live server's work must never be archived. */
+export function recoverHistory(pathOverride) {
+  const directory = historyPath(pathOverride) + '.active';
+  let files;
+  try { files = readdirSync(directory); } catch { return; }
+  for (const name of files) {
+    const recovering = name.match(/\.json\.(\d+)\.recovering$/);
+    if (!name.endsWith('.json') && !recovering) continue;
+    const file = join(directory, name);
+    try {
+      // A recovery claim survives a crash too; reclaim it only after its owner dies.
+      if (recovering) {
+        try { process.kill(Number(recovering[1]), 0); continue; } catch (err) {
+          if (err.code !== 'ESRCH') continue;
+        }
+      }
+      const { pid, record } = JSON.parse(readFileSync(file, 'utf8'));
+      if (!Number.isInteger(pid) || pid <= 0 || typeof record?.id !== 'string') continue;
+      try { process.kill(pid, 0); continue; } catch (err) {
+        if (err.code !== 'ESRCH') continue;
+      }
+      // Renaming claims this checkpoint atomically across concurrent history readers.
+      const claimed = file.replace(/\.\d+\.recovering$/, '') + `.${process.pid}.recovering`;
+      renameSync(file, claimed);
+      // A final append may have succeeded immediately before the owner died.
+      const final = findHistoryEntry(record.id, pathOverride, false);
+      if (!final || Date.parse(final.ts) < Date.parse(record.ts) || (final.paused && !record.paused)) {
+        if (!appendHistory({ ...record, ok: false, paused: false, exitCode: null,
+          errorKind: 'interrupted', error: 'The zstack process stopped before this run finished. Progress was recovered from its last checkpoint.' }, pathOverride)) {
+          renameSync(claimed, file);
+          continue;
+        }
+      }
+      unlinkSync(claimed);
+    } catch {
+      // A damaged checkpoint cannot prevent unrelated runs from being read.
+    }
   }
 }
 
@@ -325,6 +394,7 @@ function countNewlines(buf) {
  * file, so a caller can tell a short page from a short history.
  */
 export function readHistory(options = {}) {
+  recoverHistory(options.path);
   const limit = options.limit ?? HISTORY_DEFAULT_LIMIT;
   const file = historyPath(options.path);
   if (!existsSync(file)) return { entries: [], skipped: 0, total: 0 };
@@ -368,6 +438,7 @@ export function readHistory(options = {}) {
  * for a UI page that wants the newest runs and not a census of them.
  */
 export function readHistoryTail(limit = HISTORY_DEFAULT_LIMIT, pathOverride) {
+  recoverHistory(pathOverride);
   const file = historyPath(pathOverride);
   const keep = Math.max(0, limit);
   if (keep === 0 || !existsSync(file)) return [];
@@ -432,7 +503,8 @@ export function lastEntry(pathOverride) {
  * does not cost a scan. When the same id appears twice the newest wins, which
  * matches a reader's expectation that an address resolves to the latest record.
  */
-export function findHistoryEntry(id, pathOverride) {
+export function findHistoryEntry(id, pathOverride, recover = true) {
+  if (recover) recoverHistory(pathOverride);
   if (!id) return null;
   const file = historyPath(pathOverride);
   if (!existsSync(file)) return null;

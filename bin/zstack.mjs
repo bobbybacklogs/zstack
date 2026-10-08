@@ -5,12 +5,15 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { ZStack, DEFAULT_BRIDGE_URL, fetchModelHitchState } from '../src/index.mjs';
 import { BUDGET_TIERS, BUDGET_SOURCES, LANES, getStoredBudget, isKnownLane, normalizeLane, promptAndSetBudget } from '../src/budget.mjs';
+import { resolveHuggingFaceLane, describeHuggingFaceFilter, isHuggingFaceModel, hasHuggingFaceKey } from '../src/hf.mjs';
 import { gradeDiff, formatVerdictTable } from '../src/grader.mjs';
-import { appendHistory, readHistory, lastEntry, needsRerunConfirm, HISTORY_PREVIEW_CHARS } from '../src/history.mjs';
+import { appendHistory, readHistory, lastEntry, needsRerunConfirm, HISTORY_PREVIEW_CHARS, newRunId, checkpointHistory, removeHistoryCheckpoint } from '../src/history.mjs';
+import { createLiveRun, applyLiveEvent } from '../src/blocks.mjs';
+import { historyRecordFor, normalizeStartRequest, collectHistoryEvent } from '../src/runs.mjs';
 import { triageFailure } from '../src/triage.mjs';
 import { runContextOffload, formatOffloadReport } from '../src/subagent.mjs';
 import { formatEventLine, createProgressRenderer, explainEmptyContent, resolveHarnessEntry, harnessEntryExists, observeGitStatus } from '../src/harness.mjs';
-import { startServer, DEFAULT_PORT, DEFAULT_HOST, isLoopback } from '../src/serve.mjs';
+import { startServer, stopServer, DEFAULT_PORT, DEFAULT_HOST, isLoopback } from '../src/serve.mjs';
 import { DEFAULT_MAX_TURNS, continuationBudget, runWithExtensions } from '../src/turns.mjs';
 import { commitAndPushBranch } from '../src/git.mjs';
 import { createPullRequest } from '../src/github.mjs';
@@ -124,7 +127,7 @@ function parseArgs(args) {
       flags.source = args[++i].toLowerCase();
     } else if (arg === '--lane' && i + 1 < args.length) {
       flags.lane = args[++i].toLowerCase();
-    } else if (arg === '--zen' || arg === '--go' || arg === '--hitch') {
+    } else if (arg === '--zen' || arg === '--go' || arg === '--hitch' || arg === '--hf') {
       flags.lane = arg.slice(2);
     } else if (arg === '--file' && i + 1 < args.length) {
       flags.file = args[++i];
@@ -240,7 +243,9 @@ function failWith(err, flags, fallback = EXIT.FAIL, prefix = '[!] Task failed') 
  */
 function recordRun(fields) {
   try {
-    appendHistory(fields);
+    const saved = appendHistory(fields);
+    if (saved && fields.id) removeHistoryCheckpoint(fields.id);
+    return saved;
   } catch {
     // History is advisory; the task result stands on its own.
   }
@@ -278,8 +283,9 @@ Usage:
   zstack task <playbook> "<prompt>" [options]      Run a task with an explicit playbook
   zstack prompt "<prompt>" [--role <role>]         Send a prompt directly to a model role
   zstack panel "<prompt>"                          Run multi-family adversarial critique in parallel
-  zstack budget [tier] [--source config|catalog] [--lane auto|zen|go|hitch] [--confirm]
+  zstack budget [tier] [--source config|catalog] [--lane auto|zen|go|hitch|hf] [--confirm]
                                                    Preview + confirm model budget mapping
+  zstack hf [--tier <tier>] [--json] [--all]       Show the HuggingFace lane's model filter
   zstack grade [--file <diff>] [--json]            Grade a diff against the 20 principles
   zstack triage [--file <log>] [--json]            Rank playbooks for failure output
   zstack explore "<query>" [--paths src,tests]     Distill bulk file reads via a subagent
@@ -316,8 +322,12 @@ Usage:
     zen      OpenCode Zen pay-per-use  (opencode/<model>)
     go       OpenCode Go flat-rate    (opencode-go/<model>)
     hitch    No OpenCode preference: ModelHitch active providers / config default
-  Shortcuts: --zen, --go, --hitch. A single request can override the stored lane,
-  for example: zstack --go "Fix the flaky retry test"
+    hf       HuggingFace router       (huggingface/<org>/<model>)
+             An open catalogue, so the lane filters it for tool calling,
+             context, and recency before pinning any role. Run \`zstack hf\` to
+             see what the filter admitted, what it rejected, and why.
+  Shortcuts: --zen, --go, --hitch, --hf. A single request can override the stored
+  lane, for example: zstack --go "Fix the flaky retry test"
 
   Prompt classification: confident matches run directly; ambiguous matches offer
   guided playbook selection (threshold: top score >= 1.0 with >= 0.5 margin).
@@ -340,8 +350,8 @@ Usage:
 Options:
   --tier <tier>              Budget tier (low-med, med-high, high, max)
   --source <config|catalog>  Model selection source (Option A vs Option B)
-  --lane <auto|zen|go|hitch> Provider lane for this invocation (overrides stored lane)
-  --zen, --go, --hitch       Shortcuts for --lane zen | go | hitch
+  --lane <auto|zen|go|hitch|hf> Provider lane for this invocation (overrides stored lane)
+  --zen, --go, --hitch, --hf Shortcuts for --lane zen | go | hitch | hf
   --agent                    Run the agentic tool loop (single completion without it)
   --apply, -y                Agent: approve mutating calls so files can change
                              (also: zstack update, record upstream sync checkpoint)
@@ -734,6 +744,15 @@ async function runAgentPrompt(prompt, playbookId, classification, flags) {
   }
 
   const started = Date.now();
+  const request = normalizeStartRequest({ ...agentOptions(prompt, playbookId, flags),
+    maxTurns: budget, continuationOf: resuming?.id });
+  const live = createLiveRun({ id: newRunId(), prompt, ...request });
+  live.request = request;
+  live.historySteps = [];
+  const checkpoint = () => checkpointHistory({ ...historyRecordFor(request, {}, live),
+    ok: false, durationMs: Date.now() - started, errorKind: 'interrupted',
+    error: 'The CLI process stopped before this run finished.' });
+  checkpoint();
   const steps = [];
   // Coalesces streamed text deltas into readable blocks; `push` and `flush`
   // keep the live view identical to what run history records.
@@ -742,6 +761,9 @@ async function runAgentPrompt(prompt, playbookId, classification, flags) {
   });
   const onEvent = (event) => {
     steps.push(event);
+    applyLiveEvent(live, event);
+    collectHistoryEvent(live, event);
+    checkpoint();
     if (flags.json) {
       // One record per line on stderr, keeping stdout parseable.
       console.error(JSON.stringify({ zstack: 'step', ...event }));
@@ -764,6 +786,8 @@ async function runAgentPrompt(prompt, playbookId, classification, flags) {
         onEvent
       }),
       onExtend: ({ to, grant }) => {
+        live.turnOffset = live.turns;
+        live.tokenOffset = live.tokens || 0;
         if (!flags.json) {
           console.log(`[>] Out of turns. Extending this run with ${grant} more (${to} total).`);
         } else {
@@ -811,6 +835,8 @@ async function runAgentPrompt(prompt, playbookId, classification, flags) {
     }
 
     recordRun({
+      ...historyRecordFor(request, res, live),
+      id: live.id,
       command: 'agent',
       playbook: res.playbook,
       role: res.role,
@@ -893,15 +919,11 @@ async function runAgentPrompt(prompt, playbookId, classification, flags) {
     }
     return res;
   } catch (err) {
-    if (err?.kind === 'harness-missing') {
-      fail(
-        `${err.message}\n    Install it with: npm i -g modelhitch`,
-        EXIT.FAIL,
-        flags
-      );
-    }
     recordRun({
+      id: live.id,
       command: 'agent',
+      ...historyRecordFor(request, { ok: false }, live),
+      error: err?.message || String(err),
       playbook: playbookId,
       role: classification.role,
       model: null,
@@ -915,6 +937,13 @@ async function runAgentPrompt(prompt, playbookId, classification, flags) {
       errorKind: err?.kind || 'error',
       exitCode: exitCodeFor(err)
     });
+    if (err?.kind === 'harness-missing') {
+      fail(
+        `${err.message}\n    Install it with: npm i -g modelhitch`,
+        EXIT.FAIL,
+        flags
+      );
+    }
     failWith(err, flags, EXIT.FAIL, '[!] Agent run failed');
   }
 }
@@ -1146,11 +1175,14 @@ Usage:
   zstack budget high --source config     Preview High tier, Option A (ModelHitch config only)
   zstack budget max --source catalog --confirm   Apply Max tier, Option B without prompt
   zstack budget med-high --go            Preview the Med-High tier on the OpenCode Go lane
+  zstack budget med-high --hf            Preview the Med-High tier on the HuggingFace lane
 
 Tiers: low-med | med-high | high | max
 Sources: config (A: config-pinned models) | catalog (B: provider-aligned presets)
 Lanes:   auto (default) | zen (OpenCode Zen) | go (OpenCode Go) | hitch (ModelHitch routing)
-  Shortcuts: --zen, --go, --hitch set the lane without --lane.
+         hf (HuggingFace router, filtered for quality before any role is pinned)
+  Shortcuts: --zen, --go, --hitch, --hf set the lane without --lane.
+  See what the HuggingFace filter admitted and rejected with: zstack hf
 `);
     return;
   }
@@ -1159,7 +1191,7 @@ Lanes:   auto (default) | zen (OpenCode Zen) | go (OpenCode Go) | hitch (ModelHi
   const sourceArg = (flags.source || stored.source || 'catalog').toLowerCase();
   const laneArg = normalizeLane(flags.lane || stored.lane);
   if (!isKnownLane(flags.lane)) {
-    fail(`Error: unknown lane "${flags.lane}". Valid lanes: auto, zen, go, hitch`, EXIT.USAGE, flags);
+    fail(`Error: unknown lane "${flags.lane}". Valid lanes: ${Object.keys(LANES).join(', ')}`, EXIT.USAGE, flags);
   }
 
   if (!BUDGET_TIERS[tierArg]) {
@@ -1219,6 +1251,166 @@ Lanes:   auto (default) | zen (OpenCode Zen) | go (OpenCode Go) | hitch (ModelHi
   if (flags.json) {
     emitJson({ ok: true, applied: result.applied, budget: result.budget, rulePath: result.rulePath ?? null });
   }
+}
+
+const HF_HELP = `
+zstack hf — what the HuggingFace lane's filter does before any role is pinned
+
+HuggingFace's router serves a catalogue anyone can publish to, so the lane does
+not pin roles from a hand-written list. It filters first: capability gates drop
+models that cannot do the work (no tool calling, too small a context window, no
+live provider), curation gates drop the rest (non-chat models, base
+checkpoints, quantized and dated duplicates of a model already listed, the tiny
+tail), and the survivors are ranked per role. Every decision is listed below
+with the rule that made it.
+
+Usage:
+  zstack hf                          Filter report for the stored budget tier
+  zstack hf --tier max               Report as the Max tier would filter it
+  zstack hf --all                    List every rejected model, not just the counts
+  zstack hf --json                   Single JSON document (rejections included)
+  zstack hf --refresh                Refetch capability metadata instead of the cache
+
+Nothing is written and no role is changed here: this command only reports. Pin
+the lane with \`zstack budget --lane hf --confirm\` or run once with \`--hf\`.
+`;
+
+/**
+ * Report the HuggingFace lane's filter decision.
+ *
+ * The lane pins models that a reader did not choose, so the filter has to be
+ * inspectable rather than trusted: this prints what survived, what did not,
+ * and which rule decided each. It reads state only and never writes, so it is
+ * safe to run against a live gateway at any time.
+ */
+async function handleHf(args) {
+  const { flags, positional } = parseArgs(args);
+  // Matches `handleBudget`: `--help` reaches a handler as a positional, since
+  // the parser only knows the flags it was taught.
+  if (positional[0] === 'help' || positional[0] === '--help' || positional[0] === '-h') {
+    console.log(HF_HELP);
+    return;
+  }
+
+  const stored = getStoredBudget();
+  const tier = (flags.tier || stored.tier || 'med-high').toLowerCase();
+  if (!BUDGET_TIERS[tier]) {
+    fail(`Error: unknown budget tier "${tier}". Valid tiers: ${Object.keys(BUDGET_TIERS).join(', ')}`, EXIT.USAGE, flags);
+  }
+
+  let state;
+  try {
+    state = await fetchModelHitchState(z.baseUrl, { refreshHfCapabilities: !!flags.refresh });
+  } catch (err) {
+    const message = `Cannot reach ModelHitch at ${z.baseUrl}: ${err.message}`;
+    if (flags.json) jsonError(message, EXIT.GATEWAY, { baseUrl: z.baseUrl });
+    console.error(`[!] ${message}`);
+    process.exit(EXIT.GATEWAY);
+  }
+
+  const hfIds = state.models.map(m => m.id).filter(isHuggingFaceModel);
+  const keyPresent = hasHuggingFaceKey(state.keys);
+  const lane = resolveHuggingFaceLane(state.models.map(m => m.id), {
+    tier,
+    capabilities: state.hfCapabilities?.models || null,
+    capabilitySource: state.hfCapabilities?.source || 'unavailable'
+  });
+  const report = describeHuggingFaceFilter(lane.report);
+
+  // Nothing to report on is a failure to answer the question that was asked, in
+  // both output modes, so the exit code says so either way rather than
+  // depending on whether the caller asked for JSON.
+  if (hfIds.length === 0) {
+    const message = keyPresent
+      ? 'The gateway serves no HuggingFace models even though a key is present, so the lane cannot resolve.'
+      : 'The gateway serves no HuggingFace models. Set HF_TOKEN in ModelHitch\'s config, then retry.';
+    if (flags.json) {
+      emitJson({
+        ok: false,
+        error: message,
+        command: 'hf',
+        tier,
+        keyPresent,
+        considered: 0,
+        lane: { applied: false, note: lane.note },
+        filter: report
+      });
+    } else {
+      console.error(`[!] ${message}`);
+    }
+    // Assign the code and return rather than calling process.exit: the gateway
+    // connection is still open, and tearing the process down under it trips a
+    // libuv assertion on Windows (UV_HANDLE_CLOSING) instead of exiting.
+    process.exitCode = EXIT.FAIL;
+    return;
+  }
+
+  if (flags.json) {
+    emitJson({
+      ok: true,
+      command: 'hf',
+      tier,
+      keyPresent,
+      considered: report?.considered ?? 0,
+      lane: {
+        applied: lane.applied,
+        coder: lane.coder,
+        fast: lane.fast,
+        architect: lane.architect,
+        reasoner: lane.reasoner,
+        panel: lane.panel,
+        note: lane.note
+      },
+      filter: report
+    });
+    return;
+  }
+
+  console.log(`\n=== HuggingFace lane filter (tier: ${tier}, floor: ${report.sizeFloor}B) ===`);
+  console.log(`Catalogue:   ${report.considered} HuggingFace models served by the gateway`);
+  console.log(`Capability:  ${report.capabilitySource === 'unavailable'
+    ? 'unavailable, so curation rules alone decided (rerun with --refresh if the network was down)'
+    : `live metadata via ${report.capabilitySource}, gating tool calling and context`}`);
+  console.log(`Admitted:    ${report.admitted} models`);
+  console.log(`Rejected:    ${report.rejected} models`);
+
+  console.log('\nRejections by rule:');
+  for (const [gate, count] of Object.entries(report.rejectedByGate).sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${String(count).padStart(3)}  ${gate}`);
+  }
+
+  if (flags.all) {
+    console.log('\nEvery rejection:');
+    for (const r of report.exclusions) {
+      console.log(`  ${r.id}`);
+      console.log(`      ${r.gate}: ${r.reason}`);
+    }
+  }
+
+  console.log('\nPinned roles (what the lane would actually use):');
+  const picks = [
+    ['coder (feature, bug-fix, explorer, investigators, reflect tooling)', lane.coder],
+    ['fast exploration', lane.fast],
+    ['architect (judgment, explainer, synthesizer)', lane.architect],
+    ['deep reasoning', lane.reasoner]
+  ];
+  for (const [role, model] of picks) {
+    console.log(`  ${role}`);
+    console.log(`      ${model ?? '(none: the lane did not resolve)'}`);
+  }
+  console.log(`  panel (adversarial reviewers, distinct publishers)`);
+  for (const m of lane.panel) console.log(`      ${m}`);
+  if (lane.note) console.log(`\n[!] ${lane.note}`);
+
+  console.log('\nTop admitted models by score:');
+  for (const m of report.models.slice(0, 10)) {
+    const size = m.effectiveParamsB != null ? `${m.effectiveParamsB}B` : 'unrated';
+    const ctx = m.contextLength != null ? `${Math.round(m.contextLength / 1024)}k ctx` : 'ctx unknown';
+    const tools = m.supportsTools === true ? 'tools' : (m.supportsTools === false ? 'NO TOOLS' : 'tools unknown');
+    console.log(`  ${String(m.score.overall).padStart(4)}  ${m.id}`);
+    console.log(`        ${size}, ${ctx}, ${tools}, coder ${m.score.coder}, reasoner ${m.score.reasoner}`);
+  }
+  console.log(`\nPin this lane with: zstack budget --lane hf --confirm   (or one run: zstack --hf "<task>")`);
 }
 
 function readDiffInput(args) {
@@ -1543,18 +1735,15 @@ async function handleServe(args) {
 
   await new Promise((resolve) => {
     let closing = false;
-    const stop = () => {
+    const stop = (signal) => {
       if (closing) return;
       closing = true;
-      console.log('\n[>] Stopping the UI server...');
-      started.server.close(() => resolve());
-      // A run in flight holds its own child process, which is stopped with the
-      // server so nothing keeps working after the UI is gone.
-      started.registry.shutdown();
-      setTimeout(() => resolve(), 2000).unref();
+      const log = flags.json ? console.error : console.log;
+      log(`\n[>] Stopping the UI server (${signal})...`);
+      stopServer(started).then(resolve);
     };
-    process.on('SIGINT', stop);
-    process.on('SIGTERM', stop);
+    process.on('SIGINT', () => stop('SIGINT'));
+    process.on('SIGTERM', () => stop('SIGTERM'));
   });
   process.exit(EXIT.OK);
 }
@@ -1580,7 +1769,7 @@ Session commands:
   /files <a,b>       Attach files (/files clear to unset)
   /role <role>       Pin a role override (/role clear to unset)
   /model <m>         Pin a model override (/model clear to unset)
-  /lane <auto|zen|go|hitch>  Pin a provider lane (/lane clear for stored default)
+  /lane <auto|zen|go|hitch|hf>  Pin a provider lane (/lane clear for stored default)
   /json on|off       Toggle JSON output mode
   /context <tokens>  Set the context budget (/context clear for default)
   /status            Show session state
@@ -1618,7 +1807,7 @@ async function handleShellSlash(line, state, flags) {
         state.lane = null;
         console.log(`lane: unset (stored default: ${normalizeLane(getStoredBudget().lane)})`);
       } else if (!isKnownLane(arg)) {
-        console.log(`[!] Unknown lane "${arg}". Valid lanes: auto, zen, go, hitch.`);
+        console.log(`[!] Unknown lane "${arg}". Valid lanes: ${Object.keys(LANES).join(', ')}.`);
       } else {
         state.lane = normalizeLane(arg);
         console.log(`lane: ${state.lane}`);
@@ -2240,6 +2429,10 @@ async function main() {
       break;
     case 'budget':
       await handleBudget(rawArgs);
+      break;
+    case 'hf':
+    case 'huggingface':
+      await handleHf(rawArgs);
       break;
     case 'grade':
       await handleGrade(rawArgs);

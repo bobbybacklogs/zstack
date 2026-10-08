@@ -66,7 +66,7 @@ export interface TaskOptions {
   contextTokens?: number;
   noPrune?: boolean;
   timeoutMs?: number;
-  /** Provider lane override for this task: auto | zen | go | hitch. */
+  /** Provider lane override: auto | zen | go | hitch | hf. */
   lane?: string;
 }
 
@@ -107,7 +107,7 @@ export interface AgentOptions {
   type?: string;
   role?: string;
   model?: string;
-  /** Provider lane override for this run: auto | zen | go | hitch. */
+  /** Provider lane override for this run: auto | zen | go | hitch | hf. */
   lane?: string;
   /** Directory the agent reads and writes. Defaults to the zstack workspace. */
   workspaceDir?: string;
@@ -283,7 +283,7 @@ export interface OptimizeOptions {
   role?: string;
   principles?: string[];
   model?: string;
-  /** Provider lane override for the rewrite: auto | zen | go | hitch. */
+  /** Provider lane override for the rewrite: auto | zen | go | hitch | hf. */
   lane?: string;
   temperature?: number;
   timeoutMs?: number;
@@ -317,14 +317,21 @@ export interface ModelHitchState {
   keys: Record<string, string>;
   models: Array<{ id: string; object?: string; owned_by?: string }>;
   activeProviders: string[];
+  /**
+   * Per-model capability metadata for the HuggingFace lane, fetched from the
+   * router's public listing when an HF key is active. Null on a machine with
+   * no HuggingFace key, and `source: 'unavailable'` when the fetch failed, in
+   * which case the lane filters on its offline curation rules alone.
+   */
+  hfCapabilities?: HfCapabilitySet | null;
 }
 
 export interface RoleMapping {
-  mode: 'opencode-zen' | 'opencode-go' | 'opencode-zen-go' | 'modelhitch-multi-provider' | 'modelhitch-config-pinned';
+  mode: 'opencode-zen' | 'opencode-go' | 'opencode-zen-go' | 'modelhitch-multi-provider' | 'modelhitch-config-pinned' | 'huggingface-router';
   models: Record<string, string>;
   panelList: string[];
   /** Lane actually used to resolve models. */
-  lane?: 'zen' | 'go' | 'hitch';
+  lane?: 'zen' | 'go' | 'hitch' | 'hf';
 }
 
 export interface AboutInfo {
@@ -430,7 +437,16 @@ export declare const ZSTACK_SYSTEM_PROMPT: string;
 
 export type BudgetTierId = 'low-med' | 'med-high' | 'high' | 'max';
 export type BudgetSourceId = 'config' | 'catalog';
-export type LaneId = 'auto' | 'zen' | 'go' | 'hitch';
+export type LaneId = 'auto' | 'zen' | 'go' | 'hitch' | 'hf';
+
+/** The mode string a lane reports, one per lane plus the config-pinned case. */
+export type LaneMode =
+  | 'opencode-zen'
+  | 'opencode-go'
+  | 'opencode-zen-go'
+  | 'modelhitch-multi-provider'
+  | 'huggingface-router'
+  | 'modelhitch-config-pinned';
 
 export interface BudgetTierInfo {
   name: string;
@@ -455,10 +471,18 @@ export interface BudgetInfo {
   /** Lane as requested before auto-resolution. */
   requestedLane: LaneId;
   laneInfo: LaneInfo;
-  /** Gateway mode label, e.g. 'opencode-zen' | 'opencode-go' | 'modelhitch-multi-provider'. */
-  mode: string;
+  /** Gateway mode label, e.g. 'opencode-zen' | 'huggingface-router'. */
+  mode: LaneMode;
   /** False when source=config pins models from ModelHitch policy, bypassing the lane. */
   laneApplied: boolean;
+  /**
+   * Why the lane is not fully in effect, when it is not: the models came from
+   * ModelHitch policy, or the HuggingFace filter admitted nothing to pin.
+   * Null on every other lane.
+   */
+  laneNote: string | null;
+  /** The HuggingFace filter's verdict. Null on every lane but `hf`. */
+  hfLaneFilter: HfFilterSummary | null;
   models: Record<string, string>;
   panelList: string[];
 }
@@ -480,6 +504,135 @@ export declare function getStoredBudget(filePath?: string): StoredBudget;
 export declare function saveStoredBudget(data: Partial<StoredBudget>, filePath?: string): StoredBudget;
 export declare function resolveBudgetMapping(options: { tier?: string; source?: string; lane?: string; state: ModelHitchState }): BudgetInfo;
 export declare function promptAndSetBudget(options?: any): Promise<{ applied: boolean; budget: BudgetInfo; rulePath?: string }>;
+
+// --- HuggingFace lane (src/hf.mjs) -------------------------------------------
+// The lane's own module. It filters HuggingFace's open catalogue for quality
+// before any role is pinned, and reports every decision it made. Inference
+// needs no token here: the lane rides the ModelHitch gateway, which holds the
+// HuggingFace key. Only the capability metadata is fetched directly, from the
+// router's public listing.
+
+export declare const HF_PROVIDER_ID: 'huggingface';
+export declare const HF_PREFIX: 'huggingface/';
+export declare const HF_MODELS_URL: string;
+export declare const HF_CAPABILITY_CACHE: string;
+export declare const HF_CAPABILITY_TTL_MS: number;
+export declare const HF_MIN_CONTEXT_TOKENS: number;
+export declare const HF_GENERATION_BONUS: number;
+export declare const HF_FAST_POOL_SIZE: number;
+export declare const HF_COST_PENALTY_CAP: number;
+export declare const HF_PUBLISHERS: string[];
+export declare const HF_TIER_SIZE_FLOOR: Record<BudgetTierId, number>;
+export declare const HF_TIER_WEIGHTS: Record<BudgetTierId, { cost: number; speed: number; recency: number }>;
+export declare const HF_FAST_MARKER: RegExp;
+export declare const HF_CODING_SIGNALS: Array<{ re: RegExp; weight: number; reason: string }>;
+export declare const HF_REASONING_SIGNALS: Array<{ re: RegExp; weight: number; reason: string }>;
+export declare const HF_TASK_EXCLUSIONS: Array<{ id: string; re: RegExp; reason: string }>;
+export declare const HF_FINETUNE_EXCLUSIONS: Array<{ id: string; re: RegExp; reason: string }>;
+export declare const HF_VARIANT_SUFFIX: RegExp;
+
+/** Why one model was or was not admitted. `gate` names the layer that decided. */
+export interface HfRejection {
+  id: string;
+  gate: 'curation' | 'capability' | 'size' | 'duplicate';
+  reason: string;
+}
+
+/** What the router's listing says about one model. */
+export interface HfModelCapability {
+  id: string;
+  created: number | null;
+  live: boolean;
+  supportsTools: boolean;
+  supportsStructuredOutput: boolean;
+  contextLength: number | null;
+  outputModalities: string[] | null;
+  pricePerMTok: number | null;
+  isFree: boolean;
+  throughput: number | null;
+  firstTokenLatencyMs: number | null;
+  modelAuthor: boolean;
+}
+
+export interface HfCapabilitySet {
+  /** `live` from the network, `cache` from disk, `provided` when injected. */
+  source: 'live' | 'cache' | 'provided' | 'unavailable' | string;
+  at?: number | null;
+  url?: string;
+  error?: string;
+  /** Keyed by model name without the provider prefix, e.g. `Qwen/Qwen3-32B`. */
+  models: Record<string, HfModelCapability>;
+}
+
+export interface HfScoredModel {
+  id: string;
+  org: string;
+  size: { total: number | null; active: number | null; effective: number | null } | null;
+  capability: HfModelCapability | null;
+  score: { overall: number; coder: number; architect: number; reasoner: number };
+  reasons: string[];
+}
+
+export interface HfFilterReport {
+  tier: BudgetTierId;
+  sizeFloor: number;
+  capabilitySource: string;
+  considered: number;
+  admitted: HfScoredModel[];
+  rejected: HfRejection[];
+}
+
+export interface HfFilterSummary {
+  tier: BudgetTierId;
+  sizeFloor: number;
+  capabilitySource: string;
+  considered: number;
+  admitted: number;
+  rejected: number;
+  rejectedByGate: Record<string, number>;
+  models: Array<{
+    id: string;
+    org: string;
+    effectiveParamsB: number | null;
+    contextLength: number | null;
+    supportsTools: boolean | null;
+    score: { overall: number; coder: number; architect: number; reasoner: number };
+  }>;
+  exclusions: HfRejection[];
+}
+
+export interface HfLaneResolution {
+  applied: boolean;
+  coder: string | null;
+  fast: string | null;
+  architect: string | null;
+  reasoner: string | null;
+  panel: string[];
+  picks?: { coder: HfScoredModel; fast: HfScoredModel; architect: HfScoredModel; reasoner: HfScoredModel };
+  report: HfFilterReport;
+  note: string | null;
+}
+
+export declare function isHuggingFaceModel(modelId?: string | null): boolean;
+export declare function hfModelName(modelId?: string | null): string;
+export declare function hfOrg(modelName?: string | null): string;
+export declare function hfPublisherRank(org?: string | null): number;
+export declare function hfModelSize(modelName?: string | null): { total: number | null; active: number | null; effective: number | null } | null;
+export declare function isInstructModel(modelName?: string | null): boolean;
+export declare function hfFamilyKey(modelName?: string | null): string;
+export declare function hfGeneration(modelName?: string | null): { stem: string; version: number | null; major: number | null };
+export declare function hfCurationExclusion(modelId?: string | null): string | null;
+export declare function hfCapabilityExclusion(modelId: string, capability?: HfModelCapability | null): string | null;
+export declare function scoreHuggingFaceModel(model: { id: string; capability?: HfModelCapability | null }, options?: { tier?: string; capability?: HfModelCapability | null; now?: number; generationBonus?: number }): HfScoredModel;
+export declare function reduceHuggingFaceEntry(entry: any): HfModelCapability | null;
+export declare function hasHuggingFaceKey(keys?: Record<string, unknown>, env?: Record<string, string | undefined>): boolean;
+export declare function readHuggingFaceCapabilityCache(options?: { cachePath?: string; ttlMs?: number; now?: number }): { at: number; url?: string; models: Record<string, HfModelCapability> } | null;
+export declare function writeHuggingFaceCapabilityCache(data: any, options?: { cachePath?: string }): boolean;
+export declare function fetchHuggingFaceCapabilities(options?: { url?: string; fetchImpl?: typeof fetch; timeoutMs?: number }): Promise<HfCapabilitySet>;
+export declare function loadHuggingFaceCapabilities(options?: { capabilities?: HfCapabilitySet | null; refresh?: boolean; cachePath?: string; ttlMs?: number; fetchImpl?: typeof fetch; timeoutMs?: number }): Promise<HfCapabilitySet>;
+export declare function filterHuggingFaceModels(modelIds: string[], options?: { tier?: string; sizeFloor?: number; capabilities?: Record<string, HfModelCapability> | null; capabilitySource?: string; now?: number }): HfFilterReport;
+export declare function resolveHuggingFaceLane(modelIds: string[], options?: { tier?: string; sizeFloor?: number; capabilities?: Record<string, HfModelCapability> | null; capabilitySource?: string; now?: number }): HfLaneResolution;
+export declare function describeHuggingFaceFilter(report?: HfFilterReport | null): HfFilterSummary | null;
 
 export declare const CLASSIFY_CONFIDENCE_THRESHOLD: number;
 export declare const CLASSIFY_AMBIGUITY_MARGIN: number;

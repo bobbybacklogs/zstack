@@ -125,8 +125,8 @@ describe('zstack provider lanes', () => {
     };
   }
 
-  it('exposes the four documented lanes', () => {
-    for (const lane of ['auto', 'zen', 'go', 'hitch']) {
+  it('exposes the five documented lanes', () => {
+    for (const lane of ['auto', 'zen', 'go', 'hitch', 'hf']) {
       assert.ok(LANES[lane], `lane ${lane} must exist`);
     }
   });
@@ -135,10 +135,13 @@ describe('zstack provider lanes', () => {
     assert.equal(normalizeLane('opencode-go'), 'go');
     assert.equal(normalizeLane('GO'), 'go');
     assert.equal(normalizeLane('modelhitch'), 'hitch');
+    assert.equal(normalizeLane('huggingface'), 'hf');
     assert.equal(normalizeLane('nonsense'), 'auto');
     assert.equal(normalizeLane(undefined), 'auto');
     assert.equal(isKnownLane('go'), true);
     assert.equal(isKnownLane('opencode'), true);
+    assert.equal(isKnownLane('hf'), true);
+    assert.equal(isKnownLane('huggingface'), true);
     assert.equal(isKnownLane('nonsense'), false);
   });
 
@@ -183,7 +186,10 @@ describe('zstack provider lanes', () => {
   });
 
   it('resolves all four tiers on every lane without empty panels or roles', () => {
-    for (const lane of ['auto', 'zen', 'go', 'hitch']) {
+    // The hf lane is included deliberately: `laneState` serves no HuggingFace
+    // models, which is the degraded case, and a lane that cannot resolve must
+    // still leave every role with a working model and a panel of two.
+    for (const lane of ['auto', 'zen', 'go', 'hitch', 'hf']) {
       for (const tier of Object.keys(BUDGET_TIERS)) {
         const resolved = resolveBudgetMapping({ tier, source: 'catalog', lane, state: laneState() });
         assert.ok(resolved.panelList.length >= 2, `${lane}/${tier} panel must have at least 2 members`);
@@ -192,6 +198,13 @@ describe('zstack provider lanes', () => {
         }
       }
     }
+  });
+
+  it('reports the lane note when no HuggingFace model is served', () => {
+    const resolved = resolveBudgetMapping({ tier: 'med-high', source: 'catalog', lane: 'hf', state: laneState() });
+    assert.equal(resolved.mode, 'huggingface-router');
+    assert.match(resolved.laneNote, /no HuggingFace models in the catalog/);
+    assert.equal(resolved.hfLaneFilter.considered, 0);
   });
 
   it('never picks a panel member the gateway does not serve', () => {

@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ZSTACK_ROLES, syncCursorRules } from './connector.mjs';
-
+import { resolveHuggingFaceLane, describeHuggingFaceFilter } from './hf.mjs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 export const DEFAULT_BUDGET_FILE = join(__dirname, '..', 'verification', 'budget.json');
@@ -45,7 +45,14 @@ export const BUDGET_SOURCES = {
  *           the Go endpoint also requires a per-conversation session header
  * - `hitch` No OpenCode preference: resolve from ModelHitch's active providers
  *           and its configured default model
+ * - `hf`    HuggingFace's inference router (`huggingface/<org>/<model>`),
+ *           reached through the gateway, which holds the HF key. Unlike the
+ *           vendor-curated lanes above, this catalogue is open to anyone, so
+ *           the lane filters it for quality before pinning any role. See
+ *           `src/hf.mjs`.
  * - `auto`  Default. Zen when an OpenCode key is active, otherwise hitch.
+ *           HuggingFace is never auto-selected: it is a large, cheap,
+ *           variable-quality catalogue, so it is chosen explicitly.
  */
 export const LANES = {
   'auto': {
@@ -71,6 +78,12 @@ export const LANES = {
     name: 'ModelHitch Auto',
     prefix: null,
     description: 'No OpenCode preference: use the active ModelHitch providers and its configured default model.'
+  },
+  'hf': {
+    id: 'hf',
+    name: 'HuggingFace',
+    prefix: 'huggingface/',
+    description: 'HuggingFace inference router models (huggingface/<org>/<model>), filtered for tool calling, context, and recency before any role is pinned.'
   }
 };
 
@@ -81,7 +94,10 @@ const LANE_ALIASES = {
   'opencode-go': 'go',
   'go-plus': 'go',
   'modelhitch': 'hitch',
-  'multi': 'hitch'
+  'multi': 'hitch',
+  'huggingface': 'hf',
+  'hf-router': 'hf',
+  'hf-inference': 'hf'
 };
 
 /** Resolve a lane id (with aliases), falling back to `auto` on unknown input. */
@@ -103,6 +119,13 @@ export function isKnownLane(lane) {
 export function hasOpenCodeKey(keys = {}) {
   return !!(keys['opencode'] || keys['opencode-go'] || process.env.OPENCODE_API_KEY);
 }
+
+/**
+ * The HuggingFace lane's own helpers, including `hasHuggingFaceKey`, live in
+ * `src/hf.mjs` and are re-exported from there. Deliberately not re-exported
+ * here: two `export *` paths to one name make it ambiguous, which silently
+ * drops the binding from the package's public surface.
+ */
 
 /**
  * Read the current budget configuration.
@@ -147,7 +170,7 @@ export function saveStoredBudget(data, filePath = DEFAULT_BUDGET_FILE) {
 
 /**
  * Resolve role mapping based on the chosen budget tier, model source, and lane.
- * `lane` selects the provider family (zen | go | hitch | auto); an explicit
+ * `lane` selects the provider family (zen | go | hitch | hf | auto); an explicit
  * `source: 'config'` overrides lane preference by pinning to ModelHitch policy.
  */
 export function resolveBudgetMapping({ tier = 'med-high', source = 'catalog', lane = 'auto', state }) {
@@ -155,7 +178,7 @@ export function resolveBudgetMapping({ tier = 'med-high', source = 'catalog', la
   const normalizedSource = source === 'config' ? 'config' : 'catalog';
   const requestedLane = normalizeLane(lane);
 
-  const { keys, models, config } = state;
+  const { keys, models, config, hfCapabilities } = state;
   const hasOpenCode = hasOpenCodeKey(keys);
   const hasDeepSeek = !!(keys['deepseek'] || process.env.DEEPSEEK_API_KEY);
   const hasOpenAI = !!(keys['openai'] || process.env.OPENAI_API_KEY);
@@ -219,6 +242,8 @@ export function resolveBudgetMapping({ tier = 'med-high', source = 'catalog', la
   let architectModel = defaultModel;
   let reasonerModel = defaultModel;
   let panelCandidates = [];
+  /** The HuggingFace filter's full decision, kept for the report on this lane. */
+  let hfLane = null;
 
   // =========================================================================
   // OPTION A: Config-Only (strictly use models declared in ModelHitch config)
@@ -337,6 +362,27 @@ export function resolveBudgetMapping({ tier = 'med-high', source = 'catalog', la
         panelCandidates = ['opencode/claude-opus-5-5', 'opencode/gpt-6-sol', 'opencode/deepseek-v4-pro', 'opencode/qwen3.8-max'];
         break;
     }
+  } else if (resolvedLane === 'hf') {
+    // HuggingFace is the one lane whose catalogue nobody curates, so the roles
+    // are not pinned from a hand-written ladder: the filter runs first and the
+    // roles are pinned from what survived it. `hfLane` carries the whole
+    // decision, including what was rejected and why, so the lane can be
+    // audited rather than taken on faith. See src/hf.mjs.
+    hfLane = resolveHuggingFaceLane((models || []).map(m => m.id), {
+      tier: normalizedTier,
+      capabilities: hfCapabilities?.models || null,
+      capabilitySource: hfCapabilities?.source || 'unavailable'
+    });
+    if (hfLane.applied) {
+      coderModel = hfLane.coder;
+      fastModel = hfLane.fast;
+      architectModel = hfLane.architect;
+      reasonerModel = hfLane.reasoner;
+      panelCandidates = hfLane.panel;
+    }
+    // When nothing survived, the defaults above stand and `laneNote` says so:
+    // a lane that silently pinned a non-HuggingFace model would be lying about
+    // where the work runs.
   } else {
     // Multi-provider lane: OpenAI, Gemini, DeepSeek, and any other active provider.
     switch (normalizedTier) {
@@ -417,8 +463,22 @@ export function resolveBudgetMapping({ tier = 'med-high', source = 'catalog', la
   const LANE_MODES = {
     'zen': 'opencode-zen',
     'go': 'opencode-go',
-    'hitch': 'modelhitch-multi-provider'
+    'hitch': 'modelhitch-multi-provider',
+    'hf': 'huggingface-router'
   };
+
+  // A lane that could not be applied says so here rather than in a log line
+  // nobody reads: the mapping is the artifact a caller trusts to know where
+  // its work will run. Two reasons exist: ModelHitch policy pinned the models
+  // (`source: config`), or the lane had nothing to resolve to.
+  const laneApplied = normalizedSource === 'catalog';
+  const laneNote = !laneApplied
+    ? null
+    : resolvedLane === 'hf' && hfLane && !hfLane.applied
+      ? `${hfLane.note}. The catalog default routed instead.`
+      : resolvedLane === 'hf' && hfLane
+        ? hfLane.note
+        : null;
 
   return {
     tier: normalizedTier,
@@ -431,7 +491,12 @@ export function resolveBudgetMapping({ tier = 'med-high', source = 'catalog', la
     mode: normalizedSource === 'config' ? 'modelhitch-config-pinned' : LANE_MODES[resolvedLane],
     // source: 'config' pins models from ModelHitch policy, so the lane choice
     // does not influence which models were selected.
-    laneApplied: normalizedSource === 'catalog',
+    laneApplied,
+    // Null on every lane but HuggingFace, where the filter's verdict is the
+    // thing a reader needs to judge the pick. `hfLaneFilter` is the summary;
+    // the raw per-model decisions live in `hfLane.report`.
+    laneNote,
+    hfLaneFilter: resolvedLane === 'hf' && hfLane ? describeHuggingFaceFilter(hfLane.report) : null,
     models: {
       'feature, refactoring': coderModel,
       'bug-fix, perf-issue': coderModel,

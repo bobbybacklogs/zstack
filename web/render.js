@@ -851,7 +851,8 @@ export function renderBudget(config, status, { onApply }) {
       { id: 'auto', label: 'Auto (OpenCode when present, else Hitch)' },
       { id: 'zen', label: 'OpenCode Zen (opencode/<model>)' },
       { id: 'go', label: 'OpenCode Go (opencode-go/<model>)' },
-      { id: 'hitch', label: 'ModelHitch Auto' }
+      { id: 'hitch', label: 'ModelHitch Auto' },
+      { id: 'hf', label: 'HuggingFace (huggingface/<org>/<model>)' }
     ];
 
   const laneControl = makeSelect(
@@ -2166,9 +2167,42 @@ export function renderSchedulesPage({ schedules = [], projects = [], onNew, onTo
 }
 
 /**
+ * The lane choices a dialog offers, pure so the sentinel is testable.
+ *
+ * `lanes` is the server's lane list (`GET /api/config`), so a new lane appears
+ * without a client edit; the literal fallback covers a caller with no config.
+ *
+ * The empty id stays first and means "whatever lane is stored", which is not
+ * the same as `auto`: auto resolves to Zen or Hitch and never to HuggingFace,
+ * while a stored lane may be any of the five. Dropping it would make every
+ * routine saved from this dialog pin `auto` over the stored choice.
+ *
+ * A stored lane the current list does not name keeps its own entry, so opening
+ * and saving a routine cannot silently reset its lane.
+ */
+export function routineLaneOptions(lanes = [], initialLane = '') {
+  const options = [
+    { id: '', label: 'stored default lane' },
+    ...(Array.isArray(lanes) && lanes.length > 0
+      ? lanes.map((l) => ({ id: l.id, label: l.name ? `${l.name} (${l.id})` : l.id }))
+      : [
+        { id: 'auto', label: 'auto (OpenCode when present, else Hitch)' },
+        { id: 'zen', label: 'zen (OpenCode Zen)' },
+        { id: 'go', label: 'go (OpenCode Go)' },
+        { id: 'hitch', label: 'hitch (standard Hitch providers)' },
+        { id: 'hf', label: 'hf (HuggingFace)' }
+      ])
+  ];
+  if (initialLane && !options.some((o) => o.id === initialLane)) {
+    options.push({ id: initialLane, label: `${initialLane} (not in the current lane list)` });
+  }
+  return options;
+}
+
+/**
  * Routine creation dialog with live inference and presets.
  */
-export function renderRoutineDialog({ initial = {}, projects = [], onClose, onSubmit, onInfer }) {
+export function renderRoutineDialog({ initial = {}, projects = [], lanes = [], onClose, onSubmit, onInfer }) {
   const promptTextarea = el('textarea', {
     rows: 3,
     style: 'width:100%; box-sizing:border-box; font-family:inherit; resize:vertical;',
@@ -2203,12 +2237,15 @@ export function renderRoutineDialog({ initial = {}, projects = [], onClose, onSu
     el('option', { value: 'apply', text: 'apply (can write files and commit)', selected: initial.policy === 'apply' })
   ]);
 
-  const laneSelect = el('select', {}, [
-    el('option', { value: '', text: 'auto (default lane)', selected: !initial.lane }),
-    el('option', { value: 'zen', text: 'zen (OpenCode Zen)', selected: initial.lane === 'zen' }),
-    el('option', { value: 'go', text: 'go (OpenCode Go)', selected: initial.lane === 'go' }),
-    el('option', { value: 'hitch', text: 'hitch (standard Hitch providers)', selected: initial.lane === 'hitch' })
-  ]);
+  // Built from the server's lane list when the dialog has it, so a new lane
+  // shows up here without an edit. See `routineLaneOptions` for why the empty
+  // value leads and why an unrecognized stored lane keeps its own entry.
+  const laneOptions = routineLaneOptions(lanes, initial.lane || '');
+  const laneSelect = el('select', {}, laneOptions.map((o) => el('option', {
+    value: o.id,
+    text: o.label,
+    selected: initial.lane ? initial.lane === o.id : o.id === ''
+  })));
 
   const inferenceNotice = el('div', { class: 'field__hint', style: 'margin-top:6px; color:var(--text-accent, #3b82f6); display:none;' });
 

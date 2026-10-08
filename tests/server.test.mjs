@@ -4,8 +4,10 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { request as httpRequest } from 'node:http';
+import { connect } from 'node:net';
 import {
   startServer,
+  stopServer,
   createApp,
   resolveStaticPath,
   isLoopback,
@@ -808,7 +810,13 @@ describe('read endpoints', () => {
     const doc = await (await s.api('/config')).json();
     assert.deepEqual(doc.tiers, ['low-med', 'med-high', 'high', 'max']);
     assert.deepEqual(doc.sources, ['config', 'catalog']);
-    assert.deepEqual(doc.lanes.map((l) => l.id), ['auto', 'zen', 'go', 'hitch']);
+    assert.deepEqual(doc.lanes.map((l) => l.id), ['auto', 'zen', 'go', 'hitch', 'hf']);
+    // The composer renders `name` and the budget page renders `name (id)`, so a
+    // lane without a name would show up as a bare id in both.
+    const hfLane = doc.lanes.find((l) => l.id === 'hf');
+    assert.equal(hfLane.name, 'HuggingFace');
+    assert.equal(hfLane.prefix, 'huggingface/');
+    assert.match(hfLane.description, /filtered/);
     assert.equal(doc.playbooks[0].id, 'feature');
     assert.equal(doc.principles[0].id, 'prove-it-works');
     assert.equal(doc.budget.tier, 'med-high');
@@ -1739,5 +1747,38 @@ describe('binding', () => {
     assert.equal(typeof app.handler, 'function');
     assert.ok(app.registry instanceof RunRegistry);
     app.registry.shutdown();
+  });
+
+  it('releases the registry when binding fails', async () => {
+    const first = await bootTracked();
+    const registry = new RunRegistry({ zstack: stubZStack(), historyPath: tmpHistory() });
+    let shutDown = false;
+    const shutdown = registry.shutdown.bind(registry);
+    registry.shutdown = () => { shutDown = true; shutdown(); };
+    await assert.rejects(
+      startServer({ port: first.port, registry, zstack: stubZStack(), historyPath: tmpHistory() }),
+      { code: 'EADDRINUSE' }
+    );
+    assert.equal(shutDown, true);
+    await first.close();
+  });
+
+  it('stops scheduling before draining an unfinished HTTP request', async () => {
+    const s = await bootTracked();
+    const socket = connect({ host: s.host, port: s.port });
+    const closed = new Promise((resolve) => socket.once('close', resolve));
+    await new Promise((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+    });
+    // A body whose remaining bytes never arrive prevents a graceful close.
+    socket.write('POST /api/runs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 100\r\n\r\n{');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const stopped = stopServer(s, { drainTimeoutMs: 30 });
+    assert.equal(s.app.scheduler.running, false);
+    assert.equal(s.app.scheduler.timer, null);
+    await stopped;
+    await closed;
+    assert.equal(s.server.listening, false);
   });
 });

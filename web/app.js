@@ -1228,6 +1228,9 @@ async function continueChatAsRun(message, chat) {
     }
   }
 
+  // A chat pins only a model, not a lane, so the lane is inferred from the
+  // model's provider prefix. `huggingface/` ids carry a second slash; a prefix
+  // test is unaffected by that.
   let inferredLane = '';
   if (chat?.lane) {
     inferredLane = chat.lane;
@@ -1235,6 +1238,8 @@ async function continueChatAsRun(message, chat) {
     inferredLane = 'go';
   } else if (chat?.model?.startsWith('opencode/')) {
     inferredLane = 'zen';
+  } else if (chat?.model?.startsWith('huggingface/')) {
+    inferredLane = 'hf';
   }
 
   let targetTurns = null;
@@ -1457,10 +1462,17 @@ async function openNewChatDialog() {
 
 /** Open dialog to schedule an unattended routine. */
 async function openRoutineDialog(initial = {}) {
-  await loadProjects().catch(() => {});
+  await Promise.all([
+    loadProjects().catch(() => {}),
+    // The lane list comes from the server, so a new lane appears in this dialog
+    // without a client edit. A failed load leaves it empty and the dialog falls
+    // back to its own list rather than blocking the routine.
+    loadConfig().catch(() => {})
+  ]);
   const overlay = renderRoutineDialog({
     initial,
     projects: state.projects || [],
+    lanes: state.config?.lanes || [],
     onClose: () => overlay.remove(),
     onInfer: async (text) => {
       try {

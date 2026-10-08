@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { readFileSync, writeFileSync, readdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -11,7 +13,7 @@ import {
   historyRecordFor,
   narrativeOf
 } from '../src/runs.mjs';
-import { readHistory } from '../src/history.mjs';
+import { readHistory, readHistoryTail, findHistoryEntry, checkpointHistory, appendHistory } from '../src/history.mjs';
 import { createLiveRun, applyLiveEvent } from '../src/blocks.mjs';
 import { DEFAULT_MAX_TURNS, SEGMENT_TURNS } from '../src/turns.mjs';
 import { HARNESS_DEFAULT_MAX_TURNS } from '../src/harness.mjs';
@@ -677,4 +679,131 @@ describe('history record shape', () => {
     assert.equal(plain.sessionId, null);
     assert.equal(plain.continuationOf, null);
   });
+});
+
+
+describe('durable run progress', () => {
+  it('recovers a forcibly killed owner with partial prose, tools and project intact', async () => {
+    const historyPath = tmpHistory();
+    const moduleUrl = new URL('../src/runs.mjs', import.meta.url).href;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', `
+      import { RunRegistry } from ${JSON.stringify(moduleUrl)};
+      const registry = new RunRegistry({ historyPath: process.argv[1], zstack: {
+        async agent(options) {
+          options.onEvent({ type: 'run-start', model: 'test', workspace: '/repo' });
+          options.onEvent({ type: 'turn', turn: 1, tokens: 100 });
+          options.onEvent({ type: 'text', turn: 1, text: 'Work in progress.' });
+          options.onEvent({ type: 'tool', turn: 1, name: 'write', args: { file_path: 'partial.txt' }, outcome: 'ok', output: 'private successful body' });
+          options.onEvent({ type: 'tool', turn: 1, name: 'bash', args: { command: 'check' }, outcome: 'error', output: 'check failed' });
+          setInterval(() => {}, 1000);
+          process.send({ id: registry.order[0] });
+          await new Promise(() => {});
+        }
+      }});
+      registry.start({ prompt: 'Finish the task', projectId: 'project-1', policy: 'apply' });
+    `, historyPath], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    try {
+      const [{ id }] = await once(child, 'message');
+      assert.equal(readHistory({ path: historyPath }).entries.length, 0, 'a live owner is not recovered');
+      const exited = once(child, 'exit');
+      child.kill('SIGKILL');
+      await exited;
+      const records = readHistoryTail(10, historyPath);
+      assert.equal(records.length, 1);
+      const record = records[0];
+      assert.equal(record.id, id);
+      assert.equal(record.ok, false);
+      assert.equal(record.errorKind, 'interrupted');
+      assert.equal(record.narrative, 'Work in progress.');
+      assert.equal(record.turns, 1);
+      assert.equal(record.toolCalls, 2);
+      assert.equal(record.projectId, 'project-1');
+      assert.equal(record.policy, 'apply');
+      assert.equal(record.steps.filter(s => s.kind === 'tool').length, 2);
+      assert.equal(record.steps.at(-1).output, 'check failed');
+      assert.ok(!JSON.stringify(record).includes('private successful body'));
+      assert.equal(record.fileChanges[0].path, 'partial.txt');
+      assert.match(record.error, /recovered/);
+      assert.equal(findHistoryEntry(id, historyPath).id, id);
+      assert.equal(readHistory({ path: historyPath }).total, 1, 'repeated recovery does not duplicate');
+      assert.deepEqual(readdirSync(historyPath + '.active'), []);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+  });
+
+  it('saves partial progress synchronously on shutdown even if the SDK never settles', async () => {
+    const historyPath = tmpHistory();
+    const registry = new RunRegistry({ historyPath, zstack: {
+      async agent(options) {
+        options.onEvent({ type: 'turn', turn: 1 });
+        options.onEvent({ type: 'text', turn: 1, text: 'Partial answer' });
+        await new Promise(() => {});
+      }
+    }});
+    const run = registry.start({ prompt: 'Work' });
+    registry.shutdown();
+    const record = findHistoryEntry(run.id, historyPath);
+    assert.equal(record.errorKind, 'interrupted');
+    assert.equal(record.narrative, 'Partial answer');
+    assert.equal(record.steps[0].kind, 'turn');
+    assert.ok(run.controller.signal.aborted);
+    assert.throws(() => registry.start({ prompt: 'Late admission' }), /shutting down/);
+    assert.throws(() => registry.resume(run.id), /shutting down/);
+  });
+
+  it('preserves progression when the harness throws before returning its steps', async () => {
+    const historyPath = tmpHistory();
+    const registry = new RunRegistry({ historyPath, zstack: stubZStack({ events: happyEvents.slice(0, -1), throw: 'Harness died' }) });
+    const run = registry.start({ prompt: 'Work' });
+    await settled(registry, run.id);
+    const record = findHistoryEntry(run.id, historyPath);
+    assert.equal(record.steps.filter(s => s.kind === 'tool').length, 2);
+    assert.equal(record.narrative, 'Looking at the file.');
+    assert.deepEqual(readdirSync(historyPath + '.active'), []);
+  });
+});
+
+
+it('claims recovery across processes and preserves truncation flags', async () => {
+  const historyPath = tmpHistory();
+  const finished = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  await once(finished, 'exit');
+  const id = 'interrupted-capped-run';
+  checkpointHistory({ id, command: 'agent', ok: false,
+    steps: Array.from({ length: 205 }, (_, i) => ({ kind: 'turn', turn: i })),
+    narrative: 'x'.repeat(13000) }, historyPath);
+  const file = join(historyPath + '.active', readdirSync(historyPath + '.active')[0]);
+  const checkpoint = JSON.parse(readFileSync(file, 'utf8'));
+  checkpoint.pid = finished.pid;
+  writeFileSync(file, JSON.stringify(checkpoint));
+  const moduleUrl = new URL('../src/history.mjs', import.meta.url).href;
+  const readers = Array.from({ length: 3 }, () => spawn(process.execPath, ['--input-type=module', '-e', `
+    import { readHistory } from ${JSON.stringify(moduleUrl)};
+    readHistory({ path: process.argv[1] });
+  `, historyPath], { stdio: 'ignore' }));
+  const exits = await Promise.all(readers.map(child => once(child, 'exit')));
+  assert.ok(exits.every(([code]) => code === 0));
+  const history = readHistory({ path: historyPath });
+  assert.equal(history.total, 1);
+  assert.equal(history.entries[0].stepsTruncated, true);
+  assert.equal(history.entries[0].narrativeTruncated, true);
+  assert.deepEqual(readdirSync(historyPath + '.active'), []);
+});
+
+it('does not overwrite a final archive if the owner died before checkpoint cleanup', async () => {
+  const historyPath = tmpHistory();
+  const finished = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  await once(finished, 'exit');
+  const id = 'already-archived';
+  checkpointHistory({ id, command: 'agent', ok: false }, historyPath);
+  const file = join(historyPath + '.active', readdirSync(historyPath + '.active')[0]);
+  const checkpoint = JSON.parse(readFileSync(file, 'utf8'));
+  checkpoint.pid = finished.pid;
+  writeFileSync(file, JSON.stringify(checkpoint));
+  appendHistory({ id, command: 'agent', ok: true, narrative: 'Finished' }, historyPath);
+  const history = readHistory({ path: historyPath });
+  assert.equal(history.total, 1);
+  assert.equal(history.entries[0].ok, true);
+  assert.deepEqual(readdirSync(historyPath + '.active'), []);
 });

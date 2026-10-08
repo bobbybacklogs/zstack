@@ -20,6 +20,7 @@ An opinionated Agent Operating System, TypeScript SDK, and CLI for rigorous soft
 - **Pinned-model Chat**: a chat page in the UI listing conversations kept on the server. One model from the live catalogue is pinned per chat, free models included, and each turn streams token by token. A chat is plain: no playbook, no tools, no workspace, and it never lands in run history.
 - **Prompt Optimization**: the run composer has an Optimize button that rewrites your raw text into a clearer task prompt grounded in the playbook the request matches, in place and with Undo. It only shapes text: nothing is dispatched until you send.
 - **Dynamic Workload Routing**: Routes tasks to the optimal model based on available providers (OpenCode Zen/Go, OpenAI, Anthropic, Gemini, DeepSeek).
+- **Quality-Filtered HuggingFace Lane**: A fifth provider lane that draws on HuggingFace's open router. Because anyone can publish there, the lane filters the catalogue for tool calling, context, recency, and publisher before pinning any role, and reports every admission and rejection with the rule that made it.
 - **Adversarial Multi-Family Panels**: Concurrently queries models across distinct provider families (`/arena`, `/panel`) to surface architectural blind spots.
 - **Unified SDK & CLI**: Programmatic TypeScript API and terminal binary for direct task execution, prompt classification, and rule synchronization.
 
@@ -78,6 +79,12 @@ When connected to ModelHitch, `zstack` inspects available providers and assigns 
 | **deep reasoning** | `opencode/gpt-5.5` | `openai/gpt-5.6-luna` | Algorithm design, invariants, and mathematical correctness. |
 | **how explorer / why** | `opencode/deepseek-v4-pro` | `deepseek/deepseek-v4-flash` | Subsystem exploration and runtime behavior analysis. |
 | **adversarial panel** | `claude-sonnet-4-6`, `gpt-5.5`, `deepseek-v4-pro` | `openai/gpt-5.6-luna`, `gemini-3.6-flash`, `deepseek-v4-flash` | Parallel review across divergent model families. |
+
+The table pins the OpenCode and ModelHitch lanes. The `hf` lane resolves the same
+roles from the HuggingFace filter instead, per tier: on `low-med` it buys the cheap
+flash builds, and from `med-high` up it pins the current flagship for coding and
+reasoning with a flash build for fast exploration, exactly as the Zen and Go lanes
+do. Run `zstack hf` against your own gateway to see the roles this machine resolves.
 
 ---
 
@@ -319,6 +326,9 @@ zstack --about
 # Check ModelHitch bridge connectivity and active role mappings
 zstack status
 
+# Report what the HuggingFace lane's filter admits, rejects, and would pin
+zstack hf
+
 # List all available playbooks and their triggers
 zstack playbooks
 
@@ -558,8 +568,8 @@ duplicate ids, and non-array `keywords` are validation errors.
 ## Provider Lanes
 
 A lane pins which provider family role models resolve from, so you can choose
-between OpenCode's pay-per-use catalog, its flat-rate Go subscription, or plain
-ModelHitch routing without editing role mappings by hand.
+between OpenCode's pay-per-use catalog, its flat-rate Go subscription, plain
+ModelHitch routing, or HuggingFace's router without editing role mappings by hand.
 
 | Lane | Prefix | Description |
 | --- | --- | --- |
@@ -567,12 +577,14 @@ ModelHitch routing without editing role mappings by hand.
 | `zen` | `opencode/` | OpenCode Zen pay-per-use models |
 | `go` | `opencode-go/` | OpenCode Go and Go Plus flat-rate models |
 | `hitch` | — | No OpenCode preference; active ModelHitch providers and config default |
+| `hf` | `huggingface/` | HuggingFace router models, filtered for quality before pinning |
 
 ```bash
 zstack budget med-high --source catalog --lane go --confirm
 zstack --go "Fix the flaky retry test"        # one-shot override
-zstack --zen "Refactor the parser"            # aliases: --zen, --go, --hitch
+zstack --zen "Refactor the parser"            # aliases: --zen, --go, --hitch, --hf
 zstack --lane hitch "Investigate the timeout"
+zstack --hf "Add a health check to the server"
 ```
 
 Lane resolution applies whenever the source is `catalog`. With
@@ -580,6 +592,46 @@ Lane resolution applies whenever the source is `catalog`. With
 but not applied and the mapping reports `laneApplied: false`. The stored lane
 survives a tier-only update. Every lane is validated against the live catalog, so
 a resolved model the gateway does not serve is never selected.
+
+### The HuggingFace lane filters before it pins
+
+HuggingFace's router serves models published by anyone, from frontier labs to
+anonymous fine-tuners, so this lane cannot pin hand-written ladders the way `zen`
+and `go` do: a hand-written ladder over a churning open catalogue rots silently.
+It filters first and pins from what survived. Two layers, so it degrades honestly:
+
+- **Capability gates** use the router's public model listing to drop anything
+  that cannot do the work: no tool calling (the agent loop needs it), a context
+  window under 32k, no live provider, or no text output. This layer needs the
+  network once per cache window, and an unfetched fact is reported as
+  `unavailable` rather than assumed good.
+- **Curation gates** use the model id alone, so they always run, offline
+  included: safety classifiers, translation, speech, embedding and vision
+  builds, previews, on-device toys, community roleplay fine-tunes, publishers
+  outside the trusted list, base checkpoints that have an instruction-tuned
+  sibling, quantized and dated duplicates of a model already listed, and the
+  tiny tail below the tier's size floor.
+
+Survivors are ranked per role by size, recency, context, cost, and speed, with
+cost mattering more on the cheap tiers and not at all on `max`. The lane needs no
+token of its own: inference rides the ModelHitch gateway, which holds the
+HuggingFace key, exactly like every other lane. HuggingFace is never chosen by
+`auto`, because a large, cheap, variable-quality catalogue should be an explicit
+choice.
+
+Nothing is hidden: `zstack hf` prints what the filter admitted, what it rejected,
+counts by rule, and the roles it would pin.
+
+```bash
+zstack hf                    # filter report for the stored tier
+zstack hf --tier max         # report as the Max tier would filter it
+zstack hf --all --json       # every rejection with its reason, as one JSON doc
+zstack hf --refresh          # refetch capability metadata instead of the cache
+```
+
+Capability metadata is cached at `~/.zstack/hf-capabilities.json` (`ZSTACK_HF_CAPABILITIES_PATH`
+overrides) and expires after 12 hours. A machine with no HuggingFace key fetches
+nothing at all.
 
 ---
 

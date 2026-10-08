@@ -1738,9 +1738,14 @@ export function createApp(options = {}) {
           panel: mapping.panelList ?? [],
           mode: mapping.mode,
           effectiveFor: 'subsequently started runs',
+          // The HuggingFace lane can be inapplicable for a second reason — its
+          // filter admitted nothing — and `laneNote` is where that is stated
+          // instead of being folded into the config-pinned message.
+          laneNote: mapping.laneNote ?? null,
+          hfFilter: mapping.hfLaneFilter ?? null,
           note: mapping.laneApplied === false
             ? 'The stored models come from your ModelHitch config, so the lane was recorded but not applied.'
-            : null
+            : (mapping.laneNote ?? null)
         });
         return;
       }
@@ -1791,8 +1796,9 @@ export function createApp(options = {}) {
 
         if (body.lane !== undefined) {
           if (typeof body.lane !== 'string' || !body.lane.trim() || !isKnownLane(body.lane)) {
-            fail(res, 400, `Unknown provider lane: "${body.lane}". Allowed lanes: auto, zen, go, hitch.`, {
-              detail: `Unknown provider lane: "${body.lane}". Allowed lanes: auto, zen, go, hitch.`
+            const allowed = `Allowed lanes: ${Object.keys(LANES).join(', ')}.`;
+            fail(res, 400, `Unknown provider lane: "${body.lane}". ${allowed}`, {
+              detail: `Unknown provider lane: "${body.lane}". ${allowed}`
             });
             return;
           }
@@ -1859,9 +1865,11 @@ export function createApp(options = {}) {
           panel: mapping.panelList ?? [],
           mode: mapping.mode,
           effectiveFor: isConfirmed ? 'subsequently started runs' : 'subsequently started runs (once confirmed)',
+          laneNote: mapping.laneNote ?? null,
+          hfFilter: mapping.hfLaneFilter ?? null,
           note: mapping.laneApplied === false
             ? 'The stored models come from your ModelHitch config, so the lane was recorded but not applied.'
-            : null
+            : (mapping.laneNote ?? null)
         });
         return;
       }
@@ -1882,9 +1890,11 @@ export function createApp(options = {}) {
             models: mapping.models ?? {},
             laneApplied: mapping.laneApplied !== false,
             panel: mapping.panelList ?? [],
+            laneNote: mapping.laneNote ?? null,
+            hfFilter: mapping.hfLaneFilter ?? null,
             note: mapping.laneApplied === false
               ? 'The stored models come from your ModelHitch config, so the lane was recorded but not applied.'
-              : null
+              : (mapping.laneNote ?? null)
           });
         } catch (err) {
           fail(res, 400, err.message);
@@ -1914,7 +1924,8 @@ export function createApp(options = {}) {
           mapping: status.mapping,
           panelModels: status.panelModels,
           budget: status.budget,
-          laneApplied: status.budgetDetail?.laneApplied !== false
+          laneApplied: status.budgetDetail?.laneApplied !== false,
+          laneNote: status.budgetDetail?.laneNote ?? null
         });
       } catch (err) {
         sendJson(res, 200, { ok: true, connected: false, error: err?.message || String(err) });
@@ -2576,6 +2587,10 @@ export function startServer(options = {}) {
 
   return new Promise((resolvePromise, rejectPromise) => {
     server.once('error', (err) => {
+      // Listening failures never emit `close`; release the scheduler and run
+      // registry here too rather than leaving a failed startup ticking.
+      app.scheduler.stop();
+      app.registry.shutdown();
       if (err.code === 'EADDRINUSE') {
         const wrapped = new Error(`Port ${port} is already in use on ${host}. Pass --port to choose another.`);
         wrapped.code = 'EADDRINUSE';
@@ -2595,6 +2610,25 @@ export function startServer(options = {}) {
         port: address.port,
         url: `http://${host === '::' ? '[::1]' : host}:${address.port}/`
       });
+    });
+  });
+}
+
+/** Stop admissions and runs before draining HTTP connections. */
+export function stopServer(started, options = {}) {
+  const drainTimeoutMs = options.drainTimeoutMs ?? 2000;
+  started.app.scheduler.stop();
+  started.registry.shutdown();
+  return new Promise((resolvePromise) => {
+    const timer = setTimeout(() => {
+      // An unfinished request or chat stream may otherwise keep close waiting
+      // forever. Run progress has already been saved by registry.shutdown().
+      started.server.closeAllConnections();
+      resolvePromise();
+    }, drainTimeoutMs);
+    started.server.close(() => {
+      clearTimeout(timer);
+      resolvePromise();
     });
   });
 }

@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { hasHuggingFaceKey, loadHuggingFaceCapabilities, resolveHuggingFaceLane } from './hf.mjs';
 
 export const DEFAULT_BRIDGE_URL = process.env.MODELHITCH_BASE_URL || 'http://127.0.0.1:3939';
 
@@ -239,6 +240,14 @@ export async function checkBridgeHealth(baseUrl = DEFAULT_BRIDGE_URL, options = 
  * Fetch active configuration and model catalog from ModelHitch.
  * Throws a structured GatewayError only when both endpoints fail; a single
  * failure degrades to that part's default so partial outages stay usable.
+ *
+ * When a HuggingFace key is active the state also carries `hfCapabilities`:
+ * the router's per-model tool, context, price, and recency metadata, which the
+ * gateway's own `/v1/models` does not publish. It is cached on disk, so this
+ * costs one HTTP GET per cache window rather than one per call, and it never
+ * throws: a failed fetch leaves `source: 'unavailable'` and the HuggingFace
+ * lane falls back to its offline curation rules rather than failing. Pass
+ * `hfCapabilities: false` to skip it entirely.
  */
 export async function fetchModelHitchState(baseUrl = DEFAULT_BRIDGE_URL, options = {}) {
   const get = (path) => gatewayFetch(`${baseUrl}${path}`, {
@@ -265,12 +274,23 @@ export async function fetchModelHitchState(baseUrl = DEFAULT_BRIDGE_URL, options
   const models = Array.isArray(modelsData?.data) ? modelsData.data : [];
   const keys = config.keys || {};
 
+  let hfCapabilities = null;
+  if (options.hfCapabilities !== false && hasHuggingFaceKey(keys)) {
+    hfCapabilities = await loadHuggingFaceCapabilities({
+      cachePath: options.hfCapabilitiesPath,
+      refresh: options.refreshHfCapabilities === true,
+      fetchImpl: options.fetchImpl,
+      timeoutMs: options.timeoutMs
+    });
+  }
+
   return {
     baseUrl,
     config,
     keys,
     models,
-    activeProviders: Object.keys(keys).filter(k => !!keys[k])
+    activeProviders: Object.keys(keys).filter(k => !!keys[k]),
+    hfCapabilities
   };
 }
 
@@ -278,9 +298,11 @@ export async function fetchModelHitchState(baseUrl = DEFAULT_BRIDGE_URL, options
  * Intelligently resolve the best model for each zstack role based on ModelHitch's active providers.
  * Prefers OpenCode if available, else falls back cleanly to Hitch's other active providers (DeepSeek, OpenAI, Gemini, etc.).
  *
- * Pass `lane` ('zen' | 'go' | 'hitch' | 'auto') to force a provider family:
+ * Pass `lane` ('zen' | 'go' | 'hitch' | 'hf' | 'auto') to force a provider family:
  * 'zen' uses opencode/<model>, 'go' uses opencode-go/<model>, 'hitch' skips
- * OpenCode entirely. 'auto' (the default) keeps the detection above.
+ * OpenCode entirely, and 'hf' resolves from the HuggingFace catalogue through
+ * the same quality filter the budget resolver uses. 'auto' (the default) keeps
+ * the detection above.
  */
 export function resolveRoleMapping(state, options = {}) {
   const { keys, models, config } = state;
@@ -293,8 +315,8 @@ export function resolveRoleMapping(state, options = {}) {
   const requested = String(options.lane || 'auto').toLowerCase();
   const lane = requested === 'auto'
     ? (hasOpenCodeKey ? 'zen' : 'hitch')
-    : (requested === 'zen' || requested === 'go' || requested === 'hitch' ? requested : 'zen');
-  const hasOpenCode = lane !== 'hitch';
+    : (requested === 'zen' || requested === 'go' || requested === 'hitch' || requested === 'hf' ? requested : 'zen');
+  const hasOpenCode = lane !== 'hitch' && lane !== 'hf';
   const prefix = lane === 'go' ? 'opencode-go/' : 'opencode/';
 
   const modelIds = new Set(models.map(m => m.id));
@@ -350,7 +372,29 @@ export function resolveRoleMapping(state, options = {}) {
 
   // Construct Multi-Family Ensemble Panel (picks 1 model from each distinct provider family)
   const panelModels = [];
-  if (lane === 'go') {
+  if (lane === 'hf') {
+    // The HuggingFace filter owns this lane's picks, including the panel. It is
+    // the same call the budget resolver makes, so the legacy path cannot pick a
+    // model the curated path would have rejected.
+    const hfLane = resolveHuggingFaceLane(models.map(m => m.id), {
+      tier: options.tier || 'med-high',
+      capabilities: state.hfCapabilities?.models || null,
+      capabilitySource: state.hfCapabilities?.source || 'unavailable'
+    });
+    if (hfLane.applied) {
+      coderModel = hfLane.coder;
+      fastModel = hfLane.fast;
+      architectModel = hfLane.architect;
+      reasonerModel = hfLane.reasoner;
+      panelModels.push(...hfLane.panel);
+    } else {
+      // Nothing survived the filter: fall back to plain ModelHitch routing
+      // rather than pinning a HuggingFace model the filter rejected.
+      if (hasOpenAI) panelModels.push('openai/gpt-5.6-luna');
+      if (hasGemini) panelModels.push('gemini/models/gemini-3.6-flash');
+      if (hasDeepSeek) panelModels.push('deepseek/deepseek-v4-flash');
+    }
+  } else if (lane === 'go') {
     panelModels.push(`${prefix}deepseek-v4-pro`, `${prefix}gpt-5.6-luna`, `${prefix}qwen3.8-max`);
   } else if (lane === 'zen') {
     panelModels.push(`${prefix}claude-sonnet-4-6`, `${prefix}gpt-5.5`, `${prefix}deepseek-v4-pro`);
@@ -363,10 +407,10 @@ export function resolveRoleMapping(state, options = {}) {
   if (panelModels.length === 0) panelModels.push(defaultModel);
 
   const panelStr = panelModels.join(', ');
-  const MODES = { zen: 'opencode-zen', go: 'opencode-go', hitch: 'modelhitch-multi-provider' };
+  const MODES = { zen: 'opencode-zen', go: 'opencode-go', hitch: 'modelhitch-multi-provider', hf: 'huggingface-router' };
 
   return {
-    mode: hasOpenCode ? (MODES[lane] || 'opencode-zen-go') : 'modelhitch-multi-provider',
+    mode: MODES[lane] || (hasOpenCode ? 'opencode-zen-go' : 'modelhitch-multi-provider'),
     lane,
     models: {
       'feature, refactoring': coderModel,

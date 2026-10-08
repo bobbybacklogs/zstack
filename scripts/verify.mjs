@@ -24,6 +24,7 @@ const HERMETIC_FILES = [
   'tests/git.test.mjs',
   'tests/git-races.test.mjs',
   'tests/harness.test.mjs',
+  'tests/hf.test.mjs',
   'tests/history.test.mjs',
   'tests/manifest.test.mjs',
   'tests/optimize.test.mjs',
@@ -39,6 +40,7 @@ const HERMETIC_FILES = [
   'tests/subagent.test.mjs',
   'tests/triage.test.mjs',
   'tests/turns.test.mjs',
+  'tests/web-lanes.test.mjs',
   'tests/workfolk.test.mjs'
 ];
 
