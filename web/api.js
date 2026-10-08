@@ -4,10 +4,47 @@
  * Thin on purpose: the server owns the shapes and this only turns an HTTP
  * failure into a thrown Error carrying the server's own message, so a mistake
  * surfaces the server's explanation rather than a status code.
+ *
+ * The one piece of local state is the credential. A server started with
+ * `--require-auth` refuses every `api` call that presents nothing, and the
+ * browser cannot send an `Authorization` header on the navigation request that
+ * loads this page — so the key is pasted once on the Keys page (or arrives as
+ * `?token=`) and is kept here for the fetches that follow. It never leaves this
+ * origin except as the header the server asked for.
  */
 
+const TOKEN_KEY = 'zstack:api-token';
+
+/** The credential this browser presents, or '' when it presents none. */
+export function getStoredToken() {
+  try {
+    return localStorage.getItem(TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+/** Remember, or forget, the credential. An empty value clears it. */
+export function setStoredToken(token) {
+  try {
+    if (typeof token === 'string' && token.trim() !== '') {
+      localStorage.setItem(TOKEN_KEY, token.trim());
+    } else {
+      localStorage.removeItem(TOKEN_KEY);
+    }
+  } catch {
+    // A browser that refuses storage still works: the token simply does not
+    // outlive the page.
+  }
+}
+
+function authHeaders() {
+  const token = getStoredToken();
+  return token ? { authorization: `Bearer ${token}` } : {};
+}
+
 async function request(method, path, body, options = {}) {
-  const init = { method, headers: {} };
+  const init = { method, headers: { ...authHeaders() }, credentials: 'omit' };
   if (options.signal) init.signal = options.signal;
   if (body !== undefined) {
     init.headers['content-type'] = 'application/json';
@@ -56,6 +93,12 @@ export const api = {
   deleteChat: (id) => request('DELETE', `/chats/${encodeURIComponent(id)}`),
   projects: () => request('GET', '/projects'),
   project: (id) => request('GET', `/projects/${encodeURIComponent(id)}/runs`),
+  keys: () => request('GET', '/keys'),
+  key: (id) => request('GET', `/keys/${encodeURIComponent(id)}`),
+  createKey: (payload) => request('POST', '/keys', payload),
+  updateKey: (id, payload) => request('PATCH', `/keys/${encodeURIComponent(id)}`, payload),
+  deleteKey: (id) => request('DELETE', `/keys/${encodeURIComponent(id)}`),
+  rotateKey: (id, payload) => request('POST', `/keys/${encodeURIComponent(id)}/rotate`, payload ?? {}),
   dashboard: () => request('GET', '/dashboard'),
   createProject: (payload) => request('POST', '/projects', payload),
   updateProject: (id, payload) => request('PUT', `/projects/${encodeURIComponent(id)}`, payload),
@@ -88,7 +131,11 @@ export const api = {
  * reconnect.
  */
 export function subscribeToRun(id, handlers = {}) {
-  const source = new EventSource(`/api/runs/${encodeURIComponent(id)}/events`);
+  // EventSource sets no headers, so the credential rides the query string the
+  // server also accepts. Same origin, and the server never echoes it back.
+  const token = getStoredToken();
+  const query = token ? `?token=${encodeURIComponent(token)}` : '';
+  const source = new EventSource(`/api/runs/${encodeURIComponent(id)}/events${query}`);
   const on = (type) => (event) => {
     let data = null;
     try {
@@ -118,7 +165,7 @@ export async function streamChatMessage(id, text, handlers = {}) {
   const { signal, onStart, onDelta, onDone, onError } = handlers;
   const res = await fetch(`/api/chats/${encodeURIComponent(id)}/messages`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ text }),
     signal
   });

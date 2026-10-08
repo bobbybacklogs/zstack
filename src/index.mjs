@@ -13,6 +13,7 @@ export * from './triage.mjs';
 export * from './subagent.mjs';
 export * from './history.mjs';
 export * from './projects.mjs';
+export * from './keys.mjs';
 export * from './chats.mjs';
 export * from './overrides.mjs';
 export * from './skill.mjs';

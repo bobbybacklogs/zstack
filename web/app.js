@@ -10,7 +10,7 @@
  * arriving mid-run replaces one paragraph instead of re-rendering the page.
  */
 
-import { api, subscribeToRun, streamChatMessage } from './api.js';
+import { api, subscribeToRun, streamChatMessage, getStoredToken, setStoredToken } from './api.js';
 import {
   renderChatList,
   renderChatPage,
@@ -40,6 +40,10 @@ import {
   renderRoutineDialog,
   renderWorkfolkPage,
   renderWorkfolkDispatchDialog,
+  renderKeysPage,
+  renderKeyDialog,
+  renderKeySecretDialog,
+  copyText,
   renderIcon,
   turnBudgetLine,
   relativeTime
@@ -72,7 +76,11 @@ const state = {
   schedules: [],
   workfolkStatus: null,
   workfolkWorkers: [],
-  workfolkJobs: []
+  workfolkJobs: [],
+  keys: [],
+  keysInfo: null,
+  keysError: null,
+  keysUnauthorized: false
 };
 
 /** One open stream per run, closed when the run ends or the view moves on. */
@@ -117,6 +125,35 @@ if (typeof window !== 'undefined' && window.matchMedia) {
 }
 
 const SIDEBAR_KEY = 'zstack:sidebar-collapsed';
+
+/**
+ * Take a credential from the URL, once.
+ *
+ * A server started with `--require-auth` refuses every `api` call that presents
+ * nothing, and a browser cannot attach a header to the navigation request that
+ * loads this page. So the first visit carries the key in the query string, it is
+ * stored for the fetches that follow, and it is stripped from the address bar so
+ * it does not linger in history or in a URL somebody might paste elsewhere.
+ */
+function seedTokenFromUrl() {
+  let url;
+  try {
+    url = new URL(window.location.href);
+  } catch {
+    return;
+  }
+  const token = url.searchParams.get('token') || url.searchParams.get('api_token');
+  if (!token || token.trim() === '') return;
+  setStoredToken(token);
+  url.searchParams.delete('token');
+  url.searchParams.delete('api_token');
+  try {
+    window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+  } catch {
+    // A browser that refuses the rewrite has still stored the key.
+  }
+}
+
 let sidebarCollapsed = false;
 try {
   sidebarCollapsed = localStorage.getItem(SIDEBAR_KEY) === 'true';
@@ -168,6 +205,7 @@ function parseHash() {
   if (head === 'github') return { name: 'github' };
   if (head === 'schedules' || head === 'routines') return { name: 'schedules', id: null };
   if (head === 'workfolk' || head === 'workers') return { name: 'workfolk', id: null };
+  if (head === 'keys' || head === 'api-keys') return { name: 'keys' };
   if (head === 'chat' && id) return { name: 'chat', id: decodeURIComponent(id) };
   // An old `#/chat` link has no conversation to open, so it lands on the list.
   if (head === 'chat') return { name: 'chats' };
@@ -274,6 +312,36 @@ async function loadWorkfolk() {
     state.workfolkWorkers = [];
   }
   return { status: state.workfolkStatus, workers: state.workfolkWorkers };
+}
+
+/**
+ * The key store, and whether the server wants a credential at all.
+ *
+ * A 401 is not an error here, it is the answer: the page needs to render its
+ * "present a key" form, which is the only way back in once a server started with
+ * `--require-auth` and the browser has nothing to present.
+ */
+async function loadKeys() {
+  try {
+    const doc = await api.keys();
+    state.keys = doc.keys || [];
+    state.keysInfo = {
+      path: doc.path || '',
+      corrupted: !!doc.corrupted,
+      requireAuth: !!doc.requireAuth,
+      tokenConfigured: !!doc.tokenConfigured
+    };
+    state.keysUnauthorized = false;
+  } catch (err) {
+    state.keysError = err.message;
+    state.keysUnauthorized = err.status === 401;
+    if (err.status === 401) {
+      // Still render the page: the access panel is the fix for this state.
+      state.keysInfo = state.keysInfo || { path: '', corrupted: false, requireAuth: true, tokenConfigured: false };
+    }
+    return null;
+  }
+  return state.keys;
 }
 
 function filteredRuns() {
@@ -697,6 +765,13 @@ function renderSidebar() {
         count: state.github?.repos?.length || null,
         active: state.route.name === 'github',
         onClick: () => go('#/github')
+      }),
+      navItem({
+        icon: 'key',
+        label: 'API keys',
+        count: state.keys.filter((k) => k.active).length || null,
+        active: state.route.name === 'keys',
+        onClick: () => go('#/keys')
       })
     ]
   }));
@@ -829,6 +904,12 @@ function renderTopbar() {
       crumbItem('Dashboard', 'dashboard', () => go('#/')),
       crumbSep(),
       crumbItem('GitHub repos', 'github')
+    );
+  } else if (state.route.name === 'keys') {
+    crumbs.append(
+      crumbItem('Dashboard', 'dashboard', () => go('#/')),
+      crumbSep(),
+      crumbItem('API keys', 'key')
     );
   } else {
     crumbs.append(crumbItem('Dashboard', 'dashboard'));
@@ -1001,6 +1082,33 @@ function renderMain() {
         await loadWorkfolk();
         render();
       }
+    }));
+    return;
+  }
+  if (state.route.name === 'keys') {
+    // A 401 is rendered inside the page, next to the form that fixes it; any
+    // other failure is an ordinary error banner above it.
+    if (state.keysError && !state.keysUnauthorized) {
+      main.append(el('div', { class: 'error-banner', text: state.keysError }));
+    }
+    main.append(renderKeysPage({
+      keys: state.keys || [],
+      path: state.keysInfo?.path || '',
+      corrupted: !!state.keysInfo?.corrupted,
+      requireAuth: !!state.keysInfo?.requireAuth,
+      tokenConfigured: !!state.keysInfo?.tokenConfigured,
+      storedToken: getStoredToken(),
+      unauthorized: state.keysUnauthorized,
+      onNew: () => openKeyDialog(),
+      onRotate: rotateKeyFlow,
+      onEdit: (key) => openKeyDialog(key),
+      onDelete: deleteKeyFlow,
+      onCopyId: async (key) => {
+        const ok = await copyText(key.id);
+        state.error = ok ? null : `Could not copy ${key.id}; select it by hand.`;
+        render();
+      },
+      onSaveToken: saveBrowserToken
     }));
     return;
   }
@@ -1649,6 +1757,107 @@ async function deleteChatFlow(chat) {
   }
 }
 
+/* ------------------------------------------------------------------- keys */
+
+/**
+ * Refresh the key list from the server and re-render, keeping the page's error
+ * state in one place so a failed mutation does not silently look like success.
+ */
+async function refreshKeys() {
+  state.keysError = null;
+  try {
+    await loadKeys();
+  } catch (err) {
+    state.keysError = err.message;
+  }
+  render();
+}
+
+/**
+ * Remember a credential for this browser, or forget it.
+ *
+ * The key is used for the fetches that follow, including the one that re-reads
+ * this page, so saving it either fixes the 401 immediately or proves it wrong
+ * immediately.
+ */
+async function saveBrowserToken(token) {
+  setStoredToken(token);
+  state.keysError = null;
+  state.keysUnauthorized = false;
+  await loadKeys();
+  if (token && state.keysUnauthorized) {
+    state.error = 'That key was refused. Check the secret, or mint a new one with: zstack keys new "<name>"';
+  }
+  render();
+}
+
+/** Create a key, or edit an existing one's name, assignment, notes, or expiry. */
+async function openKeyDialog(existing = null) {
+  let overlay;
+  overlay = renderKeyDialog({
+    existing,
+    onClose: () => overlay.remove(),
+    onSubmit: async (payload) => {
+      if (existing) {
+        await api.updateKey(existing.id, payload);
+        overlay.remove();
+        await refreshKeys();
+        return;
+      }
+      const doc = await api.createKey(payload);
+      overlay.remove();
+      await refreshKeys();
+      showKeySecret(doc.key, doc.secret);
+    }
+  });
+  document.body.append(overlay);
+}
+
+/**
+ * Issue a new secret for a key.
+ *
+ * The old secret stops working the moment this returns, so the confirmation
+ * names what that breaks before it happens.
+ */
+async function rotateKeyFlow(key) {
+  const consequence = key.assignedTo ? ` Anything deployed to ${key.assignedTo} must be updated.` : '';
+  const confirmed = window.confirm(
+    `Rotate "${key.name}"? A new secret is issued and the current one (${key.prefix}) stops working immediately.${consequence}`
+  );
+  if (!confirmed) return;
+  try {
+    const doc = await api.rotateKey(key.id);
+    await refreshKeys();
+    showKeySecret(doc.key, doc.secret, { rotated: true });
+  } catch (err) {
+    state.error = err.message;
+    render();
+  }
+}
+
+async function deleteKeyFlow(key) {
+  const where = key.assignedTo ? ` Anything deployed to ${key.assignedTo} stops authenticating immediately.` : '';
+  if (!window.confirm(`Delete key "${key.name}" (${key.prefix})?${where} This cannot be undone.`)) return;
+  try {
+    await api.deleteKey(key.id);
+    await refreshKeys();
+  } catch (err) {
+    state.error = err.message;
+    render();
+  }
+}
+
+/** Show a secret once. The dialog is the only place it is ever readable. */
+function showKeySecret(key, secret, options = {}) {
+  const overlay = renderKeySecretDialog({
+    key,
+    secret,
+    rotated: !!options.rotated,
+    onClose: () => overlay.remove()
+  });
+  document.body.append(overlay);
+}
+
 /* --------------------------------------------------------------- github */
 
 /**
@@ -1745,6 +1954,12 @@ async function route() {
     }
     if (state.route.name === 'workfolk') {
       await loadWorkfolk();
+      render();
+      return;
+    }
+    if (state.route.name === 'keys') {
+      state.keysError = null;
+      await loadKeys();
       render();
       return;
     }
@@ -1847,6 +2062,8 @@ function onKeydown(event) {
 /* ------------------------------------------------------------------ boot */
 
 function boot() {
+  seedTokenFromUrl();
+
   dom.collapseSidebarBtn?.addEventListener('click', () => {
     setSidebarCollapsed(true);
   });
@@ -1910,6 +2127,9 @@ function boot() {
   // The sidebar lists chats on every page, so they load once at boot and after
   // each mutation rather than only when the chat routes are visited.
   loadChats().then(renderSidebar).catch(() => {});
+
+  // Same for the active-key count, which the sidebar shows on every page.
+  loadKeys().then(renderSidebar).catch(() => {});
 
   route();
 }

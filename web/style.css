@@ -2088,3 +2088,30 @@ table.data td {
 }
 
 
+
+/* API keys page */
+.key-secret {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg-code);
+  overflow-x: auto;
+}
+
+.key-secret__value {
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  user-select: all;
+  white-space: nowrap;
+}
+
+.key-table td:first-child {
+  max-width: 260px;
+}
+
+.key-table .mono {
+  font-size: 12px;
+}

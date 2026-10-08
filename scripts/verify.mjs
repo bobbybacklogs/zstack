@@ -26,6 +26,7 @@ const HERMETIC_FILES = [
   'tests/harness.test.mjs',
   'tests/hf.test.mjs',
   'tests/history.test.mjs',
+  'tests/keys.test.mjs',
   'tests/manifest.test.mjs',
   'tests/optimize.test.mjs',
   'tests/overrides.test.mjs',

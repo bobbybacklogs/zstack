@@ -13,7 +13,7 @@ import { historyRecordFor, normalizeStartRequest, collectHistoryEvent } from '..
 import { triageFailure } from '../src/triage.mjs';
 import { runContextOffload, formatOffloadReport } from '../src/subagent.mjs';
 import { formatEventLine, createProgressRenderer, explainEmptyContent, resolveHarnessEntry, harnessEntryExists, observeGitStatus } from '../src/harness.mjs';
-import { startServer, stopServer, DEFAULT_PORT, DEFAULT_HOST, isLoopback } from '../src/serve.mjs';
+import { startServer, stopServer, DEFAULT_PORT, DEFAULT_HOST, isLoopback, envTruthy } from '../src/serve.mjs';
 import { DEFAULT_MAX_TURNS, continuationBudget, runWithExtensions } from '../src/turns.mjs';
 import { commitAndPushBranch } from '../src/git.mjs';
 import { createPullRequest } from '../src/github.mjs';
@@ -38,6 +38,17 @@ import {
   pollWorkfolkJob,
   getWorkfolkConfig
 } from '../src/workfolk.mjs';
+import {
+  readKeys,
+  createKey,
+  rotateKey,
+  updateKey,
+  deleteKey,
+  findKey,
+  verifyKeySecret,
+  publicKey,
+  keysPath
+} from '../src/keys.mjs';
 
 /** Structured exit codes: 0 success, 1 failure, 2 usage, 3 gateway, 4 partial. */
 export const EXIT = { OK: 0, FAIL: 1, USAGE: 2, GATEWAY: 3, PARTIAL: 4 };
@@ -51,7 +62,7 @@ export function exitForKind(kind) {
 const KNOWN_COMMANDS = new Set([
   'task', 'prompt', 'run', 'panel', 'arena', 'interrogate', 'budget', 'grade',
   'triage', 'explore', 'history', 'shell', 'repl', 'serve', 'skill', 'schedule', 'schedules', 'cron',
-  'workfolk', 'workers',
+  'workfolk', 'workers', 'keys', 'key', 'apikeys',
   'status', 'sync', 'update', 'playbooks', 'principles', 'about', 'version', 'help'
 ]);
 
@@ -186,6 +197,19 @@ function parseArgs(args) {
       flags.cron = args[++i];
     } else if (arg === '--name' && i + 1 < args.length) {
       flags.name = args[++i];
+    } else if ((arg === '--assign' || arg === '--to') && i + 1 < args.length) {
+      flags.assign = args[++i];
+    } else if (arg === '--notes' && i + 1 < args.length) {
+      flags.notes = args[++i];
+    } else if (arg === '--expires' && i + 1 < args.length) {
+      const n = Number(args[++i]);
+      if (!Number.isFinite(n) || n <= 0) {
+        flags.expiresError = args[i];
+      } else {
+        flags.expires = Math.floor(n);
+      }
+    } else if (arg === '--require-auth') {
+      flags.requireAuth = true;
     } else if (arg === '--disabled') {
       flags.disabled = true;
     } else if (arg === '--enabled') {
@@ -290,7 +314,15 @@ Usage:
   zstack triage [--file <log>] [--json]            Rank playbooks for failure output
   zstack explore "<query>" [--paths src,tests]     Distill bulk file reads via a subagent
   zstack history [--limit N] [--steps] [--json]    Show recent runs (--last --rerun repeats)
+  zstack keys [list] [--json]                      List API keys, what they are for, and last use
+  zstack keys new "<name>" [options]               Mint a key (secret printed once, never stored)
+  zstack keys show <id|name|prefix>                Show one key's metadata
+  zstack keys rotate <id|name|prefix>              Issue a new secret; the old one dies immediately
+  zstack keys rename|assign <id> [options]         Rename a key or record where it is deployed
+  zstack keys delete <id> [--yes]                  Retire a key so it authenticates nothing
+  zstack keys verify "<secret>"                    Check whether a secret still authenticates
   zstack serve [--port N] [--host H] [--open]      Local UI: browse runs, watch one live, start one
+  zstack serve --require-auth                      Refuse API calls that present no key or token
   zstack shell | repl                              Start an interactive session with sticky context
   zstack skill <playbook-id> [--out <dir>] [--dry-run] [--force]
                                                    Package a playbook into a SKILL.md
@@ -387,6 +419,11 @@ Options:
   --cron "<expr>"          Schedule: cron expression (e.g. '0 9 * * 1-5' or '@hourly')
   --policy <read-only|apply> Schedule: execution policy (default read-only)
   --disabled               Schedule: create routine in paused state
+  --name "<name>"          Keys: the key's name (or pass it positionally)
+  --assign "<where>"       Keys: site, server, or integration the key is deployed to
+  --notes "<text>"         Keys: free-form notes kept with the key
+  --expires <days>         Keys: expire the key this many days from now
+  --require-auth           Serve: require a key or token on every API call
   --about, -a              Show architecture and design overview
   --version, -v            Show package version
 
@@ -1707,16 +1744,21 @@ async function handleServe(args) {
   }
   const host = flags.host || DEFAULT_HOST;
   const port = flags.port ?? DEFAULT_PORT;
+  const requireAuth = flags.requireAuth || envTruthy(process.env.ZSTACK_REQUIRE_AUTH);
 
   if (!isLoopback(host)) {
     console.error(`[!] Binding ${host} exposes this server beyond this machine.`);
     console.error('    It starts agent runs and executes shell commands. Anyone who can reach');
     console.error('    this port can change files on this machine. Prefer the default 127.0.0.1.');
+    if (!requireAuth && !process.env.ZSTACK_API_TOKEN) {
+      console.error('    This bind has no credential requirement: pass --require-auth and mint a');
+      console.error('    key with `zstack keys new "<name>"` so the port is not open to the network.');
+    }
   }
 
   let started;
   try {
-    started = await startServer({ host, port });
+    started = await startServer({ host, port, requireAuth });
   } catch (err) {
     fail(`[!] Cannot start the UI server: ${err.message}`, err.exitCode || EXIT.FAIL, flags);
   }
@@ -1724,10 +1766,14 @@ async function handleServe(args) {
   if (flags.json) {
     // Printed once, after the socket is actually bound, so a caller can read the
     // real port rather than the one it asked for.
-    emitJson({ ok: true, url: started.url, host: started.host, port: started.port });
+    emitJson({ ok: true, url: started.url, host: started.host, port: started.port, requireAuth });
   } else {
     console.log(`\nzstack UI listening on ${started.url}`);
     console.log(`    Runs are recorded in ${process.env.ZSTACK_HISTORY_PATH || '~/.zstack/history.jsonl'}`);
+    console.log(`    API keys live in ${keysPath()}`);
+    console.log(requireAuth
+      ? '    API calls require a key: send "Authorization: Bearer <key>" or run without --require-auth.'
+      : '    API calls are open on this bind; pass --require-auth to require a key.');
     console.log('    Press Ctrl-C to stop.\n');
   }
 
@@ -1746,6 +1792,23 @@ async function handleServe(args) {
     process.on('SIGTERM', () => stop('SIGTERM'));
   });
   process.exit(EXIT.OK);
+}
+
+/**
+ * Ask one question on the terminal.
+ *
+ * With no TTY (a pipe, a CI job) the answer is empty, which every caller treats
+ * as the cautious choice: a destructive command then needs its explicit flag
+ * rather than proceeding on input nobody gave.
+ */
+async function askLine(question) {
+  if (!process.stdin.isTTY) return '';
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await rl.question(question);
+  } finally {
+    rl.close();
+  }
 }
 
 /** Open a URL in the platform's default browser, best-effort. */
@@ -2253,6 +2316,212 @@ async function handleSchedule(args) {
   fail(`Unknown schedule subcommand "${subcommand}". Allowed: list, add, run, enable, disable, delete, infer.`, EXIT.USAGE, flags);
 }
 
+/**
+ * `zstack keys` — create, inspect, rotate, and retire API keys.
+ *
+ * This exists so a credential can be minted without a server, a browser, or a
+ * scratch script: `zstack keys new "<name>" --assign <where>` is the whole
+ * workflow, and it prints the secret once. Every subcommand resolves its
+ * argument the same way — id, then name, then secret prefix — so the short form
+ * shown in the list is what an operator can paste back.
+ */
+async function handleKeys(rawArgs) {
+  const { flags, positional } = parseArgs(rawArgs);
+  const subcommand = positional[0]?.toLowerCase();
+  const rest = positional.slice(1);
+
+  if (flags.expiresError) {
+    fail(`Error: --expires expects a positive number of days (got "${flags.expiresError}").`, EXIT.USAGE, flags);
+  }
+
+  const describeKey = (key) => {
+    const bits = [key.id, key.prefix || '(no prefix)'];
+    if (key.assignedTo) bits.push(`@ ${key.assignedTo}`);
+    if (key.expired) bits.push('EXPIRED');
+    return bits.join('  ');
+  };
+
+  if (!subcommand || subcommand === 'list' || subcommand === 'ls') {
+    const { keys, corrupted, path } = readKeys();
+    if (flags.json) {
+      emitJson({ ok: true, count: keys.length, keys, path, corrupted: corrupted || undefined });
+      return;
+    }
+    console.log('\n=== zstack API keys ===\n');
+    if (corrupted) {
+      console.log(`[!] ${path} is not readable JSON. No key authenticates until it is fixed.`);
+    }
+    if (keys.length === 0) {
+      console.log('No keys yet. Create one with: zstack keys new "<name>" [--assign <where>]\n');
+      return;
+    }
+    for (const key of keys) {
+      const name = (key.name || '').slice(0, 28).padEnd(30);
+      console.log(`  ${name} ${describeKey(key)}`);
+      const facts = [];
+      facts.push(`issued ${key.issuedAt ? key.issuedAt.slice(0, 10) : 'unknown'}`);
+      if (key.rotations > 0) facts.push(`rotated ${key.rotations}x`);
+      facts.push(key.lastUsedAt ? `last used ${key.lastUsedAt.slice(0, 16).replace('T', ' ')}` : 'never used');
+      if (key.requestCount > 0) facts.push(`${key.requestCount} requests`);
+      if (key.expiresAt) facts.push(`expires ${key.expiresAt.slice(0, 10)}`);
+      if (key.notes) facts.push(key.notes);
+      console.log(`    ${facts.join(' · ')}`);
+    }
+    console.log(`\n${keys.length} key${keys.length === 1 ? '' : 's'} in ${path}`);
+    console.log('The secret is shown once, at creation. A lost one is rotated: zstack keys rotate <id>\n');
+    return;
+  }
+
+  if (subcommand === 'new' || subcommand === 'create' || subcommand === 'gen' || subcommand === 'generate') {
+    const name = flags.name || rest.join(' ').trim();
+    if (!name) {
+      fail('Error: a key needs a name. Usage: zstack keys new "<name>" [--assign <where>] [--notes <text>] [--expires <days>]', EXIT.USAGE, flags);
+    }
+    try {
+      const { key, secret } = createKey({
+        name,
+        assignedTo: flags.assign,
+        notes: flags.notes,
+        expiresInDays: flags.expires
+      });
+      if (flags.json) {
+        emitJson({ ok: true, key, secret });
+        return;
+      }
+      console.log(`\n[✓] Created key "${key.name}" (${key.id})`);
+      if (key.assignedTo) console.log(`    Assigned to: ${key.assignedTo}`);
+      if (key.expiresAt) console.log(`    Expires:     ${key.expiresAt.slice(0, 10)}`);
+      console.log('');
+      console.log(`    ${secret}`);
+      console.log('');
+      console.log('This is the only time the secret is shown; only its hash is stored.');
+      console.log('Use it as:  Authorization: Bearer <key>   (or  x-api-token: <key>)');
+      return;
+    } catch (err) {
+      fail(`[!] ${err.message}`, EXIT.USAGE, flags);
+    }
+  }
+
+  if (subcommand === 'show') {
+    const ref = rest[0];
+    if (!ref) fail('Usage: zstack keys show <id|name|prefix> [--json]', EXIT.USAGE, flags);
+    const key = findKey(ref);
+    if (!key) fail(`[!] No key matching "${ref}".`, EXIT.FAIL, flags);
+    if (flags.json) {
+      emitJson({ ok: true, key });
+      return;
+    }
+    console.log('');
+    console.log(`  Name:        ${key.name}`);
+    console.log(`  Id:          ${key.id}`);
+    console.log(`  Prefix:      ${key.prefix || '(none)'}`);
+    console.log(`  Assigned to: ${key.assignedTo || '(unassigned)'}`);
+    console.log(`  Issued:      ${key.issuedAt || 'unknown'}`);
+    console.log(`  Rotations:   ${key.rotations}`);
+    console.log(`  Expires:     ${key.expired ? `${key.expiresAt} (expired)` : (key.expiresAt || 'never')}`);
+    console.log(`  Last used:   ${key.lastUsedAt ? `${key.lastUsedAt}${key.lastUsedFrom ? ` from ${key.lastUsedFrom}` : ''}` : 'never'}`);
+    console.log(`  Requests:    ${key.requestCount}`);
+    if (key.notes) console.log(`  Notes:       ${key.notes}`);
+    console.log('');
+    return;
+  }
+
+  if (subcommand === 'rotate') {
+    const ref = rest[0];
+    if (!ref) fail('Usage: zstack keys rotate <id|name|prefix> [--expires <days>] [--json]', EXIT.USAGE, flags);
+    try {
+      const options = flags.expires !== undefined ? { expiresInDays: flags.expires } : {};
+      const { key, secret } = rotateKey(ref, undefined, options);
+      if (flags.json) {
+        emitJson({ ok: true, key, secret });
+        return;
+      }
+      console.log(`\n[✓] Rotated key "${key.name}" (${key.id}) — rotation ${key.rotations}`);
+      console.log('    The previous secret stopped working the moment this ran.');
+      console.log('');
+      console.log(`    ${secret}`);
+      console.log('');
+      return;
+    } catch (err) {
+      fail(`[!] ${err.message}`, err.kind === 'unknown-key' ? EXIT.FAIL : EXIT.USAGE, flags);
+    }
+  }
+
+  if (subcommand === 'rename' || subcommand === 'assign' || subcommand === 'edit') {
+    const ref = rest[0];
+    if (!ref) {
+      fail(`Usage: zstack keys ${subcommand} <id|name|prefix> [--name <new>] [--assign <where>] [--notes <text>]`, EXIT.USAGE, flags);
+    }
+    const patch = {};
+    if (flags.name !== undefined) patch.name = flags.name;
+    if (flags.assign !== undefined) patch.assignedTo = flags.assign;
+    if (flags.notes !== undefined) patch.notes = flags.notes;
+    if (flags.expires !== undefined) patch.expiresInDays = flags.expires;
+    if (Object.keys(patch).length === 0) {
+      fail('Error: nothing to change. Pass --name, --assign, --notes, or --expires.', EXIT.USAGE, flags);
+    }
+    try {
+      const key = updateKey(ref, patch);
+      if (flags.json) {
+        emitJson({ ok: true, key });
+        return;
+      }
+      console.log(`[✓] Updated "${key.name}" (${key.id})${key.assignedTo ? ` — assigned to ${key.assignedTo}` : ''}`);
+      return;
+    } catch (err) {
+      fail(`[!] ${err.message}`, err.kind === 'invalid-key' ? EXIT.USAGE : EXIT.FAIL, flags);
+    }
+  }
+
+  if (subcommand === 'delete' || subcommand === 'rm' || subcommand === 'remove' || subcommand === 'revoke') {
+    const ref = rest[0];
+    if (!ref) fail('Usage: zstack keys delete <id|name|prefix> [--yes] [--json]', EXIT.USAGE, flags);
+    const key = findKey(ref);
+    if (!key) fail(`[!] No key matching "${ref}".`, EXIT.FAIL, flags);
+    if (!flags.yes && !flags.json) {
+      const answer = await askLine(`Delete key "${key.name}" (${key.id})? Any deployment using it stops working. [y/N] `);
+      if (!/^y(es)?$/i.test(answer.trim())) {
+        console.log('Cancelled.');
+        return;
+      }
+    }
+    try {
+      deleteKey(key.id);
+      if (flags.json) {
+        emitJson({ ok: true, deleted: key.id, key });
+        return;
+      }
+      console.log(`[✓] Deleted key "${key.name}" (${key.id}). It authenticates nothing now.`);
+      return;
+    } catch (err) {
+      fail(`[!] ${err.message}`, EXIT.FAIL, flags);
+    }
+  }
+
+  if (subcommand === 'verify') {
+    // Answers "does this secret still work" without a server, which is the
+    // question that comes up when an integration starts failing with 401.
+    const secret = rest[0] || (flags.file ? readFileSync(flags.file, 'utf8').trim() : '');
+    if (!secret) fail('Usage: zstack keys verify "<secret>" [--json]', EXIT.USAGE, flags);
+    const record = verifyKeySecret(secret);
+    if (flags.json) {
+      emitJson(record
+        ? { ok: true, valid: true, key: publicKey(record) }
+        : { ok: true, valid: false });
+      return;
+    }
+    if (record) {
+      console.log(`[✓] Valid — "${record.name}" (${record.id})${record.assignedTo ? ` @ ${record.assignedTo}` : ''}`);
+    } else {
+      console.log('[!] Invalid, expired, or unknown. It does not authenticate anything.');
+      process.exitCode = EXIT.FAIL;
+    }
+    return;
+  }
+
+  fail(`Unknown keys subcommand "${subcommand}". Allowed: list, new, show, rotate, rename, assign, delete, verify.`, EXIT.USAGE, flags);
+}
+
 async function handleWorkfolk(rawArgs) {
   const { flags, positional } = parseArgs(rawArgs);
   const subcommand = positional[0]?.toLowerCase();
@@ -2460,6 +2729,11 @@ async function main() {
     case 'schedules':
     case 'cron':
       await handleSchedule(rawArgs);
+      break;
+    case 'keys':
+    case 'key':
+    case 'apikeys':
+      await handleKeys(rawArgs);
       break;
     case 'workfolk':
     case 'workers':

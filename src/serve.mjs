@@ -45,6 +45,17 @@ import {
   projectsPath
 } from './projects.mjs';
 import {
+  readKeys,
+  createKey,
+  rotateKey,
+  updateKey,
+  deleteKey,
+  findKey,
+  verifyKeySecret,
+  recordKeyUse,
+  secureEquals
+} from './keys.mjs';
+import {
   readOverrides,
   patchRunOverride,
   hideRun,
@@ -269,6 +280,7 @@ const FIXED_ROUTES = Object.freeze({
   '/api/health': ['GET'],
   '/api/runs': ['GET', 'POST'],
   '/api/projects': ['GET', 'POST'],
+  '/api/keys': ['GET', 'POST'],
   '/api/dashboard': ['GET'],
   '/api/config': ['GET'],
   '/api/budget': ['GET', 'POST', 'PUT'],
@@ -292,6 +304,44 @@ const FIXED_ROUTES = Object.freeze({
 function positiveInt(value, fallback) {
   const n = Number(value);
   return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Whether an environment variable was set to an affirmative value.
+ *
+ * Exported because the CLI reads the same flag before it starts a server: the
+ * warning it prints about an exposed bind has to agree with what the server will
+ * actually enforce, and two definitions of "truthy" would eventually disagree.
+ */
+export function envTruthy(value) {
+  if (typeof value !== 'string') return false;
+  return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+}
+
+/**
+ * The address a request came from, without the IPv4-in-IPv6 prefix.
+ *
+ * Used only to label a key's last use, so a socket with no address (a test
+ * harness, an embedded transport) reports null rather than "undefined".
+ */
+function clientAddress(req) {
+  const raw = req.socket?.remoteAddress ?? null;
+  if (typeof raw !== 'string' || raw === '') return null;
+  return raw.startsWith('::ffff:') ? raw.slice(7) : raw;
+}
+
+/**
+ * The status an error from the key store deserves.
+ *
+ * A malformed request is the caller's fault (400); a reference that names
+ * nothing is 404; an unreadable store is this machine's problem (500) — reported
+ * as 500 rather than 400 so the operator looks at the file, which is where the
+ * fault actually is.
+ */
+function keyFailureStatus(err) {
+  if (err?.kind === 'invalid-key' || err?.kind === 'ambiguous-key') return 400;
+  if (err?.kind === 'unknown-key') return 404;
+  return 500;
 }
 
 /**
@@ -590,6 +640,32 @@ export function createApp(options = {}) {
   const startedAt = Date.now();
   const boundHost = options.host || DEFAULT_HOST;
   const apiToken = options.apiToken ?? options.token ?? process.env.ZSTACK_API_TOKEN ?? null;
+  const keysFile = options.keysPath;
+  // Credentials are optional by default because this server is loopback-only and
+  // the operator is the caller. `--require-auth` (or ZSTACK_REQUIRE_AUTH) is what
+  // makes them mandatory, which is the setting that matters once `--host` puts
+  // this on a network: without it, a key is a label rather than a gate.
+  const requireAuth = options.requireAuth ?? envTruthy(process.env.ZSTACK_REQUIRE_AUTH);
+
+  /**
+   * The credential a request presented: the shared token, or a stored key.
+   *
+   * A key that authenticates is recorded as used, because "is this still in
+   * use" is the question that decides whether it can be deleted. The write is
+   * throttled inside the key store, so a polling caller does not rewrite the
+   * store per request.
+   */
+  const authenticate = (req, url) => {
+    const presented = getAuthToken(req, url);
+    if (!presented) return null;
+    if (apiToken && secureEquals(presented, apiToken)) {
+      return { kind: 'token', id: null, name: 'ZSTACK_API_TOKEN', prefix: null };
+    }
+    const record = verifyKeySecret(presented, keysFile);
+    if (!record) return null;
+    recordKeyUse(record, keysFile, { from: clientAddress(req) });
+    return { kind: 'key', id: record.id, name: record.name, prefix: record.prefix };
+  };
 
   // Every projection of a stored run passes through here: the history record
   // with its sidecar override applied, so a renamed, moved, or hidden run
@@ -757,12 +833,25 @@ export function createApp(options = {}) {
       return;
     }
 
-    if (apiToken) {
-      const clientToken = getAuthToken(req, url);
-      if (!clientToken || clientToken !== apiToken) {
-        fail(res, 401, 'Unauthorized', { detail: 'Missing or invalid API token.' });
-        return;
-      }
+    // The client shell stays readable when credentials are required; the data
+    // does not. A page that refused to load could not offer anywhere to enter a
+    // key, and the shell is the same code as the public repository: it carries no
+    // secrets, so gating it protects nothing and breaks the only way in.
+    const isShellRequest = !path.startsWith('/api/') && (method === 'GET' || method === 'HEAD');
+
+    // A presented credential is resolved even when none is required, because a
+    // key that is being used has to say so on the Keys page: `never used` is the
+    // answer to "can I delete this", and reporting it for a key that is in daily
+    // use — which is what happens in the default, credential-optional mode —
+    // would be a control that lies. An unusable credential is ignored rather
+    // than refused in that mode: a stale key left in a browser must not brick a
+    // server that asks for nothing.
+    const credential = isShellRequest ? null : authenticate(req, url);
+    if ((apiToken || requireAuth) && !isShellRequest && !credential) {
+      fail(res, 401, 'Unauthorized', {
+        detail: 'Missing or invalid API credential. Pass an API key with "Authorization: Bearer <key>" or "x-api-token".'
+      });
+      return;
     }
 
     if (!path.startsWith('/api/')) {
@@ -1258,6 +1347,108 @@ export function createApp(options = {}) {
         return;
       }
       fail(res, 405, `${method} is not allowed for ${path}. Allowed: GET, PUT, DELETE.`);
+      return;
+    }
+
+    // --- api keys ---------------------------------------------------------
+    // The trust boundary here is the credential that got the request this far:
+    // when `--require-auth` or ZSTACK_API_TOKEN is set, only a valid credential
+    // reaches these routes at all. There are no per-key permissions by design —
+    // a key is a whole-API credential — so the management page is the one place
+    // that says which credential exists and where it is deployed.
+    if (path === '/api/keys' && method === 'GET') {
+      const { keys, corrupted, path: file } = readKeys(keysFile);
+      sendJson(res, 200, {
+        ok: true,
+        keys,
+        path: file,
+        corrupted: corrupted || undefined,
+        requireAuth,
+        // Whether a shared token exists at all, so the page can explain why a
+        // request was refused rather than only that it was.
+        tokenConfigured: Boolean(apiToken)
+      });
+      return;
+    }
+
+    if (path === '/api/keys' && method === 'POST') {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      try {
+        // The secret is in this response and nowhere else, ever.
+        const { key, secret } = createKey(body, keysFile);
+        sendJson(res, 201, { ok: true, key, secret });
+      } catch (err) {
+        fail(res, keyFailureStatus(err), err.message, { problems: err.problems });
+      }
+      return;
+    }
+
+    const keyRotateMatch = path.match(/^\/api\/keys\/([^/]+)\/rotate$/);
+    if (keyRotateMatch) {
+      if (method !== 'POST') {
+        fail(res, 405, `${method} is not allowed for ${path}. Allowed: POST.`);
+        return;
+      }
+      const ref = decodeURIComponent(keyRotateMatch[1]);
+      let body = {};
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        fail(res, err.status || 400, err.message);
+        return;
+      }
+      try {
+        const { key, secret } = rotateKey(ref, keysFile, body);
+        sendJson(res, 200, { ok: true, key, secret });
+      } catch (err) {
+        fail(res, keyFailureStatus(err), err.message, { problems: err.problems });
+      }
+      return;
+    }
+
+    const keyMatch = path.match(/^\/api\/keys\/([^/]+)$/);
+    if (keyMatch) {
+      const ref = decodeURIComponent(keyMatch[1]);
+      if (method === 'GET') {
+        const key = findKey(ref, keysFile);
+        if (!key) {
+          fail(res, 404, `No key matching "${ref}".`);
+          return;
+        }
+        sendJson(res, 200, { ok: true, key });
+        return;
+      }
+      if (method === 'PATCH' || method === 'PUT') {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          fail(res, err.status || 400, err.message);
+          return;
+        }
+        try {
+          sendJson(res, 200, { ok: true, key: updateKey(ref, body, keysFile) });
+        } catch (err) {
+          fail(res, keyFailureStatus(err), err.message, { problems: err.problems });
+        }
+        return;
+      }
+      if (method === 'DELETE') {
+        try {
+          const key = deleteKey(ref, keysFile);
+          sendJson(res, 200, { ok: true, deleted: key.id, key });
+        } catch (err) {
+          fail(res, keyFailureStatus(err), err.message);
+        }
+        return;
+      }
+      fail(res, 405, `${method} is not allowed for ${path}. Allowed: GET, PATCH, DELETE.`);
       return;
     }
 

@@ -61,6 +61,9 @@ const ICON_PATHS = {
   moon: '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>',
   monitor: '<rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line>',
   clock: '<circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline>',
+  key: '<path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>',
   users: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path>',
   workfolk: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path>'
 };
@@ -2595,5 +2598,463 @@ export function renderWorkfolkDispatchDialog({ worker, initialTask = '', onClose
   });
   setTimeout(() => taskTextarea.focus(), 0);
   return overlay;
+}
+
+/* --------------------------------------------------------------- api keys */
+
+/**
+ * Copy text to the clipboard.
+ *
+ * The async clipboard API is available on loopback (a browser treats
+ * `127.0.0.1` as a secure context), and the textarea fallback covers a browser
+ * that refuses it. Both are best-effort: a copy that fails leaves the value on
+ * screen, selectable by hand, rather than reporting a success that did not
+ * happen.
+ */
+export async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to the legacy path
+  }
+  try {
+    const scratch = el('textarea', { style: 'position:fixed; top:-1000px; left:-1000px;' });
+    scratch.value = text;
+    document.body.append(scratch);
+    scratch.select();
+    const ok = document.execCommand?.('copy');
+    scratch.remove();
+    return !!ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * One key as a table row.
+ *
+ * The secret is never here, because it cannot be: only its hash is stored. What
+ * is here is everything that identifies the credential — the visible prefix, who
+ * it was issued to, where it is deployed, and whether it is still being used —
+ * which is what "should I delete this" actually needs.
+ */
+function keyRow(key, { onRotate, onEdit, onDelete, onCopyId }) {
+  const chip = key.expired
+    ? el('span', { class: 'chip chip--error', text: 'expired', title: `Expired ${key.expiresAt}` })
+    : el('span', { class: 'chip chip--ok', text: 'active' });
+
+  return el('tr', { dataset: { id: key.id } }, [
+    el('td', {}, [
+      el('div', { style: 'font-weight:600', text: key.name }),
+      key.notes ? el('div', { class: 'hint', style: 'max-width:280px', text: key.notes }) : null
+    ]),
+    el('td', {}, [
+      el('div', { class: 'mono', text: key.prefix || '(no prefix)' }),
+      el('div', { class: 'hint mono', text: key.id })
+    ]),
+    el('td', {}, [
+      key.assignedTo
+        ? el('div', { text: key.assignedTo })
+        : el('span', { class: 'hint', text: 'unassigned' })
+    ]),
+    el('td', {}, [
+      el('div', { text: `issued ${relativeTime(key.issuedAt) || 'unknown'}` }),
+      key.rotations > 0
+        ? el('div', { class: 'hint', text: `rotated ${key.rotations}×${key.expiresAt ? ` · expires ${key.expiresAt.slice(0, 10)}` : ''}` })
+        : (key.expiresAt ? el('div', { class: 'hint', text: `expires ${key.expiresAt.slice(0, 10)}` }) : null)
+    ]),
+    el('td', {}, [
+      key.lastUsedAt
+        ? el('div', { text: relativeTime(key.lastUsedAt) })
+        : el('span', { class: 'hint', text: 'never used' }),
+      key.lastUsedAt
+        ? el('div', { class: 'hint', text: `${key.requestCount} request${key.requestCount === 1 ? '' : 's'}${key.lastUsedFrom ? ` · ${key.lastUsedFrom}` : ''}` })
+        : null
+    ]),
+    el('td', {}, [chip]),
+    el('td', {}, [
+      el('div', { style: 'display:flex; gap:6px; align-items:center; flex-wrap:wrap' }, [
+        el('button', {
+          class: 'btn btn--xs',
+          type: 'button',
+          text: 'Rotate',
+          title: 'Issue a new secret for this key; the current one stops working immediately',
+          onClick: () => onRotate?.(key)
+        }),
+        el('button', {
+          class: 'btn btn--xs',
+          type: 'button',
+          text: 'Edit',
+          title: 'Rename this key or change where it is assigned',
+          onClick: () => onEdit?.(key)
+        }),
+        el('button', {
+          class: 'btn btn--xs',
+          type: 'button',
+          text: 'Copy id',
+          title: `Copy ${key.id} for the CLI`,
+          onClick: () => onCopyId?.(key)
+        }),
+        el('button', {
+          class: 'btn btn--xs btn--danger',
+          type: 'button',
+          text: 'Delete',
+          onClick: () => onDelete?.(key)
+        })
+      ])
+    ])
+  ]);
+}
+
+/**
+ * The Keys page: the list, and what the server requires to answer at all.
+ *
+ * The access panel is not decoration. A server started with `--require-auth`
+ * refuses every API call that presents nothing, and the page that manages keys
+ * is itself an API caller — so without somewhere to put a key, the one page that
+ * could fix a 401 is the page that cannot load.
+ */
+export function renderKeysPage({
+  keys = [],
+  path = '',
+  corrupted = false,
+  requireAuth = false,
+  tokenConfigured = false,
+  storedToken = '',
+  unauthorized = false,
+  onNew,
+  onRotate,
+  onEdit,
+  onDelete,
+  onCopyId,
+  onSaveToken,
+  onForgetToken
+}) {
+  const activeCount = keys.filter((k) => k.active).length;
+
+  const heroHeader = el('header', { class: 'page__header' }, [
+    el('div', { class: 'page__icon-box' }, [renderIcon('key', 'page__header-icon')]),
+    el('div', { class: 'page__badge' }, [el('span', { class: 'chip chip--neutral', text: 'security' })]),
+    el('h1', { class: 'page__title', text: 'API keys' }),
+    el('div', { class: 'page__meta', text: 'Credentials for anything outside this browser: scripts, integrations, other machines.' })
+  ]);
+
+  const accessChildren = [
+    el('div', { style: 'display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px' }, [
+      requireAuth
+        ? el('span', { class: 'chip chip--ok', text: 'a key is required' })
+        : el('span', { class: 'chip chip--neutral', text: 'no key required' }),
+      tokenConfigured ? el('span', { class: 'chip chip--neutral', text: 'ZSTACK_API_TOKEN also accepted' }) : null,
+      storedToken
+        // A stored key that the server just refused is the one case where the
+        // reader needs to be told the credential is the problem, not the page.
+        ? el('span', {
+          class: `chip mono ${unauthorized ? 'chip--error' : 'chip--neutral'}`,
+          text: unauthorized
+            ? `this browser's key (${tokenLabelForDisplay(storedToken)}) was refused`
+            : `this browser sends ${tokenLabelForDisplay(storedToken)}`,
+          title: 'Stored in this browser only'
+        })
+        : el('span', { class: 'hint', text: 'this browser presents no credential' })
+    ]),
+    el('p', { class: 'hint', style: 'margin:0 0 10px', text: requireAuth
+      ? 'Every call under /api requires one of these keys. The client shell stays public so this page can load and you can paste one below.'
+      : 'This server answers unauthenticated calls on its bind address. Start it with  zstack serve --require-auth  to require a key on every call.' })
+  ];
+
+  if (storedToken) {
+    accessChildren.push(el('div', { style: 'display:flex; gap:8px; align-items:center' }, [
+      el('button', {
+        class: 'btn btn--xs',
+        type: 'button',
+        text: 'Forget this browser\'s key',
+        onClick: () => onSaveToken?.('')
+      })
+    ]));
+  }
+
+  // A refused key needs somewhere to put the replacement, not just a Forget
+  // button: making the reader clear one credential before they can present
+  // another is a step that exists for no reason.
+  if (!storedToken || unauthorized) {
+    const tokenInput = el('input', {
+      type: 'password',
+      name: 'token',
+      placeholder: 'zstk-… (or your ZSTACK_API_TOKEN)',
+      autocomplete: 'off',
+      spellcheck: 'false'
+    });
+    const save = () => {
+      const value = tokenInput.value.trim();
+      if (value === '') return;
+      onSaveToken?.(value);
+    };
+    tokenInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        save();
+      }
+    });
+    accessChildren.push(el('div', { style: 'display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap' }, [
+      el('div', { class: 'field', style: 'min-width:280px; margin:0' }, [
+        el('label', { text: unauthorized ? 'Present a different key' : 'Present a key from this browser' }),
+        tokenInput,
+        el('div', { class: 'field__hint' }, 'Kept in this browser only. Send it as Authorization: Bearer <key> from scripts.')
+      ]),
+      el('button', { class: 'btn btn--xs btn--primary', type: 'button', text: 'Use this key', onClick: save })
+    ]));
+  }
+
+  const accessPanel = el('div', { class: 'panel' }, [
+    el('div', { class: 'panel__title' }, [
+      renderIcon('shield', 'panel__icon'),
+      el('span', { text: 'Access' })
+    ]),
+    unauthorized
+      ? el('div', { class: 'error-banner', style: 'margin-bottom:10px', text: 'The server refused this request: a key is required and this browser has not presented a valid one.' })
+      : null,
+    ...accessChildren
+  ]);
+
+  const newBtn = el('button', {
+    class: 'btn btn--primary',
+    type: 'button',
+    text: 'New key',
+    onClick: () => onNew?.()
+  });
+
+  const keysPanel = el('div', { class: 'panel' }, [
+    el('div', { class: 'panel__title' }, [
+      renderIcon('key', 'panel__icon'),
+      el('span', { text: 'Keys' }),
+      el('div', { class: 'spacer' }),
+      // The count is withheld when the list could not be read: "0 keys" beside a
+      // refusal reads as "nothing exists", which is a different and false claim.
+      unauthorized
+        ? null
+        : el('span', { class: 'hint', text: `${keys.length} key${keys.length === 1 ? '' : 's'} (${activeCount} active)` })
+    ]),
+    corrupted
+      ? el('div', { class: 'error-banner', style: 'margin-bottom:10px', text: `${path} is not readable JSON. No key authenticates until the file is fixed.` })
+      : null,
+    el('p', { class: 'hint', style: 'margin:0 0 10px', text: 'A secret is shown once, when it is created or rotated; only its hash is stored, so it cannot be shown again. Losing one costs a rotation, not a reconfiguration of everything else.' }),
+    unauthorized
+      ? el('div', { class: 'empty', style: 'padding:24px 0' }, [
+        el('h2', { text: 'This list needs a key' }),
+        el('p', { text: 'The server refused it, so an empty list would be a guess rather than an answer. Present a key above, or read the store from a terminal: zstack keys list' })
+      ])
+      : (keys.length === 0
+        ? el('div', { class: 'empty', style: 'padding:28px 0' }, [
+          el('h2', { text: 'No keys yet' }),
+          el('p', { text: 'Create one here, or from a terminal: zstack keys new "<name>" --assign <where>' })
+        ])
+        : el('table', { class: 'data key-table' }, [
+          el('tr', {}, [
+            el('th', { text: 'Name' }),
+            el('th', { text: 'Secret prefix' }),
+            el('th', { text: 'Assigned to' }),
+            el('th', { text: 'Issued' }),
+            el('th', { text: 'Last used' }),
+            el('th', { text: 'State' }),
+            el('th', { text: 'Actions' })
+          ]),
+          ...keys.map((key) => keyRow(key, { onRotate, onEdit, onDelete, onCopyId }))
+        ])),
+    el('div', { style: 'display:flex; gap:12px; align-items:center; margin-top:12px; flex-wrap:wrap' }, [
+      // Minting over HTTP needs a credential like any other call, so refusing to
+      // offer a button that would 401 is the honest state. The CLI owns the file
+      // and is the way back in.
+      unauthorized
+        ? el('span', { class: 'hint', text: 'Mint one from a terminal, where the store is yours: zstack keys new "<name>"' })
+        : newBtn,
+      el('span', { class: 'hint', text: 'A key is a whole-API credential: there are no per-key permissions.' })
+    ]),
+    path ? el('div', { class: 'hint mono', style: 'margin-top:8px', text: path }) : null
+  ]);
+
+  return el('div', { class: 'page page--wide' }, [heroHeader, accessPanel, keysPanel]);
+}
+
+/** The first characters of a credential, for the "this browser sends" label. */
+function tokenLabelForDisplay(token) {
+  return token.length > 14 ? `${token.slice(0, 14)}…` : token;
+}
+
+/**
+ * Create or edit a key.
+ *
+ * Everything except the secret lives here: the name is how it is found again,
+ * the assignment is where it is deployed, and the expiry is the difference
+ * between a credential that ends by itself and one somebody has to remember to
+ * revoke.
+ */
+export function renderKeyDialog({ existing = null, onClose, onSubmit }) {
+  const nameInput = el('input', {
+    type: 'text',
+    name: 'name',
+    placeholder: 'Workfolk production',
+    value: existing?.name || ''
+  });
+  const assignInput = el('input', {
+    type: 'text',
+    name: 'assignedTo',
+    placeholder: 'gateway-01 / workfolk.example.com',
+    value: existing?.assignedTo || ''
+  });
+  const notesInput = el('input', {
+    type: 'text',
+    name: 'notes',
+    placeholder: 'What it is for, and what breaks if it is deleted',
+    value: existing?.notes || ''
+  });
+  const expiresInput = el('input', {
+    type: 'text',
+    name: 'expiresInDays',
+    placeholder: 'Never',
+    inputmode: 'numeric'
+  });
+  const problem = el('div', { class: 'composer__warning' });
+  const submit = el('button', {
+    class: 'btn btn--primary',
+    type: 'button',
+    text: existing ? 'Save changes' : 'Create key'
+  });
+
+  // "never" is accepted as the way to remove an expiry, because the alternative
+  // for a key that already has one is a second control that exists only for the
+  // one field it clears.
+  const CLEAR_EXPIRY = /^(never|none|no|off)$/i;
+
+  const save = async () => {
+    problem.textContent = '';
+    const days = expiresInput.value.trim();
+    const payload = {
+      name: nameInput.value.trim(),
+      assignedTo: assignInput.value.trim(),
+      notes: notesInput.value.trim()
+    };
+    if (CLEAR_EXPIRY.test(days)) {
+      payload.expiresAt = '';
+    } else if (days !== '') {
+      const n = Number(days);
+      if (!Number.isFinite(n) || n <= 0) {
+        problem.textContent = 'Expiry must be a positive number of days, or "never".';
+        return;
+      }
+      payload.expiresInDays = Math.floor(n);
+    }
+    submit.disabled = true;
+    try {
+      await onSubmit(payload);
+    } catch (err) {
+      submit.disabled = false;
+      problem.textContent = err.problems ? err.problems.join(' ') : err.message;
+      return;
+    }
+    submit.disabled = false;
+  };
+
+  submit.addEventListener('click', save);
+  for (const input of [nameInput, assignInput, notesInput, expiresInput]) {
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        save();
+      }
+    });
+  }
+
+  const box = el('div', { class: 'composer', onClick: (e) => e.stopPropagation() }, [
+    el('div', { class: 'composer__head', text: existing ? `Edit key — ${existing.name}` : 'New API key' }),
+    el('div', { class: 'composer__controls' }, [
+      el('div', { class: 'field' }, [
+        el('label', { text: 'Name' }),
+        nameInput,
+        el('div', { class: 'field__hint' }, 'How this key is recognised in the list and from the CLI.')
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', { text: 'Assigned to' }),
+        assignInput,
+        el('div', { class: 'field__hint' }, 'The site, server, or integration this key is deployed to. Free text.')
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', { text: 'Notes' }),
+        notesInput
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', { text: 'Expires in days' }),
+        expiresInput,
+        el('div', { class: 'field__hint' }, existing
+          ? `Leave empty to keep it as it is${existing.expiresAt ? ` (currently ${existing.expiresAt.slice(0, 10)})` : ' (currently never)'}; enter "never" to remove the expiry.`
+          : 'Leave empty for a key that does not expire.')
+      ]),
+      problem
+    ]),
+    el('div', { class: 'composer__foot' }, [
+      submit,
+      el('span', { class: 'hint' }, [
+        el('span', { class: 'kbd', text: 'Esc' }),
+        ' to close'
+      ]),
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn', type: 'button', text: 'Cancel', onClick: onClose })
+    ])
+  ]);
+
+  const overlay = el('div', { class: 'overlay', onClick: onClose }, [box]);
+  overlay.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') onClose();
+  });
+  setTimeout(() => nameInput.focus(), 0);
+  return overlay;
+}
+
+/**
+ * The one moment a secret exists in readable form.
+ *
+ * The dialog does not close on a click outside or on Escape, and the copy button
+ * says whether the copy happened: the value cannot be recovered, so a dialog
+ * that vanished under a stray click while the reader was reaching for Copy would
+ * cost a rotation.
+ */
+export function renderKeySecretDialog({ key, secret, rotated = false, onClose }) {
+  const value = el('div', { class: 'key-secret__value mono', text: secret });
+  const status = el('span', { class: 'hint' });
+  const copy = el('button', { class: 'btn btn--primary', type: 'button', text: 'Copy key' });
+  copy.addEventListener('click', async () => {
+    const ok = await copyText(secret);
+    status.textContent = ok ? 'Copied to the clipboard.' : 'Copy was refused — select the value and copy it by hand.';
+  });
+
+  const box = el('div', { class: 'composer', onClick: (e) => e.stopPropagation() }, [
+    el('div', { class: 'composer__head', text: rotated ? `Rotated — ${key.name}` : `Key created — ${key.name}` }),
+    el('div', { class: 'composer__controls' }, [
+      el('p', { class: 'hint', style: 'margin:0' , text: rotated
+        ? 'The previous secret stopped working the moment this was rotated. This is the only time the new one is shown: only its hash is stored.'
+        : 'This is the only time the secret is shown: only its hash is stored, so it cannot be shown again. Store it where the caller can read it.' }),
+      el('div', { class: 'key-secret' }, [value]),
+      el('div', { style: 'display:flex; gap:10px; align-items:center; flex-wrap:wrap' }, [
+        copy,
+        el('span', { class: 'hint mono', text: key.id }),
+        status
+      ]),
+      el('div', { class: 'field__hint' }, [
+        'Send it as ',
+        el('span', { class: 'mono', text: 'Authorization: Bearer <key>' }),
+        ' or ',
+        el('span', { class: 'mono', text: 'x-api-token: <key>' }),
+        '.'
+      ])
+    ]),
+    el('div', { class: 'composer__foot' }, [
+      el('button', { class: 'btn', type: 'button', text: 'I have stored it', onClick: onClose })
+    ])
+  ]);
+
+  // No click-outside close and no Escape close: see the note above.
+  return el('div', { class: 'overlay' }, [box]);
 }
 

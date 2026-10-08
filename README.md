@@ -17,6 +17,7 @@ An opinionated Agent Operating System, TypeScript SDK, and CLI for rigorous soft
 - **15 Standard Operating Playbooks**: Structured execution recipes for features, bug fixes, refactoring, performance forensics, and pull requests.
 - **20 Durable Principles**: Non-negotiable engineering rules (laziness protocol, root cause remediation, boundary discipline, context preservation) cited against concrete code changes.
 - **Local UI**: `zstack serve` opens runs as pages in a browser, streams a run in progress, and starts new ones. Same records the CLI writes, so a run started in the UI appears in `zstack history`.
+- **API Keys**: named, rotatable credentials for anything outside the browser — a script, a CI job, another machine. Mint, rotate, rename, assign to a site or server, and delete from a page in the UI or from `zstack keys`, with when each was issued and last used. Only a hash is stored, so a leaked store is not a leaked credential.
 - **Pinned-model Chat**: a chat page in the UI listing conversations kept on the server. One model from the live catalogue is pinned per chat, free models included, and each turn streams token by token. A chat is plain: no playbook, no tools, no workspace, and it never lands in run history.
 - **Prompt Optimization**: the run composer has an Optimize button that rewrites your raw text into a clearer task prompt grounded in the playbook the request matches, in place and with Undo. It only shapes text: nothing is dispatched until you send.
 - **Dynamic Workload Routing**: Routes tasks to the optimal model based on available providers (OpenCode Zen/Go, OpenAI, Anthropic, Gemini, DeepSeek).
@@ -455,6 +456,10 @@ What it does:
 - Organizes runs into projects: a project is a name plus the directory it owns,
   listed in the sidebar, opened as a page of its own runs, and picked in the
   composer so the run executes there.
+- Manages API keys on a page of its own: generate, rotate, rename, assign to a
+  site or server, and delete, each row showing what it is for, when it was
+  issued, and whether it is still used. See
+  [API Keys](#16-api-keys).
 
 Projects are stored in `~/.zstack/projects.json` next to history, deliberately
 as plain JSON: a human creates a handful of them by pointing at folders, not a
@@ -501,6 +506,13 @@ three policies instead of approve/deny buttons that could not work:
 the server does not answer for is refused, which is what stops a page on another
 site from reaching it through DNS rebinding.
 
+Binding further than loopback means anyone who can reach the port can start
+agent runs that change files on this machine. `--require-auth` (or
+`ZSTACK_REQUIRE_AUTH=1`) is what closes that: every call under `/api` then has to
+present [an API key](#16-api-keys) or `ZSTACK_API_TOKEN`. The client shell stays
+public, because a page that refused to load could not offer anywhere to enter a
+key; the data does not.
+
 No build step, no dependency: the client is vanilla ES modules and one
 stylesheet served straight from `web/`.
 
@@ -517,6 +529,63 @@ zstack workfolk job <job-id>                # check result of a dispatched task
 ```
 
 `--wait` blocks and polls until the task reaches a terminal state (`completed`, `failed`, `cancelled`, or `expired`), streaming the final result to stdout. In the web interface, a dedicated **Workfolk** view lists the live roster and session jobs, and chat conversations provide a 1-click **Hand off to Workfolk** action.
+
+### 16. API Keys
+
+One shared token in `ZSTACK_API_TOKEN` cannot be named, revoked on its own, or
+rotated without breaking every caller at once. A key is the same idea with an
+identity attached.
+
+```bash
+zstack keys                                      # list keys, what they are for, and last use
+zstack keys new "Workfolk prod" --assign "gateway-01 / workfolk.example.com" \
+  --notes "dispatch integration" --expires 90    # secret printed once
+zstack keys show "Workfolk prod"                 # one key's metadata
+zstack keys rotate "Workfolk prod"               # new secret; the old one dies immediately
+zstack keys assign "Workfolk prod" --assign gateway-02
+zstack keys rename "Workfolk prod" --name "Workfolk staging"
+zstack keys delete "Workfolk prod" --yes         # authenticates nothing afterwards
+zstack keys verify "zstk-…"                      # does this secret still work?
+```
+
+Use `--json` on any of them for one JSON document: `new` and `rotate` return
+`{ ok, key, secret }`, everything else `{ ok, key }` or `{ ok, keys }`.
+
+A key is presented the same way the shared token is:
+
+```bash
+curl -H "Authorization: Bearer zstk-…" http://127.0.0.1:4141/api/runs
+curl -H "x-api-token: zstk-…"          http://127.0.0.1:4141/api/health
+```
+
+The store is `~/.zstack/keys.json` (`ZSTACK_KEYS_PATH` overrides). Only a
+SHA-256 digest of each secret is written, beside a 12-character display prefix
+(`zstk-Ab3xY9Zk`) that identifies a key without being usable as one — so the
+secret exists in readable form exactly once, in the response to `new` or
+`rotate`, and a store that leaks is not a set of live credentials. Losing a
+secret costs a rotation, not a reissue of everything else.
+
+Keys are deliberately whole-API credentials: there are no per-key permissions, on
+purpose, so a key is one thing to manage instead of a matrix nobody maintains.
+A renamed key keeps its id, because a deployment reads a secret, not an id; a
+rotated key keeps its name, assignment, and notes for the same reason. Deleting
+one takes effect on the next request, and there is no grace window, because the
+one question rotation exists to answer is whether the old credential is still
+live.
+
+The page lives at `#/keys` in the UI (System → API keys): generate, rotate,
+rename, assign, and delete, with the access panel that says whether this server
+requires a credential and where to paste one. Uses are recorded, so the list can
+answer "is this still in use, and can I delete it" — a key presented to a server
+that requires nothing is still recorded, because `never used` is the answer that
+gets a live key deleted.
+
+A server started with `--require-auth` refuses every API call that presents
+nothing. The browser cannot attach a header to the navigation request that loads
+the page, so the page itself stays public and takes the key two ways: paste it
+into the Access panel once, or open the UI with `?token=zstk-…`, which stores it
+and strips it from the address bar. Either way it is kept in that browser's
+`localStorage` and sent only to this origin.
 
 ## Gateway Reliability
 
@@ -643,9 +712,81 @@ nothing at all.
 
 The server binds loopback (`127.0.0.1:4141`) by default and checks the `Host` header to defend against DNS rebinding.
 
-When the environment variable `ZSTACK_API_TOKEN` is set, all routes require the shared token and return `401 Unauthorized` if it is missing or invalid. Pass the token via:
-- `Authorization: Bearer <token>`
-- `x-api-token: <token>`
+Two kinds of credential are accepted, and either is enough:
+
+- An **API key** minted with `zstack keys new` or on the Keys page in the UI. Keys can be named, assigned, rotated, and revoked individually — see [API Keys](#16-api-keys).
+- The shared **`ZSTACK_API_TOKEN`**, unchanged, for a caller that has one already.
+
+Pass either via:
+
+- `Authorization: Bearer <key>`
+- `x-api-token: <key>`
+- `?token=<key>` on a URL (for the UI and for `EventSource`, which cannot set headers)
+
+A credential is required when `ZSTACK_API_TOKEN` is set, and when the server is
+started with `--require-auth` (or `ZSTACK_REQUIRE_AUTH=1`); without either, the
+loopback bind is the boundary and the API answers unauthenticated calls. Requests
+that do present a key are recorded against it whether or not one was required, so
+the Keys page can report the last use.
+
+Static files are never gated, in either mode: the client shell is the same code
+as this repository and carries no secrets, and a page that refused to load could
+not offer anywhere to enter a key. Everything under `/api` is.
+
+#### `GET /api/keys`
+
+Lists the stored keys, their display prefixes, assignments, issue and last-use
+times, and whether they are expired. Never returns a secret or a digest. Also
+reports `requireAuth` and `tokenConfigured`, so the page can say why a call was
+refused.
+
+```json
+{
+  "ok": true,
+  "keys": [
+    {
+      "id": "k-9e7af66d33bc",
+      "name": "Workfolk prod",
+      "prefix": "zstk-Ab3xY9Zk",
+      "assignedTo": "gateway-01 / workfolk.example.com",
+      "notes": "dispatch integration",
+      "issuedAt": "2026-10-08T21:44:38.372Z",
+      "rotations": 0,
+      "expiresAt": null,
+      "expired": false,
+      "active": true,
+      "lastUsedAt": "2026-10-08T21:55:02.114Z",
+      "lastUsedFrom": "127.0.0.1",
+      "requestCount": 12
+    }
+  ],
+  "path": "~/.zstack/keys.json",
+  "requireAuth": false,
+  "tokenConfigured": false
+}
+```
+
+#### `POST /api/keys`
+
+Creates a key. `201 Created` with `{ ok, key, secret }` — the only response in
+which the secret exists. Body: `name` (required, unique), `assignedTo`, `notes`,
+and `expiresInDays` or `expiresAt`. Every validation problem is reported at once
+in `problems` with a `400`.
+
+#### `GET | PATCH | DELETE /api/keys/:ref`
+
+Reads, edits, or deletes one key. `:ref` is its id, its name (case-insensitive),
+or its display prefix; an ambiguous name or prefix is `400` rather than a guess,
+and an unknown one is `404`. `PATCH` (or `PUT`) accepts `name`, `assignedTo`,
+`notes` — an empty string clears a field — and `expiresInDays`/`expiresAt`.
+`DELETE` removes it, after which the secret authenticates nothing.
+
+#### `POST /api/keys/:ref/rotate`
+
+Issues a new secret for an existing key and returns `{ ok, key, secret }`. The id,
+name, assignment, and notes survive; the previous secret stops working
+immediately. Rotating is how a lost secret is recovered, since the old one cannot
+be shown again.
 
 ### Error Format
 
@@ -659,9 +800,9 @@ Errors return structured JSON with standard HTTP status codes (`400`, `401`, `40
 }
 ```
 
-- `400`: Invalid request payload, empty prompt, unknown playbook or lane, or workspace outside the named project.
-- `401`: Missing or invalid `ZSTACK_API_TOKEN`.
-- `404`: Unknown run or project ID.
+- `400`: Invalid request payload, empty prompt, unknown playbook or lane, an ambiguous key reference, or workspace outside the named project.
+- `401`: Missing or invalid API key or `ZSTACK_API_TOKEN`, when one is required.
+- `404`: Unknown run, project, or key.
 - `409`: A run is already active in the same canonical git repository.
 
 ### Endpoints
