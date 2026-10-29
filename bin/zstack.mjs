@@ -62,7 +62,7 @@ export function exitForKind(kind) {
 const KNOWN_COMMANDS = new Set([
   'task', 'prompt', 'run', 'panel', 'arena', 'interrogate', 'budget', 'grade',
   'triage', 'explore', 'history', 'shell', 'repl', 'serve', 'skill', 'schedule', 'schedules', 'cron',
-  'workfolk', 'workers', 'keys', 'key', 'apikeys',
+  'research', 'workfolk', 'workers', 'keys', 'key', 'apikeys',
   'status', 'sync', 'update', 'playbooks', 'principles', 'about', 'version', 'help'
 ]);
 
@@ -306,6 +306,7 @@ Usage:
   zstack "<prompt>"                                Run a task (auto-detects playbook & principles)
   zstack task <playbook> "<prompt>" [options]      Run a task with an explicit playbook
   zstack prompt "<prompt>" [--role <role>]         Send a prompt directly to a model role
+  zstack research "<prompt>" [--json]              Search the web and read public sources
   zstack panel "<prompt>"                          Run multi-family adversarial critique in parallel
   zstack budget [tier] [--source config|catalog] [--lane auto|zen|go|hitch|hf] [--confirm]
                                                    Preview + confirm model budget mapping
@@ -2744,6 +2745,18 @@ async function main() {
       const { flags } = parseArgs(rawArgs);
       if (flags.json) console.error('Checking upstream pstack...');
       await z.update({ apply: flags.apply, check: flags.check });
+      break;
+    }
+    case 'research': {
+      if (rawArgs.includes('--help') || rawArgs.includes('-h')) { console.log('zstack research "<prompt>" [--json] — shared web research, using MH_AGENT_API_KEY privately.'); break; }
+      if (rawArgs.some(arg => arg.startsWith('--') && arg !== '--json')) { fail('Research accepts only a prompt and --json.', EXIT.USAGE, globalFlags); break; }
+      const prompt = rawArgs.filter(arg => arg !== '--json').join(' ').trim();
+      if (!prompt) { fail('Provide a research prompt.', EXIT.USAGE, globalFlags); break; }
+      const controller = new AbortController(); const cancel = () => controller.abort(); process.once('SIGINT', cancel);
+      try {
+        const result = await z.research({ prompt, signal: controller.signal });
+        if (rawArgs.includes('--json')) emitJson({ ok: true, ...result }); else console.log(result.answer);
+      } finally { process.off('SIGINT', cancel); }
       break;
     }
     case 'task':

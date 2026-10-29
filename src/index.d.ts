@@ -402,6 +402,10 @@ export declare class ZStack {
    */
   chat(options: ChatOptions): Promise<ChatResult>;
 
+  /** Shared web-only research, using this app's private MH_AGENT_API_KEY. */
+  research(options: { prompt: string; signal?: AbortSignal }): Promise<WebResearchResult>;
+  researchHealth(options?: { signal?: AbortSignal }): Promise<WebResearchHealth>;
+
   /**
    * Rewrite a raw request into a task prompt worth running. Classified first so
    * the rewrite knows the playbook it prepares for; returns text to review, not
@@ -844,3 +848,7 @@ export declare function checkCrossLocationCollision(options: {
   force?: boolean;
 }): void;
 export declare function packageSkill(options: PackageSkillOptions): PackageSkillResult;
+
+/** Optional shared web-only research result; no private client type dependency. */
+export interface WebResearchResult { id: string; model: string; answer: string; toolCalls: Array<{ name: string; ok: boolean }>; }
+export interface WebResearchHealth { ok: true; model: string; tools: Array<'web_search' | 'read_page'>; }

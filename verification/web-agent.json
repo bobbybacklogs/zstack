@@ -1,0 +1,33 @@
+{
+  "checkedAt": "2026-10-29T18:41:40.844175+00:00",
+  "sourceBase": "8b7721163259c4da76f3e87eada759449d9fae1c",
+  "mhKitVersion": "0.2.0",
+  "tests": {
+    "passed": 82,
+    "withoutPrivateClient": 82,
+    "withPrivateClient": 82
+  },
+  "freshCheckoutLiveResearch": {
+    "ok": true,
+    "configuredModel": "modelhitch/auto",
+    "tools": [
+      {
+        "name": "web_search",
+        "ok": true
+      },
+      {
+        "name": "read_page",
+        "ok": true
+      }
+    ],
+    "officialSourceCitationVerified": true,
+    "separateAppKeyUsed": true,
+    "credentialsCommitted": false
+  },
+  "deploymentChecks": {
+    "existingInference": "passed",
+    "workerChat": "not applicable",
+    "browserUi": "Chromium passed"
+  },
+  "privateArchiveInPublicRepo": false
+}

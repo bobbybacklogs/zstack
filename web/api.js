@@ -83,6 +83,7 @@ export const api = {
   resume: (id) => request('POST', `/runs/${encodeURIComponent(id)}/resume`, {}),
   setBudget: (payload) => request('PUT', '/budget', payload),
   models: () => request('GET', '/models'),
+  research: (prompt, options) => request('POST', '/research', { prompt }, options),
   chat: (payload, options) => request('POST', '/chat', payload, options),
   classifyPrompt: (payload) => request('POST', '/classify', payload),
   optimizePrompt: (payload) => request('POST', '/optimize', payload),

@@ -148,7 +148,7 @@ export function renderChatList({ chats, onOpen, onNew }) {
  * arriving or finished.
  */
 export function renderChatPage(chat, listing = {}, handlers = {}) {
-  const { onSend, onStop, onPin, onRename, onDelete, onContinueAsRun, onScheduleRoutine, onHandoffToWorkfolk } = handlers;
+  const { onSend, onStop, onPin, onRename, onDelete, onContinueAsRun, onScheduleRoutine, onHandoffToWorkfolk, onResearch } = handlers;
   const models = Array.isArray(listing.models) ? listing.models : [];
   const pending = chat.pending === true;
   const messages = Array.isArray(chat.messages) ? chat.messages : [];
@@ -331,6 +331,7 @@ export function renderChatPage(chat, listing = {}, handlers = {}) {
     textarea,
     el('div', { class: 'chat__composer-foot' }, [
       sendButton,
+      onResearch ? el('button', { class: 'btn', type: 'button', text: 'Web research', disabled: pending, onClick: () => onResearch(textarea.value.trim()) }) : null,
       el('span', { class: 'hint' }, [
         el('span', { class: 'kbd', text: 'Enter' }),
         ' to send, ',
@@ -459,4 +460,29 @@ export function renderRenameChatDialog({ chat, onClose, onSubmit }) {
     input.select();
   }, 0);
   return overlay;
+}
+
+/** Separate research task; it never changes a conversation's pinned model. */
+export function renderWebResearchDialog({ initialPrompt = '', onClose, onSubmit }) {
+  const input = el('textarea', { rows: 4, name: 'research', 'aria-label': 'Research question', style: 'width:100%;resize:vertical', placeholder: 'What would you like to research?' }); input.value = initialPrompt;
+  const status = el('div', { class: 'field__hint', text: 'Search the web and read sources.' });
+  const answer = el('div', { style: 'white-space:pre-wrap;max-height:45vh;overflow:auto', role: 'status' });
+  const submit = el('button', { class: 'btn btn--primary', type: 'button', text: 'Research' });
+  submit.addEventListener('click', async () => {
+    if (!input.value.trim()) { input.focus(); return; }
+    submit.disabled = true; input.disabled = true; status.textContent = 'Researching…'; answer.textContent = '';
+    try {
+      const result = await onSubmit(input.value.trim()); answer.textContent = result.answer;
+      status.textContent = result.toolCalls?.some(call => !call.ok) ? 'Some research steps failed. Check the answer and sources.' : 'Research complete.';
+    } catch (err) { status.textContent = err?.name === 'AbortError' ? 'Stopped.' : err?.message || 'Research failed.'; }
+    finally { submit.disabled = false; input.disabled = false; }
+  });
+  const box = el('div', { class: 'composer', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Web research', onClick: event => event.stopPropagation() }, [
+    el('div', { class: 'composer__head', text: 'Web research' }),
+    el('div', { class: 'composer__controls', style: 'display:flex;flex-direction:column;gap:12px' }, [input, status, answer]),
+    el('div', { class: 'composer__foot' }, [submit, el('div', { class: 'spacer' }), el('button', { class: 'btn', type: 'button', text: 'Close', onClick: onClose })])
+  ]);
+  const overlay = el('div', { class: 'overlay', onClick: onClose }, [box]);
+  overlay.addEventListener('keydown', event => { if (event.key === 'Escape') onClose(); });
+  setTimeout(() => input.focus(), 0); return overlay;
 }

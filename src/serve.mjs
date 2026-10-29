@@ -1,3 +1,4 @@
+import { validateResearchRequest, WebResearchError } from './web-agent.mjs';
 /**
  * The local UI server: `zstack serve`.
  *
@@ -286,6 +287,7 @@ const FIXED_ROUTES = Object.freeze({
   '/api/budget': ['GET', 'POST', 'PUT'],
   '/api/status': ['GET'],
   '/api/chat': ['POST'],
+  '/api/research': ['GET', 'POST'],
   '/api/models': ['GET'],
   '/api/chats': ['GET', 'POST'],
   '/api/classify': ['POST'],
@@ -2149,6 +2151,35 @@ export function createApp(options = {}) {
       } catch (err) {
         sendJson(res, 200, { ok: true, connected: false, error: err?.message || String(err), models: [] });
       }
+      return;
+    }
+
+    // Web research has its own authenticated surface; pinned-model chat stays plain.
+    if (path === '/api/research') {
+      const controller = new AbortController();
+      const disconnected = () => { if (!res.writableEnded) controller.abort(); };
+      res.once('close', disconnected);
+      try {
+        if (method === 'GET') {
+          if (typeof zstack.researchHealth !== 'function') { fail(res, 503, 'Web research is not configured.'); return; }
+          res.setHeader('cache-control', 'no-store');
+          sendJson(res, 200, await zstack.researchHealth({ signal: controller.signal }));
+        } else {
+          if (typeof zstack.research !== 'function') { fail(res, 503, 'Web research is not configured.'); return; }
+          if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) { fail(res, 415, 'JSON required.'); return; }
+          let body;
+          try { body = await readJsonBody(req); } catch (err) { fail(res, err.status || 400, 'Provide a JSON prompt.'); return; }
+          const problems = validateResearchRequest(body);
+          if (problems.length) { fail(res, 400, problems.join(' '), { problems }); return; }
+          const result = await zstack.research({ prompt: body.prompt, signal: controller.signal });
+          res.setHeader('cache-control', 'no-store');
+          sendJson(res, 200, { ok: true, ...result });
+        }
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        const status = err instanceof WebResearchError ? err.code === 'config' ? 503 : err.code === 'timeout' || err.code === 'aborted' ? 504 : err.status === 429 ? 429 : 502 : 502;
+        fail(res, status, 'Web research failed.', err instanceof WebResearchError ? { code: err.code, requestId: err.requestId, retryAfterSeconds: err.retryAfterSeconds } : {});
+      } finally { res.off('close', disconnected); }
       return;
     }
 

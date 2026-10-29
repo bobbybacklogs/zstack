@@ -16,7 +16,8 @@ import {
   renderChatPage,
   renderChatMessage,
   renderNewChatDialog,
-  renderRenameChatDialog
+  renderRenameChatDialog,
+  renderWebResearchDialog
 } from './chat.js';
 import {
   el,
@@ -1016,6 +1017,7 @@ function renderMain() {
     }
     main.append(renderChatPage(state.chat, state.chatModels || {}, {
       onSend: sendChatMessage,
+      onResearch: openWebResearch,
       onStop: stopChat,
       onPin: pinChatModel,
       onRename: () => renameChatFlow(state.chat),
@@ -1699,6 +1701,16 @@ async function sendChatMessage(text) {
     }
     chatAbort = null;
   }
+}
+
+function openWebResearch(initialPrompt = '') {
+  const controller = new AbortController();
+  const overlay = renderWebResearchDialog({
+    initialPrompt,
+    onClose: () => { controller.abort(); overlay.remove(); },
+    onSubmit: prompt => api.research(prompt, { signal: controller.signal })
+  });
+  document.body.append(overlay);
 }
 
 function stopChat() {
