@@ -1338,3 +1338,7 @@ Tests validate:
 ## License
 
 MIT License. Copyright (c) 2026 genoventures-labs.
+
+## Shared web research
+
+[Optional client setup, chat action, SDK/CLI/API, authentication, and verification](docs/web-agent.md).

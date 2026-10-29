@@ -20,7 +20,8 @@
     "sync": "node bin/zstack.mjs sync",
     "test": "node tests/connector.test.mjs",
     "verify": "node scripts/verify.mjs",
-    "verify:live": "node scripts/verify.mjs --live"
+    "verify:live": "node scripts/verify.mjs --live",
+    "test:research": "node --test tests/web-agent.test.mjs"
   },
   "keywords": [
     "ai",
@@ -31,5 +32,13 @@
     "playbooks"
   ],
   "author": "genoventures-labs",
-  "license": "MIT"
+  "license": "MIT",
+  "peerDependencies": {
+    "@cass/mh-kit": ">=0.2.0 <0.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@cass/mh-kit": {
+      "optional": true
+    }
+  }
 }

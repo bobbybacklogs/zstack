@@ -1,3 +1,4 @@
+import { runWebResearch, webResearchHealth } from './web-agent.mjs';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -742,6 +743,10 @@ export class ZStack {
    * With `onDelta`, the reply streams: the callback receives each text chunk as
    * it arrives and the resolved value is the same either way.
    */
+  /** Shared web research: backend-managed search and page reading, no workspace tools. */
+  async research({ prompt, signal } = {}) { return runWebResearch(prompt, { signal }); }
+  async researchHealth({ signal } = {}) { return webResearchHealth({ signal }); }
+
   async chat(options = {}) {
     const problems = validateChatRequest(options);
     if (problems.length > 0) throw new Error(problems.join(' '));
